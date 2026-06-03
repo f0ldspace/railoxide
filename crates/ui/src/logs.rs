@@ -15,6 +15,7 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context as LayerContext, Layer};
 use tracing_subscriber::registry::LookupSpan;
+use url::Url;
 
 use crate::theme;
 
@@ -38,6 +39,15 @@ const MIN_TIME_WIDTH: Pixels = px(72.0);
 const MIN_LEVEL_WIDTH: Pixels = px(48.0);
 const MIN_TARGET_WIDTH: Pixels = px(80.0);
 const MIN_MESSAGE_WIDTH: Pixels = px(140.0);
+
+const REDACTED_URL_SCHEMES: &[&str] = &[
+    "http://",
+    "https://",
+    "socks5://",
+    "socks5h://",
+    "ws://",
+    "wss://",
+];
 
 /// Single retained log line from the app's in-memory tracing layer.
 #[derive(Debug, Clone)]
@@ -166,8 +176,9 @@ impl MessageVisitor {
 
 impl Visit for MessageVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
+        let value = redact_log_urls(value);
         if field.name() == "message" {
-            self.message.push_str(value);
+            self.message.push_str(&value);
         } else {
             if !self.extras.is_empty() {
                 self.extras.push(' ');
@@ -177,15 +188,82 @@ impl Visit for MessageVisitor {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let value = redact_log_urls(&format!("{value:?}"));
         if field.name() == "message" {
-            let _ = write!(&mut self.message, "{value:?}");
+            self.message.push_str(&value);
         } else {
             if !self.extras.is_empty() {
                 self.extras.push(' ');
             }
-            let _ = write!(&mut self.extras, "{}={value:?}", field.name());
+            let _ = write!(&mut self.extras, "{}={value}", field.name());
         }
     }
+}
+
+fn redact_log_urls(value: &str) -> String {
+    let Some(mut offset) = next_url_start(value) else {
+        return value.to_string();
+    };
+
+    let mut redacted = String::with_capacity(value.len());
+    let mut rest = value;
+    loop {
+        redacted.push_str(&rest[..offset]);
+        let candidate = &rest[offset..];
+        let end = url_candidate_end(candidate);
+        let url_text = &candidate[..end];
+        match Url::parse(url_text) {
+            Ok(url) => {
+                redacted.push_str(&redact_url_for_log(&url));
+                rest = &candidate[end..];
+            }
+            Err(_) => {
+                let mut chars = candidate.chars();
+                if let Some(ch) = chars.next() {
+                    redacted.push(ch);
+                    rest = chars.as_str();
+                } else {
+                    rest = "";
+                }
+            }
+        }
+
+        let Some(next_offset) = next_url_start(rest) else {
+            redacted.push_str(rest);
+            return redacted;
+        };
+        offset = next_offset;
+    }
+}
+
+fn next_url_start(value: &str) -> Option<usize> {
+    REDACTED_URL_SCHEMES
+        .iter()
+        .filter_map(|scheme| value.find(scheme))
+        .min()
+}
+
+fn url_candidate_end(value: &str) -> usize {
+    value
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (ch.is_whitespace()
+                || matches!(ch, '"' | '\'' | ')' | ']' | '}' | '<' | '>' | ',' | ';'))
+            .then_some(index)
+        })
+        .unwrap_or(value.len())
+}
+
+fn redact_url_for_log(url: &Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    if !redacted.cannot_be_a_base() {
+        redacted.set_path("");
+    }
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 #[must_use]
@@ -834,5 +912,29 @@ mod tests {
         });
         let seqs: Vec<u64> = logs.logs().iter().map(|l| l.seq).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn ui_log_layer_redacts_url_credentials_paths_queries_and_fragments() {
+        let logs = LogStore::new(4);
+        let layer = UiLogLayer::new(logs.clone());
+        let subscriber = Registry::default().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                rpc = "https://user:pass@example.com/private/project-id?token=secret#fragment",
+                proxy_url = "socks5h://proxy-user:proxy-pass@proxy.example:9050",
+                "request failed at https://api-user:api-pass@api.example/rpc/key?api_key=secret#fragment"
+            );
+        });
+
+        let entry = logs.logs().pop().expect("log entry");
+        assert!(entry.message.contains("https://example.com/"));
+        assert!(entry.message.contains("socks5h://proxy.example:9050"));
+        assert!(entry.message.contains("https://api.example/"));
+        assert!(!entry.message.contains("user"));
+        assert!(!entry.message.contains("pass"));
+        assert!(!entry.message.contains("project-id"));
+        assert!(!entry.message.contains("secret"));
+        assert!(!entry.message.contains("fragment"));
     }
 }

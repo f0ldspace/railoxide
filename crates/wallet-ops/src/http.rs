@@ -715,10 +715,13 @@ fn build_reqwest_context(
     })
 }
 
-fn redact_url_for_display(url: &Url) -> String {
+pub(crate) fn redact_url_for_display(url: &Url) -> String {
     let mut redacted = url.clone();
     let _ = redacted.set_username("");
     let _ = redacted.set_password(None);
+    if !redacted.cannot_be_a_base() {
+        redacted.set_path("");
+    }
     redacted.set_query(None);
     redacted.set_fragment(None);
     redacted.to_string()
@@ -980,7 +983,7 @@ mod tests {
     }
 
     fn sensitive_proxy_url() -> Url {
-        Url::parse("socks5h://user:pass@example.com:9050?token=secret#fragment")
+        Url::parse("socks5h://user:pass@example.com:9050/path?token=secret#fragment")
             .expect("valid sensitive proxy URL")
     }
 
@@ -1065,6 +1068,7 @@ mod tests {
         assert_eq!(redacted, "socks5h://example.com:9050");
         assert!(!redacted.contains("user"));
         assert!(!redacted.contains("pass"));
+        assert!(!redacted.contains("path"));
         assert!(!redacted.contains("token"));
         assert!(!redacted.contains("fragment"));
     }
@@ -1087,6 +1091,7 @@ mod tests {
         assert!(detail.contains("socks5h://example.com:9050"));
         assert!(!detail.contains("user"));
         assert!(!detail.contains("pass"));
+        assert!(!detail.contains("path"));
         assert!(!detail.contains("token"));
         assert!(!detail.contains("fragment"));
     }

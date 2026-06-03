@@ -633,7 +633,8 @@ pub async fn resolve_source_tx_origin(
                 ));
             }
             Err(error) => {
-                tracing::warn!(%error, rpc = %provider_handle.url, "fetch source transaction failed");
+                let rpc = crate::http::redact_url_for_display(&provider_handle.url);
+                tracing::warn!(%error, %rpc, "fetch source transaction failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
                 last_error = Some(Report::new(error));
             }
@@ -1326,7 +1327,8 @@ pub(crate) async fn buffered_gas_price_from_rpc_pool(
         {
             Ok(gas_price) => return Ok(gas_price),
             Err(error) => {
-                tracing::warn!(%error, rpc = %provider_handle.url, "fetch gas price failed");
+                let rpc = crate::http::redact_url_for_display(&provider_handle.url);
+                tracing::warn!(%error, %rpc, "fetch gas price failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
                 last_error = Some(error);
             }

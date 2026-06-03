@@ -334,8 +334,9 @@ pub(super) async fn poll_self_broadcast_attempt_receipts(
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    let url = crate::http::redact_url_for_display(&provider_handle.url);
                     tracing::warn!(
-                        url = %provider_handle.url,
+                        %url,
                         %error,
                         "self-broadcast receipt fetch failed"
                     );
@@ -604,36 +605,37 @@ pub(super) async fn self_broadcast_provider_fee_sample(
     );
     let (gas_price, max_priority_fee, fee_history) =
         tokio::join!(gas_price, max_priority_fee, fee_history);
+    let url = crate::http::redact_url_for_display(&provider_handle.url);
     let rpc_gas_price = match gas_price {
         Ok(Ok(value)) => Some(value),
         Ok(Err(error)) => {
-            tracing::warn!(url = %provider_handle.url, %error, "self-broadcast eth_gasPrice failed");
+            tracing::warn!(%url, %error, "self-broadcast eth_gasPrice failed");
             None
         }
         Err(_) => {
-            tracing::warn!(url = %provider_handle.url, "self-broadcast eth_gasPrice timed out");
+            tracing::warn!(%url, "self-broadcast eth_gasPrice timed out");
             None
         }
     };
     let max_priority_fee_per_gas = match max_priority_fee {
         Ok(Ok(value)) => Some(value),
         Ok(Err(error)) => {
-            tracing::debug!(url = %provider_handle.url, %error, "self-broadcast eth_maxPriorityFeePerGas failed");
+            tracing::debug!(%url, %error, "self-broadcast eth_maxPriorityFeePerGas failed");
             None
         }
         Err(_) => {
-            tracing::debug!(url = %provider_handle.url, "self-broadcast eth_maxPriorityFeePerGas timed out");
+            tracing::debug!(%url, "self-broadcast eth_maxPriorityFeePerGas timed out");
             None
         }
     };
     let fee_history = match fee_history {
         Ok(Ok(value)) => Some(value),
         Ok(Err(error)) => {
-            tracing::debug!(url = %provider_handle.url, %error, "self-broadcast eth_feeHistory failed");
+            tracing::debug!(%url, %error, "self-broadcast eth_feeHistory failed");
             None
         }
         Err(_) => {
-            tracing::debug!(url = %provider_handle.url, "self-broadcast eth_feeHistory timed out");
+            tracing::debug!(%url, "self-broadcast eth_feeHistory timed out");
             None
         }
     };
@@ -1056,8 +1058,9 @@ pub(crate) async fn self_broadcast_send_raw_transaction_to_rpc_pool(
         match tokio::time::timeout(wait_for, join_set.join_next()).await {
             Ok(Some(Ok(result))) => match result.outcome {
                 SelfBroadcastRawTxBroadcastOutcome::Accepted => {
+                    let url = crate::http::redact_url_for_display(&result.provider_handle.url);
                     tracing::info!(
-                        url = %result.provider_handle.url,
+                        %url,
                         %tx_hash,
                         "self-broadcast tx accepted by RPC"
                     );
@@ -1067,8 +1070,9 @@ pub(crate) async fn self_broadcast_send_raw_transaction_to_rpc_pool(
                     }
                 }
                 SelfBroadcastRawTxBroadcastOutcome::AlreadyKnown => {
+                    let url = crate::http::redact_url_for_display(&result.provider_handle.url);
                     tracing::info!(
-                        url = %result.provider_handle.url,
+                        %url,
                         %tx_hash,
                         "self-broadcast tx already known by RPC"
                     );
@@ -1078,8 +1082,9 @@ pub(crate) async fn self_broadcast_send_raw_transaction_to_rpc_pool(
                     }
                 }
                 SelfBroadcastRawTxBroadcastOutcome::Rejected(message) => {
+                    let url = crate::http::redact_url_for_display(&result.provider_handle.url);
                     tracing::warn!(
-                        url = %result.provider_handle.url,
+                        %url,
                         %tx_hash,
                         message,
                         "self-broadcast tx rejected by RPC"
