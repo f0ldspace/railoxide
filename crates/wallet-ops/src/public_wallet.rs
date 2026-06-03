@@ -2031,7 +2031,7 @@ mod tests {
     }
 
     fn temp_db_root() -> PathBuf {
-        let dir = std::env::temp_dir().join("railgun-broadcaster-public-wallet-tests");
+        let dir = std::env::temp_dir().join("railoxide-public-wallet-tests");
         fs::create_dir_all(&dir).expect("create temp db dir");
         let pid = std::process::id();
         let nanos = SystemTime::now()

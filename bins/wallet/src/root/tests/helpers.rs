@@ -130,7 +130,7 @@ pub(super) fn temp_wallet_db_root(name: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     std::env::temp_dir().join(format!(
-        "railgun-broadcaster-wallet-root-tests-{name}-{}-{nanos}",
+        "railoxide-wallet-root-tests-{name}-{}-{nanos}",
         std::process::id()
     ))
 }

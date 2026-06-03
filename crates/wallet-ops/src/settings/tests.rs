@@ -17,7 +17,7 @@ use sync_service::ChainConfigDefaults;
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_db_root() -> PathBuf {
-    let dir = std::env::temp_dir().join("railgun-broadcaster-wallet-settings-tests");
+    let dir = std::env::temp_dir().join("railoxide-wallet-settings-tests");
     fs::create_dir_all(&dir).expect("create temp db dir");
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()

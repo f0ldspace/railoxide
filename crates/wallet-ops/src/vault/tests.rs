@@ -20,7 +20,7 @@ fn test_kdf() -> KdfParams {
 }
 
 fn temp_db_root() -> PathBuf {
-    let dir = std::env::temp_dir().join("railgun-broadcaster-wallet-vault-tests");
+    let dir = std::env::temp_dir().join("railoxide-wallet-vault-tests");
     fs::create_dir_all(&dir).expect("create temp db dir");
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()

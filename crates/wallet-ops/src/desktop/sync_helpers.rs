@@ -405,7 +405,7 @@ mod tests {
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db_root() -> PathBuf {
-        let dir = std::env::temp_dir().join("railgun-broadcaster-wallet-sync-helper-tests");
+        let dir = std::env::temp_dir().join("railoxide-wallet-sync-helper-tests");
         fs::create_dir_all(&dir).expect("create temp db dir");
         let pid = std::process::id();
         let nanos = SystemTime::now()
