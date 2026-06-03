@@ -11,6 +11,7 @@ use gpui_component::{
     Icon, IconName, Root, Sizable, TitleBar,
     button::ButtonVariants,
     resizable::{resizable_panel, v_resizable},
+    scroll::ScrollableElement,
     tab::{Tab, TabBar},
 };
 use tokio::runtime::Handle;
@@ -275,6 +276,12 @@ pub(super) fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement)
     let card_width = (viewport.width - px(48.0))
         .max(px(0.0))
         .min(HERO_CARD_MAX_WIDTH);
+    let vertical_padding = match layout {
+        WalletHeroLayout::Wide => px(32.0),
+        WalletHeroLayout::Medium => px(40.0),
+        WalletHeroLayout::Narrow => px(24.0),
+    };
+    let scroll_content_min_height = (viewport.height - vertical_padding * 2.0).max(px(0.0));
 
     let stage = if layout == WalletHeroLayout::Wide {
         div()
@@ -320,11 +327,18 @@ pub(super) fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement)
                 .top_0()
                 .left_0()
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px(px(24.0))
-                .child(stage),
+                .overflow_y_scrollbar()
+                .child(
+                    div()
+                        .w_full()
+                        .min_h(scroll_content_min_height)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(px(24.0))
+                        .py(vertical_padding)
+                        .child(stage),
+                ),
         )
 }
 
