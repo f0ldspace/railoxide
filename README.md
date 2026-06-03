@@ -21,6 +21,20 @@
 
 RailOxide is under active development. APIs, wallet storage formats, and UI flows may change before a stable release.
 
+## Features
+
+- Fully open source
+- Zero telemetry, zero home calls
+- First-class integrated Tor support
+- Indexed POI tree support, prevents UTXO spend intent leaking to the poi proxy operator
+- Hardware-derived wallets:
+  - public accounts have full hardware wallet support.
+  - 0zk accounts are derived detirministically by signing a hash with a hardware device, private keys are **not** stored in app, but for signing they are briefly exposed in memory.
+  Full on-device 0zk signing support is to be added as soon as hardware wallet vendors add railgun-specific cryptography functions.
+- Aggressive batching to reduce rpc throttling
+- Resilient public broadcaster network connection management
+- Decenralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
+
 ## Build
 
 Native dependencies include Rust 1.91, `protoc`, OpenSSL development libraries, and `pkg-config`.
