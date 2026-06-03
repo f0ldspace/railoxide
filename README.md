@@ -1,6 +1,21 @@
-# RailOxide
+<p align="center">
+  <img height="192" src="bins/wallet/packaging/icons/railoxide-icon.svg" alt="RailOxide">
+</p>
 
-Desktop wallet for RAILGUN private transactions.
+<h1 align="center">
+  <img width="420" src="bins/wallet/assets/icons/hero-wordmark.svg#gh-dark-mode-only" alt="RailOxide">
+  <img width="420" src="bins/wallet/assets/icons/hero-wordmark-light.svg#gh-light-mode-only" alt="RailOxide">
+</h1>
+
+<p align="center">Desktop wallet for RAILGUN private transactions.</p>
+
+<p align="center">
+  <a href="https://github.com/triamazikamno/railoxide/releases">Releases</a> ·
+  <a href="#build">Build</a> ·
+  <a href="#privacy-model">Privacy Model</a>
+</p>
+
+---
 
 ## Status
 
