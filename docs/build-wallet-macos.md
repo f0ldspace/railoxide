@@ -136,6 +136,8 @@ Install full Xcode from the App Store or Apple Developer downloads, then select 
 ```bash
 sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
 sudo xcodebuild -license accept
+sudo xcodebuild -runFirstLaunch
+xcodebuild -downloadComponent MetalToolchain
 ```
 
 Verify the Metal compiler tools are available:
