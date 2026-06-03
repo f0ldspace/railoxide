@@ -28,7 +28,10 @@ Native dependencies include Rust 1.91, `protoc`, OpenSSL development libraries, 
 ```bash
 cargo check -p wallet
 cargo check -p wallet --features hardware
+cargo build --release -p wallet --features hardware
 ```
+
+For a complete Ubuntu wallet build guide, including hardware-wallet support, see [`docs/build-wallet-ubuntu.md`](docs/build-wallet-ubuntu.md).
 
 ## Hardware Wallets
 
