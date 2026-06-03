@@ -127,13 +127,9 @@ fn wallet_poi_merkle_proof_source(
                 LocalPoiMerkleProofSource::new(caches),
             ))
         }
-        PoiReadSource::PoiProxy => {
-            let poi_rpc_url =
-                Url::parse(DEFAULT_WALLET_POI_RPC_URL).wrap_err("parse default POI RPC URL")?;
-            Ok(WalletPoiMerkleProofSourceSelection::PoiProxy(
-                PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone()),
-            ))
-        }
+        PoiReadSource::PoiProxy => Ok(WalletPoiMerkleProofSourceSelection::PoiProxy(
+            PoiRpcClient::with_http_client(session.poi_rpc_url.clone(), http.client.clone()),
+        )),
     }
 }
 

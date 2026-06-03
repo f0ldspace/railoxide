@@ -23,6 +23,18 @@ Ledger and Trezor support is available behind the `hardware` feature:
 cargo run --bin wallet --features hardware
 ```
 
+Current hardware-wallet support is hardware-derived software custody, not native RAILGUN hardware signing. The desktop app asks the device to derive profile material, then uses derived wallet material in desktop memory to prepare and sign RAILGUN spends. Treat this as hardware-assisted recovery/authorization for a software wallet, not as a guarantee that private transaction signing remains inside the hardware device.
+
+## Privacy Model
+
+RailOxide is privacy-oriented, but metadata privacy depends on mode and infrastructure choices.
+
+By default, wallet HTTP/RPC traffic uses built-in Tor when no proxy or network mode is configured. Direct mode is explicit and sends outbound requests over the normal network. Proxy mode routes HTTP/RPC traffic through the configured proxy, but embedded Waku libp2p transports are disabled in proxy mode to avoid proxy bypass.
+
+RPC providers, POI services, artifact gateways, public broadcasters, Waku peers, and token/fee data providers can observe metadata for the requests they receive. Indexed POI artifacts avoid sending wallet blind commitments for normal POI reads, but the configured POI RPC URL is still used to live-tail recent public POI events. POI proxy mode is less private because it sends blind commitment hashes associated with UTXOs being received or prepared for spend.
+
+The encrypted wallet vault protects wallet secrets and encrypted wallet cache records. App settings are stored outside the encrypted vault and may include proxy URLs, RPC endpoints, POI RPC URLs, Waku endpoints, and custom infrastructure settings. Logs are intended for non-sensitive diagnostics, but users should avoid putting credentials or API tokens in URLs where possible.
+
 ## Shared Crates
 
 RailOxide depends on shared RAILGUN Rust crates from [`railgun-rust`](https://github.com/triamazikamno/railgun-rust).

@@ -47,6 +47,14 @@ impl Render for WalletSettingsEditor {
                 settings.poi.read_source = poi_source_from_value(value.as_ref());
             },
         );
+        let poi_rpc_url = Self::shared_string_field(
+            "poi-rpc-url",
+            editor.clone(),
+            |settings| settings.poi.proxy.rpc_url.clone(),
+            |settings, value| {
+                settings.poi.proxy.rpc_url = value;
+            },
+        );
         let poi_publisher = Self::shared_string_field(
             "poi-publisher-public-key",
             editor.clone(),
@@ -431,7 +439,8 @@ impl Render for WalletSettingsEditor {
             .group(
                 settings_group()
                     .item(settings_section_header("POI"))
-                    .item(SettingItem::new("POI source", poi_source).description("'Indexed artifacts' downloads snapshots containing POI data from IPFS. Because no POI proxy is queried, a POI proxy operator cannot associate your UTXO activity with your IP address or wallet. 'POI proxy'  mode is less private: the proxy receives requests containing blind commitment hashes associated with UTXOs you are receiving or preparing to spend. Use this mode only if you trust the POI proxy operator."))
+                    .item(SettingItem::new("POI source", poi_source).description("'Indexed artifacts' downloads snapshots containing POI data from IPFS and uses the POI RPC URL only to live-tail recent public POI events. 'POI proxy' mode is less private: the POI RPC receives requests containing blind commitment hashes associated with UTXOs you are receiving or preparing to spend. Use POI proxy mode only if you trust the POI RPC operator."))
+                    .item(SettingItem::new("POI RPC URL", poi_rpc_url).description("Used for indexed-artifact live tailing and for direct POI status/proof requests when POI proxy mode is selected.").layout(Axis::Vertical))
                     .item(
                         SettingItem::new("Publisher public key", poi_publisher)
                             .layout(Axis::Vertical),

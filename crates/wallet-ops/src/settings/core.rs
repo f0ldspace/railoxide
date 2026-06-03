@@ -1,7 +1,7 @@
 use super::{
     ChainSettings, Deserialize, Error, GasSettings, NetworkSettings, PoiReadSource,
     PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings, RuntimeSettings, Serialize,
-    TokenSettings, WakuSettings, WalletNetworkMode, fmt,
+    TokenSettings, Url, WakuSettings, WalletNetworkMode, fmt,
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
@@ -166,5 +166,14 @@ impl WalletSettings {
                 PoiReadSource::IndexedArtifacts(self.poi.artifact.source_config())
             }
         })
+    }
+
+    pub fn poi_rpc_url(&self) -> Result<Url, WalletSettingsValidationError> {
+        let mut errors = Vec::new();
+        self.poi.proxy.validate(&mut errors);
+        if !errors.is_empty() {
+            return Err(WalletSettingsValidationError::new(errors));
+        }
+        Ok(Url::parse(&self.poi.proxy.rpc_url).expect("validated POI RPC URL"))
     }
 }

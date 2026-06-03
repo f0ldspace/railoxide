@@ -55,6 +55,7 @@ struct WalletStartupReady {
     public_broadcaster_republish_interval: Duration,
     default_allow_suspicious_broadcasters: bool,
     poi_read_source: PoiReadSource,
+    poi_rpc_url: reqwest::Url,
 }
 
 enum StartupNetworkContext {
@@ -256,6 +257,7 @@ impl WalletStartupRoot {
                 ready.public_broadcaster_republish_interval,
                 ready.default_allow_suspicious_broadcasters,
                 ready.poi_read_source,
+                ready.poi_rpc_url,
                 self.runtime.clone(),
                 monitor_state,
                 ready.waku,
@@ -688,6 +690,9 @@ async fn build_wallet_startup(
     let poi_read_source = settings
         .poi_read_source()
         .map_err(|error| eyre::eyre!("wallet POI settings are invalid: {error}"))?;
+    let poi_rpc_url = settings
+        .poi_rpc_url()
+        .map_err(|error| eyre::eyre!("wallet POI RPC settings are invalid: {error}"))?;
 
     let http = startup_http_context(
         &options,
@@ -783,6 +788,7 @@ async fn build_wallet_startup(
             .broadcaster
             .allow_suspicious_broadcasters_by_default,
         poi_read_source,
+        poi_rpc_url,
     })
 }
 

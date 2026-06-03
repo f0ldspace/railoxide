@@ -117,6 +117,7 @@ pub(super) fn wallet_generation_matches(
 
 pub(super) fn start_shared_poi_cache_service(
     poi_read_source: &PoiReadSource,
+    poi_rpc_url: &reqwest::Url,
     vault_store: Option<&Arc<DesktopVaultStore>>,
     http: &HttpContext,
     runtime: &Handle,
@@ -130,11 +131,14 @@ pub(super) fn start_shared_poi_cache_service(
         return None;
     };
 
-    let service = Arc::new(PoiCacheService::new(
-        vault_store.db(),
-        artifact_config.clone(),
-        Some(http.client.clone()),
-    ));
+    let service = Arc::new(
+        PoiCacheService::new(
+            vault_store.db(),
+            artifact_config.clone(),
+            Some(http.client.clone()),
+        )
+        .with_poi_rpc_url(poi_rpc_url.clone()),
+    );
     let startup_service = Arc::clone(&service);
     let chain_ids = chain_ids.to_vec();
     runtime.spawn(async move {
@@ -343,6 +347,7 @@ impl WalletRoot {
             sync_to_block: overrides.sync_to_block,
             use_indexed_wallet_catch_up: overrides.use_indexed_wallet_catch_up,
             poi_read_source: self.poi_read_source.clone(),
+            poi_rpc_url: self.poi_rpc_url.clone(),
             rewind_wallet_cache: overrides.rewind_wallet_cache,
             progress_tx: Some(progress_tx),
             local_poi_caches: None,

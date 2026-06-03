@@ -163,6 +163,7 @@ pub struct ViewWalletChainSessionRequest {
     pub sync_to_block: Option<u64>,
     pub use_indexed_wallet_catch_up: bool,
     pub poi_read_source: PoiReadSource,
+    pub poi_rpc_url: Url,
     pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub rewind_wallet_cache: bool,
     pub progress_tx: Option<SyncProgressSender>,

@@ -495,6 +495,7 @@ pub struct ShieldSendOutput {
 
 pub struct WalletSession {
     pub chain_id: u64,
+    pub poi_rpc_url: Url,
     pub cache_key: String,
     pub start_block: u64,
     pub ready_rx: watch::Receiver<bool>,

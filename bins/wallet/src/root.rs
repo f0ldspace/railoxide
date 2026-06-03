@@ -276,6 +276,7 @@ pub(crate) struct WalletRoot {
     options: WalletAppOptions,
     vault_store: Option<Arc<DesktopVaultStore>>,
     poi_read_source: PoiReadSource,
+    poi_rpc_url: reqwest::Url,
     effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
@@ -531,6 +532,7 @@ impl WalletRoot {
         public_broadcaster_republish_interval: Duration,
         default_allow_suspicious_broadcasters: bool,
         poi_read_source: PoiReadSource,
+        poi_rpc_url: reqwest::Url,
         runtime: Handle,
         monitor_state: Shared,
         waku: Arc<PublicBroadcasterWakuClient>,
@@ -557,6 +559,7 @@ impl WalletRoot {
         let vault_store = Some(vault_store);
         let poi_cache_service = start_shared_poi_cache_service(
             &poi_read_source,
+            &poi_rpc_url,
             vault_store.as_ref(),
             &http,
             &runtime,
@@ -759,6 +762,7 @@ impl WalletRoot {
             options,
             vault_store,
             poi_read_source,
+            poi_rpc_url,
             effective_chain_configs,
             effective_token_registry,
             public_balance_refresh_interval,

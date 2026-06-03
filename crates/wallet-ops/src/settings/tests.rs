@@ -505,6 +505,29 @@ fn default_poi_read_source_converts_to_official_indexed_artifacts() {
 }
 
 #[test]
+fn default_poi_rpc_url_matches_default_poi_service() {
+    let settings = WalletSettings::default();
+
+    assert_eq!(
+        settings.poi_rpc_url().expect("POI RPC URL").as_str(),
+        reqwest::Url::parse(poi::poi::DEFAULT_WALLET_POI_RPC_URL)
+            .expect("default POI RPC URL")
+            .as_str()
+    );
+}
+
+#[test]
+fn custom_poi_rpc_url_is_runtime_url() {
+    let mut settings = WalletSettings::default();
+    settings.poi.proxy.rpc_url = "https://poi.example/rpc".to_string();
+
+    assert_eq!(
+        settings.poi_rpc_url().expect("custom POI RPC URL").as_str(),
+        "https://poi.example/rpc"
+    );
+}
+
+#[test]
 fn waku_settings_defaults_match_startup_defaults() {
     let settings = WalletSettings::default();
     assert_eq!(settings.waku.cluster_id, super::DEFAULT_WAKU_CLUSTER_ID);

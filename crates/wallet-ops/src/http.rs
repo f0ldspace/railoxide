@@ -250,12 +250,16 @@ impl HttpContext {
             WalletNetworkMode::Tor => match self.proxy_url.as_ref() {
                 Some(proxy) => format!(
                     "Ready. HTTP/RPC session #{} is routed through {proxy}",
-                    self.tor_session_generation()
+                    self.tor_session_generation(),
+                    proxy = redact_url_for_display(proxy)
                 ),
                 None => "HTTP bridge is unavailable".to_string(),
             },
             WalletNetworkMode::Proxy => match self.user_proxy_url.as_ref() {
-                Some(proxy) => format!("HTTP is routed through {proxy}"),
+                Some(proxy) => format!(
+                    "HTTP is routed through {proxy}",
+                    proxy = redact_url_for_display(proxy)
+                ),
                 None => "Missing proxy URL".to_string(),
             },
             WalletNetworkMode::Direct => {
@@ -683,9 +687,10 @@ fn build_reqwest_context(
 ) -> Result<HttpContext> {
     let mut builder = reqwest::Client::builder();
     if let Some(proxy_url) = &proxy_url {
-        tracing::info!(network_mode = %mode, %proxy_url, "routing wallet HTTP traffic through proxy");
+        let display_proxy_url = redact_url_for_display(proxy_url);
+        tracing::info!(network_mode = %mode, proxy_url = %display_proxy_url, "routing wallet HTTP traffic through proxy");
         let proxy = reqwest::Proxy::all(proxy_url.as_str())
-            .wrap_err_with(|| format!("invalid proxy URL {proxy_url}"))?;
+            .wrap_err_with(|| format!("invalid proxy URL {display_proxy_url}"))?;
         builder = builder.proxy(proxy);
     }
     if mode == WalletNetworkMode::Tor {
@@ -708,6 +713,15 @@ fn build_reqwest_context(
         socks_bridge,
         fail_closed: mode != WalletNetworkMode::Direct,
     })
+}
+
+fn redact_url_for_display(url: &Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 struct ArtiSocksBridge {
@@ -965,6 +979,11 @@ mod tests {
         Url::parse("socks5h://127.0.0.1:9050").expect("valid proxy URL")
     }
 
+    fn sensitive_proxy_url() -> Url {
+        Url::parse("socks5h://user:pass@example.com:9050?token=secret#fragment")
+            .expect("valid sensitive proxy URL")
+    }
+
     fn test_data_dir(name: &str) -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1037,6 +1056,39 @@ mod tests {
         assert_eq!(health.mode, WalletNetworkMode::Proxy);
         assert_eq!(health.state, WalletNetworkHealthState::Ready);
         assert_eq!(health.label(), "Proxy mode");
+    }
+
+    #[test]
+    fn proxy_url_display_redacts_credentials_query_and_fragment() {
+        let redacted = redact_url_for_display(&sensitive_proxy_url());
+
+        assert_eq!(redacted, "socks5h://example.com:9050");
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("pass"));
+        assert!(!redacted.contains("token"));
+        assert!(!redacted.contains("fragment"));
+    }
+
+    #[test]
+    fn proxy_network_health_redacts_configured_proxy_url() {
+        let proxy = sensitive_proxy_url();
+        let context = build_reqwest_context(
+            WalletNetworkMode::Proxy,
+            Some(proxy.clone()),
+            Some(proxy),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("proxy context");
+        let detail = context.network_status_detail();
+
+        assert!(detail.contains("socks5h://example.com:9050"));
+        assert!(!detail.contains("user"));
+        assert!(!detail.contains("pass"));
+        assert!(!detail.contains("token"));
+        assert!(!detail.contains("fragment"));
     }
 
     #[test]

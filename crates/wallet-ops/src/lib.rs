@@ -26,7 +26,7 @@ use broadcaster_monitor::FeeRow;
 use eyre::{Report, Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole};
 use merkletree::tree::MerkleForest;
-use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
+use poi::poi::{PoiRpcClient, default_active_poi_list_keys};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::prover::build_prover_cache_with_progress;
 pub use railgun_wallet::prover::{

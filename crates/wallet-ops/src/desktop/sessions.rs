@@ -46,6 +46,7 @@ impl WalletSessionStore {
         wait_until_ready: bool,
     ) -> Result<WalletSession> {
         let chain_id = request.chain_id;
+        let poi_rpc_url = request.poi_rpc_url.clone();
         let synced = setup_synced_view_wallet_with_store(
             request.view_session,
             chain_id,
@@ -55,6 +56,7 @@ impl WalletSessionStore {
             request.use_indexed_wallet_catch_up,
             request.effective_chain.clone(),
             request.poi_read_source.clone(),
+            request.poi_rpc_url.clone(),
             request.local_poi_caches.clone(),
             request.rewind_wallet_cache,
             rpc_url_override,
@@ -66,7 +68,7 @@ impl WalletSessionStore {
         )
         .await?;
 
-        wallet_session_from_view_synced(chain_id, synced).await
+        wallet_session_from_view_synced(chain_id, poi_rpc_url, synced).await
     }
 
     pub async fn shutdown(&self) {
@@ -76,10 +78,12 @@ impl WalletSessionStore {
 
 async fn wallet_session_from_view_synced(
     chain_id: u64,
+    poi_rpc_url: Url,
     synced: SyncedViewWallet,
 ) -> Result<WalletSession> {
     wallet_session_from_parts(
         chain_id,
+        poi_rpc_url,
         synced.db,
         synced.sync_manager,
         synced.chain_key,
@@ -91,6 +95,7 @@ async fn wallet_session_from_view_synced(
 
 async fn wallet_session_from_parts(
     chain_id: u64,
+    poi_rpc_url: Url,
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     chain_key: ChainKey,
@@ -118,6 +123,7 @@ async fn wallet_session_from_parts(
 
     Ok(WalletSession {
         chain_id,
+        poi_rpc_url,
         cache_key,
         start_block,
         ready_rx,
