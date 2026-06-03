@@ -2,23 +2,22 @@
 use std::sync::Arc;
 
 use gpui::{
-    Entity, IntoElement, ParentElement, SharedString, Styled, Window, div, img,
-    prelude::FluentBuilder as _, px, rgb,
+    Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
-#[cfg(feature = "hardware")]
-use gpui::{InteractiveElement, StatefulInteractiveElement};
 use gpui_component::Icon;
 #[cfg(feature = "hardware")]
 use gpui_component::Sizable;
 use gpui_component::progress::Progress as UiProgress;
 #[cfg(feature = "hardware")]
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants};
+use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants, tooltip::Tooltip};
 #[cfg(feature = "hardware")]
 use gpui_component::{
     Selectable,
     button::{Button, ButtonGroup},
 };
+use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
 };
@@ -426,6 +425,7 @@ impl WalletRoot {
             .generated_seed
             .as_ref()
             .map_or_else(String::new, |seed| seed.mnemonic.to_string());
+        let phrase_for_clipboard = phrase.clone();
         let mut body = vault_dialog_body(
             "Write this phrase down before continuing. It is shown once and then encrypted into the vault.",
         );
@@ -449,7 +449,29 @@ impl WalletRoot {
                 .text_color(rgb(theme::WARNING))
                 .text_size(APP_TEXT_SIZE)
                 .line_height(px(21.0))
-                .child(SharedString::from(phrase)),
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(SharedString::from(phrase)),
+                )
+                .when(!phrase_for_clipboard.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .id("generated-wallet-recovery-phrase-copy-action")
+                            .flex_none()
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Copy recovery phrase").build(window, cx)
+                            })
+                            .child(clipboard_with_toast(
+                                "generated-wallet-recovery-phrase-copy",
+                                phrase_for_clipboard,
+                            )),
+                    )
+                }),
         )
         .child(
             app_button("confirm-generated-wallet", "I saved it, create wallet")

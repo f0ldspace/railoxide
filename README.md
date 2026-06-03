@@ -45,7 +45,7 @@ cargo check -p wallet --features hardware
 cargo build --release -p wallet --features hardware
 ```
 
-For a complete Ubuntu wallet build guide, including hardware-wallet support, see [`docs/build-wallet-ubuntu.md`](docs/build-wallet-ubuntu.md).
+For complete wallet build guides, including hardware-wallet support, see [`docs/build-wallet-ubuntu.md`](docs/build-wallet-ubuntu.md) and [`docs/build-wallet-macos.md`](docs/build-wallet-macos.md).
 
 ## Hardware Wallets
 
