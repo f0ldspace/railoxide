@@ -1,5 +1,9 @@
 // Hex color literals are intentionally written `0xRRGGBB` style.
 #![allow(clippy::unreadable_literal)]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod assets;
 mod cli;
