@@ -37,7 +37,7 @@ const SOCKS_REPLY_ADDR_NOT_SUPPORTED: u8 = 0x08;
 const TOR_BOOTSTRAP_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const SOCKS_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-pub type WalletTorClient = TorClient<PreferredRuntime>;
+pub type WalletTorClient = Arc<TorClient<PreferredRuntime>>;
 pub type WalletTorClientProvider = Arc<dyn Fn() -> Option<WalletTorClient> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
