@@ -362,6 +362,7 @@ pub(super) struct PreparedPublicBroadcasterPlan<P> {
     pub(super) fee_mode: FeeHandlingMode,
     pub(super) gas_limit: u64,
     pub(super) min_gas_price: u128,
+    pub(super) bound_min_gas_price: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -919,6 +920,17 @@ pub fn broadcaster_fee_amount(
 #[must_use]
 pub const fn public_broadcaster_service_gas_price(min_gas_price: u128) -> u128 {
     min_gas_price * 101 / 100
+}
+
+#[must_use]
+pub const fn public_broadcaster_bound_min_gas_price(chain_id: u64, min_gas_price: u128) -> u128 {
+    match chain_id {
+        // Arbitrum eth_call/eth_estimateGas exposes the current child-chain gas price as
+        // tx.gasprice, even when a higher legacy gasPrice is supplied. The RAILGUN contract
+        // documents minGasPrice as type-0-only, so bind zero on Arbitrum and keep pricing separate.
+        42_161 | 42_170 | 421_614 => 0,
+        _ => min_gas_price,
+    }
 }
 
 #[must_use]

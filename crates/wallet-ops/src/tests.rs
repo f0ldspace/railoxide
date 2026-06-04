@@ -49,10 +49,10 @@ use super::{
     parse_send_amount, parse_submitted_tx_hash, parse_unshield_amount,
     public_broadcaster_amount_split, public_broadcaster_amount_split_for_tokens,
     public_broadcaster_amount_split_for_tokens_and_protocol,
-    public_broadcaster_anchor_rate_for_policy, public_broadcaster_build_error,
-    public_broadcaster_candidates, public_broadcaster_fee_breakdown,
-    public_broadcaster_gas_limit_with_buffer, public_broadcaster_max_entered_amount,
-    public_broadcaster_max_entered_amount_for_tokens,
+    public_broadcaster_anchor_rate_for_policy, public_broadcaster_bound_min_gas_price,
+    public_broadcaster_build_error, public_broadcaster_candidates,
+    public_broadcaster_fee_breakdown, public_broadcaster_gas_limit_with_buffer,
+    public_broadcaster_max_entered_amount, public_broadcaster_max_entered_amount_for_tokens,
     public_broadcaster_max_entered_amount_for_tokens_and_protocol,
     public_broadcaster_republish_loop, public_broadcaster_transact_params,
     resolve_desktop_wallet_chain_start, resolve_self_broadcast_gas_fee, select_public_broadcaster,
@@ -2997,6 +2997,20 @@ fn public_broadcaster_gas_limit_uses_configured_buffer() {
     assert_eq!(
         public_broadcaster_gas_limit_with_buffer(210_000, 250_000),
         460_000
+    );
+}
+
+#[test]
+fn public_broadcaster_bound_min_gas_price_is_zero_on_arbitrum() {
+    assert_eq!(public_broadcaster_bound_min_gas_price(42161, 21_000_000), 0);
+    assert_eq!(public_broadcaster_bound_min_gas_price(42170, 21_000_000), 0);
+    assert_eq!(
+        public_broadcaster_bound_min_gas_price(421614, 21_000_000),
+        0
+    );
+    assert_eq!(
+        public_broadcaster_bound_min_gas_price(1, 21_000_000),
+        21_000_000
     );
 }
 

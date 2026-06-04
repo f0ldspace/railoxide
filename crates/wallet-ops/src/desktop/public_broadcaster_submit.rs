@@ -40,6 +40,8 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         http,
     )
     .await?;
+    let bound_min_gas_price =
+        public_broadcaster_bound_min_gas_price(request.chain_id, min_gas_price);
     let same_token_fee = request.fee_token == request.token;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
@@ -115,6 +117,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 fee_amount = %estimate.fee_amount,
                 gas_limit = estimate.gas_limit,
                 min_gas_price,
+                bound_min_gas_price,
                 transaction_count = estimate.transaction_count,
                 input_count = estimate.input_count,
                 private_output_count = estimate.private_output_count,
@@ -181,7 +184,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 token_address: request.fee_token,
                 amount: fee_amount,
             }),
-            min_gas_price,
+            min_gas_price: bound_min_gas_price,
         };
         update_transaction_generation_stage(
             request.progress_tx.as_ref(),
@@ -242,6 +245,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             computed_fee = %computed_fee,
             gas_limit,
             min_gas_price,
+            bound_min_gas_price,
             gas_elapsed_ms,
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
@@ -311,6 +315,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 fee_mode: split.fee_mode,
                 gas_limit,
                 min_gas_price,
+                bound_min_gas_price,
             });
         }
         let next_fee = buffered_public_broadcaster_fee(computed_fee);
@@ -377,6 +382,8 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         http,
     )
     .await?;
+    let bound_min_gas_price =
+        public_broadcaster_bound_min_gas_price(request.chain_id, min_gas_price);
     let same_token_fee = request.fee_token == request.token;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
@@ -437,6 +444,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 fee_amount = %estimate.fee_amount,
                 gas_limit = estimate.gas_limit,
                 min_gas_price,
+                bound_min_gas_price,
                 transaction_count = estimate.transaction_count,
                 input_count = estimate.input_count,
                 private_output_count = estimate.private_output_count,
@@ -496,7 +504,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 token_address: request.fee_token,
                 amount: fee_amount,
             }),
-            min_gas_price,
+            min_gas_price: bound_min_gas_price,
         };
         update_transaction_generation_stage(
             request.progress_tx.as_ref(),
@@ -576,6 +584,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
             computed_fee = %computed_fee,
             gas_limit,
             min_gas_price,
+            bound_min_gas_price,
             gas_elapsed_ms,
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
@@ -642,6 +651,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 fee_mode: split.fee_mode,
                 gas_limit,
                 min_gas_price,
+                bound_min_gas_price,
             });
         }
         let next_fee = buffered_public_broadcaster_fee(computed_fee);
@@ -835,6 +845,7 @@ pub(super) async fn submit_public_broadcaster_plan(
     fee_mode: FeeHandlingMode,
     gas_limit: u64,
     min_gas_price: u128,
+    bound_min_gas_price: u128,
     progress_tx: Option<TransactionGenerationProgressSender>,
     timeout: Duration,
     republish_interval: Duration,
@@ -851,6 +862,7 @@ pub(super) async fn submit_public_broadcaster_plan(
         fee_amount = %fee_amount,
         gas_limit,
         min_gas_price,
+        bound_min_gas_price,
         data_len = data.len(),
         transact_topic = %transact_topic,
         response_topic = %response_topic,
@@ -864,7 +876,7 @@ pub(super) async fn submit_public_broadcaster_plan(
         &broadcaster,
         to,
         data,
-        min_gas_price,
+        bound_min_gas_price,
         pre_transaction_pois_per_txid_leaf_per_list,
     );
     let encrypt_started = Instant::now();
