@@ -335,7 +335,8 @@ function Build-Wallet {
         Stop-Install "Visual Studio Build Tools are required to build RailOxide"
     }
 
-    $cargoArgs = @("+$Toolchain", "build", "--release", "-p", "wallet")
+    $manifestPath = Join-Path $SourceDir "Cargo.toml"
+    $cargoArgs = @("+$Toolchain", "build", "--release", "--manifest-path", $manifestPath, "-p", "wallet")
     if (-not [string]::IsNullOrWhiteSpace($features)) {
         $cargoArgs += @("--features", $features)
     }
