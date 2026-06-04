@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/triamazikamno/railoxide/releases">Releases</a> ·
+  <a href="#install-from-source">Install</a> ·
   <a href="#build">Build</a> ·
   <a href="#privacy-model">Privacy Model</a>
 </p>
@@ -35,6 +36,24 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 - Resilient public broadcaster network connection management
 - Decenralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
 
+## Install From Source
+
+RailOxide is alpha software and currently installs by building the latest `main` branch from source.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet | bash
+```
+
+To inspect the installer first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet
+less install-wallet
+bash install-wallet
+```
+
+The installer supports macOS and Ubuntu/Debian Linux. See [`Install from source`](docs/install-from-source.md) for options and platform notes.
+
 ## Build
 
 Native dependencies include Rust 1.91, `protoc`, and platform-specific C/C++ build dependencies.
@@ -47,7 +66,7 @@ cargo build --release -p wallet --features hardware
 
 For complete wallet build guides see
 - [`Ubuntu`](docs/build-wallet-ubuntu.md)
-- [`Macos`](docs/build-wallet-macos.md)
+- [`macOS`](docs/build-wallet-macos.md)
 - [`Windows`](docs/build-wallet-windows.md)
 
 ## Hardware Wallets

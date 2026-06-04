@@ -1,0 +1,47 @@
+name: Installer
+
+on:
+  pull_request:
+    paths:
+      - scripts/install-wallet
+      - scripts/package-wallet-macos
+      - docs/install-from-source.md
+      - .github/workflows/install-wallet.yml
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/install-wallet
+      - scripts/package-wallet-macos
+      - docs/install-from-source.md
+      - .github/workflows/install-wallet.yml
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check installer syntax
+        run: bash -n scripts/install-wallet
+
+      - name: Check macOS packaging syntax
+        run: bash -n scripts/package-wallet-macos
+
+      - name: Show installer help
+        run: scripts/install-wallet --help
+
+      - name: Dry run installer
+        run: scripts/install-wallet --dry-run --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"

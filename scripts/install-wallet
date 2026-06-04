@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_url="https://github.com/triamazikamno/railoxide.git"
+branch="main"
+toolchain="1.91.0"
+protobuf_version="35.0"
+
+prefix="$HOME/.local"
+source_dir="$HOME/.local/src/railoxide"
+install_deps=1
+hardware=1
+assume_yes=0
+dry_run=0
+verbose=0
+macos_shader_mode="auto"
+macos_shader_mode_set=0
+macos_build_features=""
+macos_build_developer_dir=""
+
+usage() {
+  cat <<'EOF'
+RailOxide source installer.
+
+This installer builds the latest main branch from source. It does not install
+prebuilt binaries.
+
+Usage:
+  install-wallet [options]
+
+Options:
+  --prefix PATH          Install under PATH instead of ~/.local
+  --source-dir PATH      Use PATH for the managed source checkout
+  --no-deps              Do not install missing system dependencies
+  --no-hardware          Build without hardware-wallet support
+  --metal                On macOS, require build-time Metal shader compilation
+  --runtime-shaders      On macOS, force runtime shaders instead of Metal
+  -y, --yes              Do not prompt before dependency installs/downloads
+  --dry-run              Print what would happen without changing anything
+  --verbose              Print commands as they run
+  -h, --help             Show this help
+
+Default install command:
+  curl -fsSL https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet | bash
+
+EOF
+}
+
+log() {
+  printf '==> %s\n' "$*" >&2
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+expand_path() {
+  case "$1" in
+    '~') printf '%s\n' "$HOME" ;;
+    '~/'*) printf '%s/%s\n' "$HOME" "${1#~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+run() {
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '+ '
+    printf '%q ' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+run_shell() {
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '+ %s\n' "$*"
+  else
+    bash -c "$*"
+  fi
+}
+
+write_installer_marker() {
+  local marker="$1"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '+ write installer marker %q\n' "$marker"
+  else
+    printf '%s\n' "$repo_url" >"$marker"
+  fi
+}
+
+write_linux_desktop_file() {
+  local desktop_file="$1"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '+ write desktop file %q\n' "$desktop_file"
+  else
+    {
+      printf '[Desktop Entry]\n'
+      printf 'Name=RailOxide\n'
+      printf 'Comment=Desktop wallet for RAILGUN private transactions\n'
+      printf 'Exec=%s/bin/railoxide-wallet\n' "$prefix"
+      printf 'Icon=app.railoxide.wallet\n'
+      printf 'Terminal=false\n'
+      printf 'Type=Application\n'
+      printf 'Categories=Finance;Network;\n'
+    } >"$desktop_file"
+  fi
+}
+
+write_macos_wrapper() {
+  local wrapper="$1"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '+ write wrapper %q\n' "$wrapper"
+  else
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf 'exec "$HOME/Applications/RailOxide.app/Contents/MacOS/RailOxide" "$@"\n'
+    } >"$wrapper"
+    chmod 755 "$wrapper"
+  fi
+}
+
+confirm() {
+  local prompt="$1"
+
+  if [[ "$assume_yes" -eq 1 ]]; then
+    return 0
+  fi
+
+  if [[ ! -r /dev/tty ]]; then
+    die "$prompt Pass --yes to continue non-interactively."
+  fi
+
+  local answer
+  printf '%s [y/N] ' "$prompt" >/dev/tty
+  IFS= read -r answer </dev/tty || return 1
+  case "$answer" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prefix)
+        [[ $# -ge 2 ]] || die '--prefix requires a path'
+        prefix="$(expand_path "$2")"
+        shift 2
+        ;;
+      --source-dir)
+        [[ $# -ge 2 ]] || die '--source-dir requires a path'
+        source_dir="$(expand_path "$2")"
+        shift 2
+        ;;
+      --no-deps)
+        install_deps=0
+        shift
+        ;;
+      --no-hardware)
+        hardware=0
+        shift
+        ;;
+      --metal)
+        [[ "$macos_shader_mode_set" -eq 0 ]] || die '--metal and --runtime-shaders cannot be combined'
+        macos_shader_mode="metal"
+        macos_shader_mode_set=1
+        shift
+        ;;
+      --runtime-shaders)
+        [[ "$macos_shader_mode_set" -eq 0 ]] || die '--metal and --runtime-shaders cannot be combined'
+        macos_shader_mode="runtime"
+        macos_shader_mode_set=1
+        shift
+        ;;
+      -y|--yes)
+        assume_yes=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --verbose)
+        verbose=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+dry_run_plan() {
+  local os_name="$1"
+
+  log 'dry run: no commands will be executed'
+  printf 'repository: %s\n' "$repo_url"
+  printf 'branch: %s\n' "$branch"
+  printf 'toolchain: %s\n' "$toolchain"
+  printf 'prefix: %s\n' "$prefix"
+  printf 'source checkout: %s\n' "$source_dir"
+  printf 'system dependencies: %s\n' "$([[ "$install_deps" -eq 1 ]] && printf yes || printf no)"
+  printf 'hardware support: %s\n' "$([[ "$hardware" -eq 1 ]] && printf yes || printf no)"
+  printf 'detected OS: %s\n' "$os_name"
+  if [[ "$os_name" == "Darwin" ]]; then
+    printf 'macOS shader mode: %s\n' "$macos_shader_mode"
+    printf 'would install: ~/Applications/RailOxide.app and %s/bin/railoxide-wallet\n' "$prefix"
+  elif [[ "$os_name" == "Linux" ]]; then
+    printf 'would install: %s/bin/railoxide-wallet\n' "$prefix"
+    printf 'would install desktop entry and icons under ~/.local/share\n'
+  fi
+}
+
+ensure_not_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    die 'do not run this installer as root; it uses sudo only when system packages are needed'
+  fi
+}
+
+load_cargo_env() {
+  if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+  fi
+}
+
+ensure_rust() {
+  load_cargo_env
+
+  if ! command_exists rustup; then
+    [[ "$install_deps" -eq 1 ]] || die 'rustup is missing and --no-deps was provided'
+    log "installing rustup with Rust $toolchain"
+    if confirm 'Install Rust with rustup?'; then
+      run_shell "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain '$toolchain'"
+      load_cargo_env
+    else
+      die 'Rust is required to build RailOxide'
+    fi
+  fi
+
+  command_exists rustup || die 'rustup is still unavailable after installation'
+  log "installing Rust toolchain $toolchain"
+  run rustup toolchain install "$toolchain"
+}
+
+ensure_common_tools() {
+  if ! command_exists git; then
+    die 'git is required; install Git or rerun without --no-deps on a supported OS'
+  fi
+
+  if ! command_exists curl; then
+    die 'curl is required; install curl or rerun without --no-deps on a supported OS'
+  fi
+}
+
+ensure_macos_command_line_tools() {
+  if xcode-select -p >/dev/null 2>&1; then
+    return
+  fi
+
+  [[ "$install_deps" -eq 1 ]] || die "Apple Command Line Tools are missing and --no-deps was provided"
+
+  if confirm "Install Apple's Command Line Tools now?"; then
+    run xcode-select --install
+    die "Command Line Tools installation has started. Rerun this installer after it finishes."
+  fi
+
+  die "Apple Command Line Tools are required to build RailOxide"
+}
+
+install_macos_protoc() {
+  local arch archive_arch url protoc_root zip_path
+  arch="$(uname -m)"
+  case "$arch" in
+    arm64) archive_arch="osx-aarch_64" ;;
+    x86_64) archive_arch="osx-x86_64" ;;
+    *) die "unsupported macOS architecture for protoc: $arch" ;;
+  esac
+
+  protoc_root="$prefix/protoc-$protobuf_version"
+  zip_path="$protoc_root/protoc.zip"
+  url="https://github.com/protocolbuffers/protobuf/releases/download/v$protobuf_version/protoc-$protobuf_version-$archive_arch.zip"
+
+  log "installing protoc $protobuf_version under $protoc_root"
+  run mkdir -p "$protoc_root"
+  run curl -fL "$url" -o "$zip_path"
+  run ditto -x -k "$zip_path" "$protoc_root"
+  export PATH="$protoc_root/bin:$PATH"
+}
+
+ensure_macos_protoc() {
+  if command_exists protoc; then
+    return
+  fi
+
+  local protoc_root="$prefix/protoc-$protobuf_version"
+  if [[ -x "$protoc_root/bin/protoc" ]]; then
+    export PATH="$protoc_root/bin:$PATH"
+    return
+  fi
+
+  [[ "$install_deps" -eq 1 ]] || die 'protoc is missing and --no-deps was provided'
+
+  if confirm "Download protoc $protobuf_version into $protoc_root?"; then
+    install_macos_protoc
+  else
+    die 'protoc is required to build RailOxide'
+  fi
+}
+
+full_xcode_developer_dir() {
+  if [[ -n "${DEVELOPER_DIR:-}" && -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
+    printf '%s\n' "$DEVELOPER_DIR"
+    return 0
+  fi
+
+  local selected=""
+  selected="$(xcode-select -p 2>/dev/null || true)"
+  if [[ "$selected" == */Xcode.app/Contents/Developer && -x "$selected/usr/bin/xcodebuild" ]]; then
+    printf '%s\n' "$selected"
+    return 0
+  fi
+
+  if [[ -x "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild" ]]; then
+    printf '%s\n' "/Applications/Xcode.app/Contents/Developer"
+    return 0
+  fi
+
+  return 1
+}
+
+has_metal_tools() {
+  local developer_dir="$1"
+  env DEVELOPER_DIR="$developer_dir" xcrun --find metal >/dev/null 2>&1 && \
+    env DEVELOPER_DIR="$developer_dir" xcrun --find metallib >/dev/null 2>&1
+}
+
+maybe_download_metal_toolchain() {
+  local developer_dir="$1"
+
+  [[ "$install_deps" -eq 1 ]] || return 1
+
+  if confirm "Full Xcode is installed, but Metal tools are missing. Download the Metal toolchain component?"; then
+    log 'downloading Xcode Metal toolchain component'
+    if run env DEVELOPER_DIR="$developer_dir" xcodebuild -downloadComponent MetalToolchain; then
+      has_metal_tools "$developer_dir"
+      return $?
+    fi
+  fi
+
+  return 1
+}
+
+runtime_shader_features() {
+  local feature_prefix="$1"
+
+  if [[ -n "$feature_prefix" ]]; then
+    printf '%s,gpui/runtime_shaders\n' "$feature_prefix"
+  else
+    printf 'gpui/runtime_shaders\n'
+  fi
+}
+
+set_macos_build_settings() {
+  local feature_prefix=""
+  if [[ "$hardware" -eq 1 ]]; then
+    feature_prefix="hardware"
+  fi
+
+  macos_build_features=""
+  macos_build_developer_dir=""
+
+  if [[ "$macos_shader_mode" == "runtime" ]]; then
+    macos_build_features="$(runtime_shader_features "$feature_prefix")"
+    return
+  fi
+
+  local developer_dir=""
+  if developer_dir="$(full_xcode_developer_dir)"; then
+    if has_metal_tools "$developer_dir"; then
+      log "using Xcode Metal shader compilation from $developer_dir"
+      macos_build_developer_dir="$developer_dir"
+      macos_build_features="$feature_prefix"
+      return
+    fi
+
+    if maybe_download_metal_toolchain "$developer_dir"; then
+      log "using Xcode Metal shader compilation from $developer_dir"
+      macos_build_developer_dir="$developer_dir"
+      macos_build_features="$feature_prefix"
+      return
+    fi
+
+    if [[ "$macos_shader_mode" == "metal" ]]; then
+      die 'Metal build was requested, but full Xcode Metal tools are unavailable'
+    fi
+
+    warn 'full Xcode is installed, but Metal tools are unavailable; falling back to runtime shaders'
+  elif [[ "$macos_shader_mode" == "metal" ]]; then
+    die 'Metal build was requested, but full Xcode is not installed'
+  else
+    log 'full Xcode not found; using runtime shaders'
+  fi
+
+  macos_build_features="$(runtime_shader_features "$feature_prefix")"
+}
+
+ensure_linux_packages() {
+  if [[ "$install_deps" -eq 0 ]]; then
+    return
+  fi
+
+  if ! command_exists apt-get; then
+    die 'automatic Linux dependency installation currently requires apt-get; use --no-deps after installing dependencies manually'
+  fi
+
+  if ! confirm 'Install/upgrade Ubuntu/Debian build dependencies with sudo apt-get?'; then
+    die 'system dependencies are required to build RailOxide'
+  fi
+
+  local packages=(
+    build-essential
+    clang
+    cmake
+    curl
+    elfutils
+    gettext-base
+    git
+    jq
+    lld
+    llvm
+    pkg-config
+    protobuf-compiler
+    libasound2-dev
+    libfontconfig-dev
+    libglib2.0-dev
+    libsqlite3-dev
+    libssl-dev
+    libstdc++-14-dev
+    libudev-dev
+    libusb-1.0-0-dev
+    libva-dev
+    libvulkan1
+    libwayland-dev
+    libx11-xcb-dev
+    libxkbcommon-x11-dev
+    libzstd-dev
+    pipewire
+    xdg-desktop-portal
+  )
+
+  log 'installing Linux build dependencies'
+  run sudo apt-get update
+  run sudo apt-get install -y "${packages[@]}"
+}
+
+managed_marker_path() {
+  printf '%s/.railoxide-installer-managed\n' "$source_dir"
+}
+
+ensure_source_checkout() {
+  local marker parent
+  marker="$(managed_marker_path)"
+  parent="$(dirname "$source_dir")"
+
+  if [[ ! -d "$source_dir" ]]; then
+    log "cloning RailOxide main into $source_dir"
+    run mkdir -p "$parent"
+    run git clone --branch "$branch" --single-branch "$repo_url" "$source_dir"
+    write_installer_marker "$marker"
+    return
+  fi
+
+  if [[ ! -f "$marker" ]]; then
+    die "$source_dir already exists and is not marked as installer-managed; pass --source-dir to use another path"
+  fi
+
+  if [[ ! -d "$source_dir/.git" ]]; then
+    die "$source_dir exists but is not a Git checkout"
+  fi
+
+  if [[ -n "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ]]; then
+    die "$source_dir has local modifications; resolve them or use --source-dir with a fresh path"
+  fi
+
+  log "updating RailOxide main in $source_dir"
+  run git -C "$source_dir" fetch origin "$branch"
+  run git -C "$source_dir" checkout "$branch"
+  run git -C "$source_dir" merge --ff-only "origin/$branch"
+}
+
+current_source_commit() {
+  git -C "$source_dir" rev-parse HEAD
+}
+
+base_features() {
+  if [[ "$hardware" -eq 1 ]]; then
+    printf 'hardware\n'
+  else
+    printf '\n'
+  fi
+}
+
+build_linux() {
+  local features
+  features="$(base_features)"
+  log 'building RailOxide wallet release binary'
+  if [[ -n "$features" ]]; then
+    run cargo "+$toolchain" build --release -p wallet --features "$features"
+  else
+    run cargo "+$toolchain" build --release -p wallet
+  fi
+}
+
+install_linux_binary() {
+  local bin_dir dst src
+  bin_dir="$prefix/bin"
+  src="$source_dir/target/release/wallet"
+  dst="$bin_dir/railoxide-wallet"
+
+  log "installing $dst"
+  run mkdir -p "$bin_dir"
+  run install -m 755 "$src" "$dst"
+}
+
+install_linux_desktop_entry() {
+  local applications_dir icons_dir desktop_file icon_src
+  applications_dir="$HOME/.local/share/applications"
+  icons_dir="$HOME/.local/share/icons/hicolor/512x512/apps"
+  desktop_file="$applications_dir/app.railoxide.wallet.desktop"
+  icon_src="$source_dir/bins/wallet/packaging/icons/png/512x512.png"
+
+  log 'installing Linux desktop entry'
+  run mkdir -p "$applications_dir" "$icons_dir"
+  run install -m 644 "$icon_src" "$icons_dir/app.railoxide.wallet.png"
+  write_linux_desktop_file "$desktop_file"
+
+  if command_exists update-desktop-database; then
+    run update-desktop-database "$applications_dir"
+  fi
+}
+
+build_and_install_macos() {
+  local features app_src app_dst wrapper
+  set_macos_build_settings
+  features="$macos_build_features"
+  app_src="$source_dir/target/macos/RailOxide.app"
+  app_dst="$HOME/Applications/RailOxide.app"
+  wrapper="$prefix/bin/railoxide-wallet"
+
+  log "packaging RailOxide.app with features: ${features:-none}"
+  if [[ -n "$macos_build_developer_dir" ]]; then
+    run env DEVELOPER_DIR="$macos_build_developer_dir" CARGO_TOOLCHAIN="$toolchain" CARGO_FEATURES="$features" "$source_dir/scripts/package-wallet-macos"
+  else
+    run env CARGO_TOOLCHAIN="$toolchain" CARGO_FEATURES="$features" "$source_dir/scripts/package-wallet-macos"
+  fi
+
+  if [[ -d "$app_dst" ]]; then
+    if confirm "Replace existing $app_dst?"; then
+      run rm -rf "$app_dst"
+    else
+      die "cannot install without replacing $app_dst"
+    fi
+  fi
+
+  log "installing $app_dst"
+  run mkdir -p "$HOME/Applications" "$prefix/bin"
+  run ditto "$app_src" "$app_dst"
+  write_macos_wrapper "$wrapper"
+}
+
+smoke_test() {
+  local os_name="$1"
+  log 'verifying installed wallet command parses --help'
+  if [[ "$os_name" == "Darwin" ]]; then
+    run "$prefix/bin/railoxide-wallet" --help
+  else
+    run "$prefix/bin/railoxide-wallet" --help
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  if [[ "$verbose" -eq 1 ]]; then
+    set -x
+  fi
+
+  local os_name
+  os_name="$(uname -s)"
+  case "$os_name" in
+    Darwin|Linux) ;;
+    *) die "unsupported OS: $os_name" ;;
+  esac
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    dry_run_plan "$os_name"
+    exit 0
+  fi
+
+  ensure_not_root
+
+  if [[ "$os_name" == "Darwin" ]]; then
+    ensure_macos_command_line_tools
+    ensure_common_tools
+    ensure_macos_protoc
+    ensure_rust
+    ensure_source_checkout
+    log "building source commit $(current_source_commit)"
+    cd "$source_dir"
+    build_and_install_macos
+    smoke_test "$os_name"
+    log "installed RailOxide.app to $HOME/Applications/RailOxide.app"
+  else
+    ensure_linux_packages
+    ensure_common_tools
+    ensure_rust
+    ensure_source_checkout
+    log "building source commit $(current_source_commit)"
+    cd "$source_dir"
+    build_linux
+    install_linux_binary
+    install_linux_desktop_entry
+    smoke_test "$os_name"
+    log "installed railoxide-wallet to $prefix/bin/railoxide-wallet"
+  fi
+
+  log 'done'
+}
+
+main "$@"

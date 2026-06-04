@@ -16,7 +16,9 @@ binary_dst="$macos_dir/$app_name"
 plist_src="$repo_root/bins/wallet/packaging/macos/Info.plist"
 icon_src="$repo_root/bins/wallet/packaging/icons/macos/RailOxide.icns"
 codesign_identity="${CODESIGN_IDENTITY:--}"
-cargo_features="${CARGO_FEATURES:-hardware,gpui/runtime_shaders}"
+cargo_features="${CARGO_FEATURES-hardware,gpui/runtime_shaders}"
+cargo_bin="${CARGO_BIN:-cargo}"
+cargo_toolchain="${CARGO_TOOLCHAIN:-}"
 
 require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -25,7 +27,7 @@ require_tool() {
   fi
 }
 
-require_tool cargo
+require_tool "$cargo_bin"
 require_tool codesign
 require_tool ditto
 require_tool hdiutil
@@ -46,7 +48,16 @@ if [[ ! -f "$icon_src" ]]; then
   exit 1
 fi
 
-cargo build --release -p wallet --features "$cargo_features"
+cargo_command=("$cargo_bin")
+if [[ -n "$cargo_toolchain" ]]; then
+  cargo_command+=("+$cargo_toolchain")
+fi
+
+if [[ -n "$cargo_features" ]]; then
+  "${cargo_command[@]}" build --release -p wallet --features "$cargo_features"
+else
+  "${cargo_command[@]}" build --release -p wallet
+fi
 
 rm -rf "$app_bundle"
 mkdir -p "$macos_dir" "$resources_dir"
