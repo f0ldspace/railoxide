@@ -6,6 +6,7 @@ fn chain_load_uses_default_sync_options() {
 
     assert_eq!(overrides.init_block_number, None);
     assert_eq!(overrides.sync_to_block, None);
+    assert_eq!(overrides.sync_start_policy, None);
     assert!(overrides.use_indexed_wallet_catch_up);
     assert!(!overrides.rewind_wallet_cache);
 }

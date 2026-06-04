@@ -38,6 +38,240 @@ pub(crate) struct DesktopWalletChainStart {
     pub(crate) last_scanned_block: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NewWalletChainMetadataInitReport {
+    pub(crate) initialized: usize,
+    pub(crate) skipped_disabled: usize,
+    pub(crate) skipped_selected: usize,
+    pub(crate) skipped_existing: usize,
+    pub(crate) deployment_fallbacks: usize,
+    pub(crate) failed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NewWalletChainBaseline {
+    start: DesktopWalletChainStart,
+    used_deployment_fallback: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NewWalletChainMetadataInitOutcome {
+    Initialized { used_deployment_fallback: bool },
+    SkippedExisting,
+    Failed,
+}
+
+#[must_use]
+pub(crate) const fn new_wallet_chain_start_from_deployment(
+    deployment_block: u64,
+) -> DesktopWalletChainStart {
+    DesktopWalletChainStart {
+        start_block: deployment_block,
+        last_scanned_block: deployment_block.saturating_sub(1),
+    }
+}
+
+#[must_use]
+pub(crate) const fn new_wallet_chain_start_from_head(
+    deployment_block: u64,
+    finality_depth: u64,
+    head: u64,
+) -> DesktopWalletChainStart {
+    let finalized_head = head.saturating_sub(finality_depth);
+    let safe_head = if finalized_head > deployment_block {
+        finalized_head
+    } else {
+        deployment_block
+    };
+    DesktopWalletChainStart {
+        start_block: safe_head.saturating_add(1),
+        last_scanned_block: safe_head,
+    }
+}
+
+pub(crate) async fn initialize_new_wallet_chain_metadata_for_session(
+    view_session: Arc<vault::DesktopViewSession>,
+    effective_chains: BTreeMap<u64, settings::EffectiveChainConfig>,
+    db: Arc<DbStore>,
+    http: HttpContext,
+    skip_chain_id: Option<u64>,
+) -> NewWalletChainMetadataInitReport {
+    let vault_store = vault::DesktopVaultStore::from_db(db);
+    let mut report = NewWalletChainMetadataInitReport::default();
+
+    for effective_chain in effective_chains.into_values() {
+        if !effective_chain.enabled {
+            report.skipped_disabled += 1;
+            continue;
+        }
+        if skip_chain_id == Some(effective_chain.chain_id) {
+            report.skipped_selected += 1;
+            continue;
+        }
+
+        match initialize_new_wallet_chain_metadata_for_chain(
+            &vault_store,
+            view_session.as_ref(),
+            &effective_chain,
+            &http,
+        )
+        .await
+        {
+            NewWalletChainMetadataInitOutcome::Initialized {
+                used_deployment_fallback,
+            } => {
+                report.initialized += 1;
+                if used_deployment_fallback {
+                    report.deployment_fallbacks += 1;
+                }
+            }
+            NewWalletChainMetadataInitOutcome::SkippedExisting => {
+                report.skipped_existing += 1;
+            }
+            NewWalletChainMetadataInitOutcome::Failed => {
+                report.failed += 1;
+            }
+        }
+    }
+
+    report
+}
+
+async fn initialize_new_wallet_chain_metadata_for_chain(
+    vault_store: &vault::DesktopVaultStore,
+    view_session: &vault::DesktopViewSession,
+    effective_chain: &settings::EffectiveChainConfig,
+    http: &HttpContext,
+) -> NewWalletChainMetadataInitOutcome {
+    let chain_id = effective_chain.chain_id;
+    let chain_defaults = match chain_defaults_for_chain(chain_id) {
+        Ok(defaults) => defaults,
+        Err(error) => {
+            tracing::warn!(chain_id, error = %error, "skip new wallet chain metadata for unsupported chain");
+            return NewWalletChainMetadataInitOutcome::Failed;
+        }
+    };
+    let contract = match parse_effective_address(
+        "railgun contract",
+        &effective_chain.railgun_contract,
+    ) {
+        Ok(contract) => contract.to_checksum(None),
+        Err(error) => {
+            tracing::warn!(chain_id, error = %error, "skip new wallet chain metadata for invalid contract");
+            return NewWalletChainMetadataInitOutcome::Failed;
+        }
+    };
+
+    match vault_store.find_wallet_chain_metadata_for_session(view_session, 0, chain_id, &contract) {
+        Ok(Some(_)) => return NewWalletChainMetadataInitOutcome::SkippedExisting,
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(chain_id, error = %error, "failed to check existing new wallet chain metadata");
+            return NewWalletChainMetadataInitOutcome::Failed;
+        }
+    }
+
+    let baseline = new_wallet_chain_baseline(&chain_defaults, effective_chain, http).await;
+
+    match vault_store.find_wallet_chain_metadata_for_session(view_session, 0, chain_id, &contract) {
+        Ok(Some(_)) => return NewWalletChainMetadataInitOutcome::SkippedExisting,
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(chain_id, error = %error, "failed to recheck new wallet chain metadata");
+            return NewWalletChainMetadataInitOutcome::Failed;
+        }
+    }
+
+    match vault_store.create_wallet_chain_metadata_for_session(
+        view_session,
+        0,
+        chain_id,
+        &contract,
+        baseline.start.start_block,
+        baseline.start.last_scanned_block,
+    ) {
+        Ok(_) => {
+            tracing::info!(
+                chain_id,
+                start_block = baseline.start.start_block,
+                last_scanned_block = baseline.start.last_scanned_block,
+                used_deployment_fallback = baseline.used_deployment_fallback,
+                "initialized new wallet chain metadata"
+            );
+            NewWalletChainMetadataInitOutcome::Initialized {
+                used_deployment_fallback: baseline.used_deployment_fallback,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(chain_id, error = %error, "failed to create new wallet chain metadata");
+            NewWalletChainMetadataInitOutcome::Failed
+        }
+    }
+}
+
+async fn new_wallet_chain_baseline(
+    defaults: &ChainConfigDefaults,
+    effective_chain: &settings::EffectiveChainConfig,
+    http: &HttpContext,
+) -> NewWalletChainBaseline {
+    match fetch_new_wallet_chain_head(defaults, effective_chain, http).await {
+        Ok(head) => NewWalletChainBaseline {
+            start: new_wallet_chain_start_from_head(
+                effective_chain.deployment_block,
+                effective_chain.finality_depth,
+                head,
+            ),
+            used_deployment_fallback: false,
+        },
+        Err(error) => {
+            tracing::warn!(
+                chain_id = effective_chain.chain_id,
+                error = %error,
+                "falling back to deployment block for new wallet chain metadata"
+            );
+            NewWalletChainBaseline {
+                start: new_wallet_chain_start_from_deployment(effective_chain.deployment_block),
+                used_deployment_fallback: true,
+            }
+        }
+    }
+}
+
+async fn fetch_new_wallet_chain_head(
+    defaults: &ChainConfigDefaults,
+    effective_chain: &settings::EffectiveChainConfig,
+    http: &HttpContext,
+) -> Result<u64> {
+    let chain_cfg = chain_config(defaults, None, Some(effective_chain), http, None)?;
+    let providers = chain_cfg.rpcs.available_providers();
+    if providers.is_empty() {
+        return Err(eyre!("no RPC providers configured"));
+    }
+
+    let mut last_error = None;
+    for provider in providers {
+        match provider.provider.get_block_number().await {
+            Ok(head) => return Ok(head),
+            Err(error) => {
+                let message = error.to_string();
+                tracing::warn!(
+                    chain_id = effective_chain.chain_id,
+                    rpc = provider.url.as_str(),
+                    error = %message,
+                    "failed to fetch new wallet chain metadata baseline head"
+                );
+                chain_cfg.rpcs.mark_bad_provider(&provider);
+                last_error = Some(message);
+            }
+        }
+    }
+
+    Err(eyre!(
+        "all RPC providers failed{}",
+        last_error.map_or_else(String::new, |error| format!("; last error: {error}"))
+    ))
+}
+
 pub(crate) fn resolve_desktop_wallet_chain_start(
     policy: DesktopWalletSyncStartPolicy,
     existing_metadata: Option<&vault::WalletChainMetadataBundle>,
@@ -57,19 +291,13 @@ pub(crate) fn resolve_desktop_wallet_chain_start(
 
     if rewind_wallet_cache {
         let start_block = init_block_number.unwrap_or(deployment_block);
-        return Ok(DesktopWalletChainStart {
-            start_block,
-            last_scanned_block: start_block.saturating_sub(1),
-        });
+        return Ok(new_wallet_chain_start_from_deployment(start_block));
     }
 
     match policy {
         DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill => {
             let start_block = init_block_number.unwrap_or(deployment_block);
-            Ok(DesktopWalletChainStart {
-                start_block,
-                last_scanned_block: start_block.saturating_sub(1),
-            })
+            Ok(new_wallet_chain_start_from_deployment(start_block))
         }
         DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill => {
             let safe_head = safe_head.ok_or_else(|| {

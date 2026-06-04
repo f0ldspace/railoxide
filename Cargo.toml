@@ -75,15 +75,15 @@ zeroize = { version = "1", features = ["derive"] }
 arti-client = "0.42"
 tor-rtcompat = "0.42"
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
-waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b4a1899e0793763121949e7b6368aa019d63851e" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
+waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "11d5a8862c0bfb303373d70637cf0fbabac4936f" }
 
 #[patch.crates-io]
 #wasmer-vm = { git = "https://github.com/triamazikamno/wasmer", rev = "d94b171d85bb5ff2aa7c4954a1921c9fb482be0c" }

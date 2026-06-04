@@ -2367,7 +2367,9 @@ impl WalletRoot {
         };
 
         match result {
-            Ok((session, metadata)) => self.enter_view_unlocked(session, metadata, window, cx),
+            Ok((session, metadata)) => {
+                self.enter_new_wallet_view_unlocked(session, metadata, window, cx)
+            }
             Err(error) => self.handle_vault_error(&error, cx),
         }
     }
@@ -2522,7 +2524,11 @@ impl WalletRoot {
                 root.hardware_wallet_creation_in_progress = false;
                 match result {
                     Ok(Ok((session, metadata))) => {
-                        root.enter_view_unlocked(session, metadata, window, cx);
+                        if sync_intent == HardwareWalletSyncIntent::CreateNew {
+                            root.enter_new_wallet_view_unlocked(session, metadata, window, cx);
+                        } else {
+                            root.enter_view_unlocked(session, metadata, window, cx);
+                        }
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {
                         root.handle_hardware_wallet_setup_vault_error(&error, "", window, cx);
@@ -3227,7 +3233,11 @@ impl WalletRoot {
                 root.hardware_profile_unlock.action_label = None;
                 match result {
                     Ok(Ok((session, metadata))) => {
-                        root.install_view_session(session, metadata, window, cx);
+                        if sync_intent == HardwareWalletSyncIntent::CreateNew {
+                            root.enter_new_wallet_view_unlocked(session, metadata, window, cx);
+                        } else {
+                            root.install_view_session(session, metadata, window, cx);
+                        }
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {
                         root.handle_hardware_profile_vault_error(&error);
@@ -3321,7 +3331,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.install_view_session_with_dialog_policy(session, metadata, true, window, cx);
+        self.install_view_session_with_dialog_policy(session, metadata, true, None, window, cx);
     }
 
     pub(super) fn install_view_session_after_management(
@@ -3331,7 +3341,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.install_view_session_with_dialog_policy(session, metadata, false, window, cx);
+        self.install_view_session_with_dialog_policy(session, metadata, false, None, window, cx);
     }
 
     #[cfg(feature = "hardware")]
@@ -3361,6 +3371,7 @@ impl WalletRoot {
         session: DesktopViewSession,
         metadata: Vec<WalletMetadataBundle>,
         close_dialogs: bool,
+        initial_sync_start_policy: Option<wallet_ops::DesktopWalletSyncStartPolicy>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -3404,7 +3415,11 @@ impl WalletRoot {
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
-        self.ensure_chain_load(self.selected_chain, cx);
+        self.ensure_chain_load_with_start_policy(
+            self.selected_chain,
+            initial_sync_start_policy,
+            cx,
+        );
         cx.notify();
     }
 
@@ -3432,6 +3447,48 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.install_view_session(session, metadata, window, cx);
+    }
+
+    fn enter_new_wallet_view_unlocked(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: Vec<WalletMetadataBundle>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.install_view_session_with_dialog_policy(
+            session,
+            metadata,
+            true,
+            Some(wallet_ops::DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill),
+            window,
+            cx,
+        );
+        self.initialize_created_wallet_chain_metadata();
+    }
+
+    fn initialize_created_wallet_chain_metadata(&self) {
+        let Some(view_session) = self.view_session.clone() else {
+            return;
+        };
+        let Some(vault_store) = self.vault_store.as_ref() else {
+            return;
+        };
+        let effective_chains = self.effective_chain_configs.clone();
+        let db = vault_store.db();
+        let http = self.http.clone();
+        let skip_chain_id = Some(self.selected_chain);
+
+        self.runtime.spawn(async move {
+            wallet_ops::initialize_created_wallet_chain_metadata_for_session(
+                view_session,
+                effective_chains,
+                db,
+                http,
+                skip_chain_id,
+            )
+            .await;
+        });
     }
 
     pub(super) fn enter_password_metadata_unlocked(

@@ -93,6 +93,7 @@ impl ChainUtxoState {
 pub(super) struct ChainLoadOverrides {
     pub(super) init_block_number: Option<u64>,
     pub(super) sync_to_block: Option<u64>,
+    pub(super) sync_start_policy: Option<DesktopWalletSyncStartPolicy>,
     pub(super) use_indexed_wallet_catch_up: bool,
     pub(super) rewind_wallet_cache: bool,
 }
@@ -101,6 +102,7 @@ pub(super) const fn chain_load_overrides() -> ChainLoadOverrides {
     ChainLoadOverrides {
         init_block_number: None,
         sync_to_block: None,
+        sync_start_policy: None,
         use_indexed_wallet_catch_up: true,
         rewind_wallet_cache: false,
     }
@@ -280,6 +282,17 @@ impl WalletRoot {
         self.start_chain_load(chain_id, &overrides, false, cx);
     }
 
+    pub(super) fn ensure_chain_load_with_start_policy(
+        &mut self,
+        chain_id: u64,
+        sync_start_policy: Option<DesktopWalletSyncStartPolicy>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let mut overrides = chain_load_overrides();
+        overrides.sync_start_policy = sync_start_policy;
+        self.start_chain_load(chain_id, &overrides, false, cx);
+    }
+
     pub(super) fn start_chain_load(
         &mut self,
         chain_id: u64,
@@ -342,7 +355,9 @@ impl WalletRoot {
             view_session,
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
-            sync_start_policy: self.selected_wallet_sync_start_policy(),
+            sync_start_policy: overrides
+                .sync_start_policy
+                .unwrap_or_else(|| self.selected_wallet_sync_start_policy()),
             init_block_number: overrides.init_block_number,
             sync_to_block: overrides.sync_to_block,
             use_indexed_wallet_catch_up: overrides.use_indexed_wallet_catch_up,

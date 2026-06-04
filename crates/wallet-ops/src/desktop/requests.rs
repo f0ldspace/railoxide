@@ -55,7 +55,7 @@ pub enum DesktopWalletSyncStartPolicy {
 impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
     fn from(value: vault::WalletSource) -> Self {
         match value {
-            vault::WalletSource::Generated => Self::CurrentSafeHeadNoBackfill,
+            vault::WalletSource::Generated => Self::ImportedHistoricalBackfill,
             vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
             vault::WalletSource::LedgerDerived | vault::WalletSource::TrezorDerived => {
                 Self::ImportedHistoricalBackfill
@@ -67,7 +67,7 @@ impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
 impl From<&vault::WalletMetadataBundle> for DesktopWalletSyncStartPolicy {
     fn from(value: &vault::WalletMetadataBundle) -> Self {
         match value.source {
-            vault::WalletSource::Generated => Self::CurrentSafeHeadNoBackfill,
+            vault::WalletSource::Generated => Self::ImportedHistoricalBackfill,
             vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
             vault::WalletSource::LedgerDerived | vault::WalletSource::TrezorDerived => {
                 match value
@@ -75,10 +75,10 @@ impl From<&vault::WalletMetadataBundle> for DesktopWalletSyncStartPolicy {
                     .as_ref()
                     .map(|descriptor| descriptor.sync_intent)
                 {
-                    Some(crate::hardware::HardwareWalletSyncIntent::CreateNew) => {
-                        Self::CurrentSafeHeadNoBackfill
+                    Some(hardware::HardwareWalletSyncIntent::CreateNew) => {
+                        Self::ImportedHistoricalBackfill
                     }
-                    Some(crate::hardware::HardwareWalletSyncIntent::RecoverExisting) | None => {
+                    Some(hardware::HardwareWalletSyncIntent::RecoverExisting) | None => {
                         Self::ImportedHistoricalBackfill
                     }
                 }

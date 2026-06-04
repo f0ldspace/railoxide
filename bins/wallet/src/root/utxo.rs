@@ -706,9 +706,12 @@ impl WalletRoot {
             Some(ChainUtxoState::Error { message, .. }) => {
                 self.render_chain_error_body(root, message.as_ref())
             }
-            Some(ChainUtxoState::Ready { snapshot, .. }) if snapshot.utxo_count == 0 => {
-                centered_message("No UTXOs found")
-            }
+            Some(ChainUtxoState::Ready {
+                snapshot, session, ..
+            }) if snapshot.utxo_count == 0 => centered_message(format!(
+                "No UTXOs found. Synced from block {}.",
+                session.start_block
+            )),
             Some(state) if state.renders_table() => div()
                 .size_full()
                 .min_w(px(0.0))

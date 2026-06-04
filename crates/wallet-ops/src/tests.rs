@@ -43,10 +43,12 @@ use super::{
     decode_public_broadcaster_response, eligible_public_broadcasters,
     fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
     fixed_token_anchor_rate, initial_separate_token_public_broadcaster_fee,
+    initialize_new_wallet_chain_metadata_for_session,
     is_self_broadcast_insufficient_native_gas_error, is_self_broadcast_tx_already_known_message,
     is_wrapped_native_token, max_broadcaster_fee_token_amount_from_outputs,
-    max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
-    parse_send_amount, parse_submitted_tx_hash, parse_unshield_amount,
+    max_send_amount_from_outputs, max_unshield_amount_from_outputs,
+    new_wallet_chain_start_from_deployment, new_wallet_chain_start_from_head,
+    parse_railgun_recipient, parse_send_amount, parse_submitted_tx_hash, parse_unshield_amount,
     public_broadcaster_amount_split, public_broadcaster_amount_split_for_tokens,
     public_broadcaster_amount_split_for_tokens_and_protocol,
     public_broadcaster_anchor_rate_for_policy, public_broadcaster_bound_min_gas_price,
@@ -66,6 +68,9 @@ use super::{
 };
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TEST_PASSWORD: &str = "correct horse battery staple";
+const TEST_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
 fn address(byte: u8) -> Address {
     Address::from_slice(&[byte; 20])
@@ -106,6 +111,44 @@ fn hardware_wallet_metadata(sync_intent: HardwareWalletSyncIntent) -> vault::Wal
         display_order: 0,
         hardware_descriptor: Some(descriptor),
         hardware_account: None,
+    }
+}
+
+fn effective_chain_config_with_rpc_endpoints(
+    chain_id: u64,
+    rpc_endpoints: Vec<String>,
+    deployment_block: u64,
+) -> super::settings::EffectiveChainConfig {
+    let defaults = ChainConfigDefaults::for_chain(chain_id).expect("chain defaults");
+    super::settings::EffectiveChainConfig {
+        chain_id,
+        enabled: true,
+        rpc_endpoints,
+        archive_rpc_url: None,
+        quick_sync_enabled: true,
+        quick_sync_endpoint: defaults
+            .quick_sync_endpoint
+            .as_ref()
+            .map(ToString::to_string),
+        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
+        deployment_block,
+        v2_start_block: defaults.v2_start_block,
+        legacy_shield_block: defaults.legacy_shield_block,
+        archive_until_block: defaults.archive_until_block,
+        railgun_contract: defaults.contract.to_string(),
+        relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
+        relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
+        wrapped_native_token: wrapped_native_token_for_chain(chain_id)
+            .map(|token| token.to_string()),
+        multicall_contract: defaults.multicall_contract.to_string(),
+        finality_depth: defaults.finality_depth,
+        block_range: None,
+        poll_interval_secs: None,
+        gas: super::settings::EffectiveChainGasSettings {
+            gas_limit_buffer: super::GAS_LIMIT_BUFFER,
+            gas_price_buffer_numerator: 105,
+            gas_price_buffer_denominator: 100,
+        },
     }
 }
 
@@ -187,9 +230,9 @@ fn sample_pre_tx_poi(byte: u8) -> PreTxPoi {
 }
 
 #[test]
-fn desktop_wallet_start_policy_generated_uses_safe_head_no_backfill() {
+fn desktop_wallet_start_policy_generated_defaults_to_historical_backfill() {
     let resolved = resolve_desktop_wallet_chain_start(
-        DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+        DesktopWalletSyncStartPolicy::from(vault::WalletSource::Generated),
         None,
         None,
         100,
@@ -201,8 +244,8 @@ fn desktop_wallet_start_policy_generated_uses_safe_head_no_backfill() {
     assert_eq!(
         resolved,
         DesktopWalletChainStart {
-            start_block: 251,
-            last_scanned_block: 250,
+            start_block: 100,
+            last_scanned_block: 99,
         }
     );
 }
@@ -229,11 +272,11 @@ fn desktop_wallet_start_policy_imported_uses_deployment_block() {
 }
 
 #[test]
-fn desktop_wallet_start_policy_new_hardware_uses_safe_head_no_backfill() {
+fn desktop_wallet_start_policy_new_hardware_defaults_to_historical_backfill() {
     let metadata = hardware_wallet_metadata(HardwareWalletSyncIntent::CreateNew);
     assert_eq!(
         DesktopWalletSyncStartPolicy::from(&metadata),
-        DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill
+        DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill
     );
 
     let resolved = resolve_desktop_wallet_chain_start(
@@ -249,10 +292,149 @@ fn desktop_wallet_start_policy_new_hardware_uses_safe_head_no_backfill() {
     assert_eq!(
         resolved,
         DesktopWalletChainStart {
+            start_block: 100,
+            last_scanned_block: 99,
+        }
+    );
+}
+
+#[test]
+fn desktop_wallet_creation_override_uses_safe_head_no_backfill() {
+    let resolved = resolve_desktop_wallet_chain_start(
+        DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+        None,
+        None,
+        100,
+        Some(250),
+        false,
+    )
+    .expect("resolve generated creation start");
+
+    assert_eq!(
+        resolved,
+        DesktopWalletChainStart {
             start_block: 251,
             last_scanned_block: 250,
         }
     );
+}
+
+#[test]
+fn new_wallet_chain_start_helpers_use_expected_baselines() {
+    assert_eq!(
+        new_wallet_chain_start_from_deployment(100),
+        DesktopWalletChainStart {
+            start_block: 100,
+            last_scanned_block: 99,
+        }
+    );
+    assert_eq!(
+        new_wallet_chain_start_from_head(100, 10, 250),
+        DesktopWalletChainStart {
+            start_block: 241,
+            last_scanned_block: 240,
+        }
+    );
+    assert_eq!(
+        new_wallet_chain_start_from_head(100, 10, 50),
+        DesktopWalletChainStart {
+            start_block: 101,
+            last_scanned_block: 100,
+        }
+    );
+}
+
+#[test]
+fn new_wallet_chain_metadata_initializer_creates_deployment_fallback_metadata() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
+    store
+        .create_vault_with_params(TEST_PASSWORD, vault::KdfParams::new(1024, 1, 1))
+        .expect("create vault");
+    let wallet_id = "generated-wallet";
+    let metadata = store
+        .new_wallet_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            0,
+            vault::WalletSource::Generated,
+            "Generated",
+        )
+        .expect("wallet metadata");
+    store
+        .import_wallet_mnemonic_with_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            0,
+            "english",
+            TEST_MNEMONIC,
+            &metadata,
+        )
+        .expect("store wallet");
+    let session = Arc::new(
+        store
+            .load_view_session(TEST_PASSWORD, wallet_id)
+            .expect("load view session"),
+    );
+    let http = runtime
+        .block_on(super::build_wallet_network_context(
+            super::WalletNetworkConfig {
+                network_mode: Some(super::WalletNetworkMode::Direct),
+                proxy: None,
+                data_dir: &root_dir,
+            },
+        ))
+        .expect("direct HTTP context");
+    let deployment_block = 12_345;
+    let configs = BTreeMap::from([(
+        1,
+        effective_chain_config_with_rpc_endpoints(1, Vec::new(), deployment_block),
+    )]);
+
+    let report = runtime.block_on(initialize_new_wallet_chain_metadata_for_session(
+        Arc::clone(&session),
+        configs.clone(),
+        Arc::clone(&db),
+        http.clone(),
+        None,
+    ));
+
+    assert_eq!(report.initialized, 1);
+    assert_eq!(report.deployment_fallbacks, 1);
+    assert_eq!(report.failed, 0);
+
+    let contract = ChainConfigDefaults::for_chain(1)
+        .expect("ethereum defaults")
+        .contract
+        .to_checksum(None);
+    let chain_metadata = store
+        .find_wallet_chain_metadata_for_session(session.as_ref(), 0, 1, &contract)
+        .expect("load chain metadata")
+        .expect("chain metadata exists");
+    assert_eq!(chain_metadata.start_block, deployment_block);
+    assert_eq!(
+        chain_metadata.last_scanned_block,
+        deployment_block.saturating_sub(1)
+    );
+
+    let report = runtime.block_on(initialize_new_wallet_chain_metadata_for_session(
+        session, configs, db, http, None,
+    ));
+    assert_eq!(report.initialized, 0);
+    assert_eq!(report.skipped_existing, 1);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root_dir);
 }
 
 #[test]
