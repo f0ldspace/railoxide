@@ -144,10 +144,10 @@ confirm() {
   fi
 
   local answer
-  printf '%s [y/N] ' "$prompt" >/dev/tty
+  printf '%s [Y/n] ' "$prompt" >/dev/tty
   IFS= read -r answer </dev/tty || return 1
   case "$answer" in
-    y|Y|yes|YES|Yes) return 0 ;;
+    ''|y|Y|yes|YES|Yes) return 0 ;;
     *) return 1 ;;
   esac
 }

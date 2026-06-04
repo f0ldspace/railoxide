@@ -40,11 +40,21 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 
 RailOxide is alpha software and currently installs by building the latest `main` branch from source.
 
+macOS/Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet | bash
 ```
 
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 | iex
+```
+
 To inspect the installer first:
+
+macOS/Linux:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet
@@ -52,7 +62,15 @@ less install-wallet
 bash install-wallet
 ```
 
-The installer supports macOS and Ubuntu/Debian Linux. See [`Install from source`](docs/install-from-source.md) for options and platform notes.
+Windows PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 -OutFile install-wallet.ps1
+notepad .\install-wallet.ps1
+powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
+```
+
+The installers support macOS, Ubuntu/Debian Linux, and Windows. See [`Install from source`](docs/install-from-source.md) for options and platform notes.
 
 ## Build
 

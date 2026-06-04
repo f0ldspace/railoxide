@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - scripts/install-wallet
+      - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
       - docs/install-from-source.md
       - .github/workflows/install-wallet.yml
@@ -12,6 +13,7 @@ on:
       - main
     paths:
       - scripts/install-wallet
+      - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
       - docs/install-from-source.md
       - .github/workflows/install-wallet.yml
@@ -45,3 +47,30 @@ jobs:
 
       - name: Dry run installer
         run: scripts/install-wallet --dry-run --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
+
+  windows-smoke:
+    name: windows-2022
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse Windows installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/install-wallet.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+
+      - name: Show Windows installer help
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wallet.ps1 -Help
+
+      - name: Dry run Windows installer
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wallet.ps1 -DryRun -NoDeps -SourceDir "$env:RUNNER_TEMP\railoxide-src" -InstallDir "$env:RUNNER_TEMP\railoxide-bin"

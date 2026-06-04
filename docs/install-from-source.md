@@ -4,11 +4,21 @@ RailOxide is alpha software. The source installer builds the latest `main` branc
 
 ## Quick Install
 
+macOS/Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet | bash
 ```
 
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 | iex
+```
+
 ## Inspect First
+
+macOS/Linux:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet
@@ -16,14 +26,23 @@ less install-wallet
 bash install-wallet
 ```
 
+Windows PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 -OutFile install-wallet.ps1
+notepad .\install-wallet.ps1
+powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
+```
+
 ## What It Does
 
 - Clones or updates `https://github.com/triamazikamno/railoxide.git` from `main`.
-- Stores the managed checkout at `~/.local/src/railoxide` by default.
+- Stores the managed checkout at `~/.local/src/railoxide` on macOS/Linux and `%LOCALAPPDATA%\RailOxide\src\railoxide` on Windows by default.
 - Installs Rust `1.91.0` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
 - Prints the exact source commit before building.
-- Refuses to run as root.
+- Defaults interactive prompts to yes when Enter is pressed.
+- Refuses to run as root on macOS/Linux.
 - Uses `sudo` only for Ubuntu/Debian system package installation.
 
 ## macOS
@@ -69,7 +88,30 @@ The installed command is written to:
 
 It also installs a desktop entry and icon under `~/.local/share`.
 
+## Windows
+
+The Windows installer uses `winget` to install missing dependencies from [`build-wallet-windows.md`](build-wallet-windows.md), including Git, Rustup, CMake, Protobuf, LLVM, and Visual Studio Build Tools.
+
+It builds the x64 MSVC target:
+
+```text
+x86_64-pc-windows-msvc
+```
+
+It also downloads the official SQLite DLL package, generates `sqlite3.lib` with Visual Studio's `lib` tool, and copies `sqlite3.dll` next to the wallet executable.
+
+The installed files are written to:
+
+```text
+%LOCALAPPDATA%\RailOxide\bin\wallet.exe
+%LOCALAPPDATA%\RailOxide\bin\sqlite3.dll
+```
+
+The installer creates a Start Menu shortcut unless `-NoShortcut` is passed.
+
 ## Options
+
+macOS/Linux options:
 
 ```text
 --prefix PATH          Install under PATH instead of ~/.local
@@ -84,15 +126,30 @@ It also installs a desktop entry and icon under `~/.local/share`.
 -h, --help             Show help
 ```
 
+Windows PowerShell options:
+
+```text
+-InstallDir PATH       Install wallet.exe and sqlite3.dll under PATH
+-SourceDir PATH        Use PATH for the managed source checkout
+-NoDeps                Do not install missing system dependencies
+-NoHardware            Build without hardware-wallet support
+-Yes                   Do not prompt before dependency installs/downloads
+-DryRun                Print what would happen without changing anything
+-NoShortcut            Do not create a Start Menu shortcut
+-Help                  Show help
+```
+
 ## Updating
 
 Rerun the installer. It updates the managed checkout to the latest `main` commit and rebuilds.
 
 ## Troubleshooting
 
-If `railoxide-wallet` is not found after installation, add `~/.local/bin` to your shell `PATH`.
+If `railoxide-wallet` is not found after installation on macOS/Linux, add `~/.local/bin` to your shell `PATH`.
 
 If the installer reports that `~/.local/src/railoxide` is not installer-managed, either move that existing checkout or pass a different `--source-dir`.
+
+If the Windows installer reports that `%LOCALAPPDATA%\RailOxide\src\railoxide` is not installer-managed, either move that existing checkout or pass a different `-SourceDir`.
 
 For manual platform-specific build steps, see:
 
