@@ -37,7 +37,7 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 
 ## Build
 
-Native dependencies include Rust 1.91, `protoc`, OpenSSL development libraries, and `pkg-config`.
+Native dependencies include Rust 1.91, `protoc`, and platform-specific C/C++ build dependencies.
 
 ```bash
 cargo check -p wallet
@@ -45,7 +45,10 @@ cargo check -p wallet --features hardware
 cargo build --release -p wallet --features hardware
 ```
 
-For complete wallet build guides, including hardware-wallet support, see [`docs/build-wallet-ubuntu.md`](docs/build-wallet-ubuntu.md) and [`docs/build-wallet-macos.md`](docs/build-wallet-macos.md).
+For complete wallet build guides see
+- [`Ubuntu`](docs/build-wallet-ubuntu.md)
+- [`Macos`](docs/build-wallet-macos.md)
+- [`Windows`](docs/build-wallet-windows.md)
 
 ## Hardware Wallets
 
