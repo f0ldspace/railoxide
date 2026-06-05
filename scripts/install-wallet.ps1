@@ -242,7 +242,12 @@ function Ensure-RequiredTools {
 
 function Ensure-RustToolchain {
     Write-Step "installing Rust toolchain $Toolchain"
-    Invoke-External "rustup" @("toolchain", "install", $Toolchain)
+    $toolchainArgs = @("toolchain", "install", $Toolchain)
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+        $toolchainArgs += "--force-non-host"
+    }
+
+    Invoke-External "rustup" $toolchainArgs
     Invoke-External "rustup" @("target", "add", $Target, "--toolchain", $Toolchain)
 }
 
