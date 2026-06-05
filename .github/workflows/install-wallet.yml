@@ -7,6 +7,7 @@ on:
       - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
       - docs/install-from-source.md
+      - README.md
       - .github/workflows/install-wallet.yml
   push:
     branches:
@@ -16,6 +17,7 @@ on:
       - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
       - docs/install-from-source.md
+      - README.md
       - .github/workflows/install-wallet.yml
 
 permissions:
@@ -48,6 +50,12 @@ jobs:
       - name: Dry run installer
         run: scripts/install-wallet --dry-run --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
 
+      - name: Dry run main installer
+        run: scripts/install-wallet --dry-run --main --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
+
+      - name: Dry run ref installer
+        run: scripts/install-wallet --dry-run --ref test-ref --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
+
   windows-smoke:
     name: windows-2022
     runs-on: windows-2022
@@ -74,3 +82,11 @@ jobs:
       - name: Dry run Windows installer
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wallet.ps1 -DryRun -NoDeps -SourceDir "$env:RUNNER_TEMP\railoxide-src" -InstallDir "$env:RUNNER_TEMP\railoxide-bin"
+
+      - name: Dry run Windows main installer
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wallet.ps1 -DryRun -Main -NoDeps -SourceDir "$env:RUNNER_TEMP\railoxide-src" -InstallDir "$env:RUNNER_TEMP\railoxide-bin"
+
+      - name: Dry run Windows ref installer
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wallet.ps1 -DryRun -Ref test-ref -NoDeps -SourceDir "$env:RUNNER_TEMP\railoxide-src" -InstallDir "$env:RUNNER_TEMP\railoxide-bin"

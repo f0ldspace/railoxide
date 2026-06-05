@@ -1,6 +1,6 @@
 # Install RailOxide From Source
 
-RailOxide is alpha software. The source installer builds the latest `main` branch from GitHub instead of installing prebuilt signed binaries.
+RailOxide is alpha software. The source installer builds from GitHub instead of installing prebuilt signed binaries.
 
 ## Quick Install
 
@@ -36,12 +36,13 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 
 ## What It Does
 
-- Clones or updates `https://github.com/triamazikamno/railoxide.git` from `main`.
+- Prompts for the source to build: latest release, latest `main`, or a specific tag/branch/commit.
+- Uses the latest published GitHub release by default, including pre-releases.
+- Clones or updates `https://github.com/triamazikamno/railoxide.git`.
 - Stores the managed checkout at `~/.local/src/railoxide` on macOS/Linux and `%LOCALAPPDATA%\RailOxide\src\railoxide` on Windows by default.
 - Installs Rust `1.91.0` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
 - Prints the exact source commit before building.
-- Defaults interactive prompts to yes when Enter is pressed.
 - Refuses to run as root on macOS/Linux.
 - Uses `sudo` only for Ubuntu/Debian system package installation.
 
@@ -74,6 +75,8 @@ Useful macOS options:
 ```bash
 bash install-wallet --metal
 bash install-wallet --runtime-shaders
+bash install-wallet --main
+bash install-wallet --ref v0.1.0-alpha.1
 ```
 
 ## Ubuntu/Debian Linux
@@ -116,6 +119,8 @@ macOS/Linux options:
 ```text
 --prefix PATH          Install under PATH instead of ~/.local
 --source-dir PATH      Use PATH for the managed source checkout
+--main                 Build the latest main branch without prompting
+--ref REF              Build a specific tag, branch, or commit without prompting
 --no-deps              Do not install missing system dependencies
 --no-hardware          Build without hardware-wallet support
 --metal                On macOS, require build-time Metal shader compilation
@@ -131,6 +136,8 @@ Windows PowerShell options:
 ```text
 -InstallDir PATH       Install wallet.exe and sqlite3.dll under PATH
 -SourceDir PATH        Use PATH for the managed source checkout
+-Main                  Build the latest main branch without prompting
+-Ref REF               Build a specific tag, branch, or commit without prompting
 -NoDeps                Do not install missing system dependencies
 -NoHardware            Build without hardware-wallet support
 -Yes                   Do not prompt before dependency installs/downloads
@@ -141,7 +148,7 @@ Windows PowerShell options:
 
 ## Updating
 
-Rerun the installer. It updates the managed checkout to the latest `main` commit and rebuilds.
+Rerun the installer. It updates the managed checkout to the selected source and rebuilds.
 
 ## Troubleshooting
 

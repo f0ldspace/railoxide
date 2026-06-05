@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_url="https://github.com/triamazikamno/railoxide.git"
+repo_api_url="https://api.github.com/repos/triamazikamno/railoxide"
 branch="main"
 toolchain="1.91.0"
 protobuf_version="35.0"
@@ -13,6 +14,9 @@ hardware=1
 assume_yes=0
 dry_run=0
 verbose=0
+source_mode="release"
+source_ref=""
+source_mode_set=0
 macos_shader_mode="auto"
 macos_shader_mode_set=0
 macos_build_features=""
@@ -22,8 +26,9 @@ usage() {
   cat <<'EOF'
 RailOxide source installer.
 
-This installer builds the latest main branch from source. It does not install
-prebuilt binaries.
+This installer builds RailOxide from source. By default it prompts for the
+source to build and defaults to the latest published GitHub release, including
+pre-releases. It does not install prebuilt binaries.
 
 Usage:
   install-wallet [options]
@@ -31,6 +36,8 @@ Usage:
 Options:
   --prefix PATH          Install under PATH instead of ~/.local
   --source-dir PATH      Use PATH for the managed source checkout
+  --main                 Build the latest main branch without prompting
+  --ref REF              Build a specific tag, branch, or commit without prompting
   --no-deps              Do not install missing system dependencies
   --no-hardware          Build without hardware-wallet support
   --metal                On macOS, require build-time Metal shader compilation
@@ -152,6 +159,16 @@ confirm() {
   esac
 }
 
+set_source_mode() {
+  local mode="$1"
+  local ref="${2:-}"
+
+  [[ "$source_mode_set" -eq 0 ]] || die '--main and --ref cannot be combined'
+  source_mode="$mode"
+  source_ref="$ref"
+  source_mode_set=1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -163,6 +180,16 @@ parse_args() {
       --source-dir)
         [[ $# -ge 2 ]] || die '--source-dir requires a path'
         source_dir="$(expand_path "$2")"
+        shift 2
+        ;;
+      --main)
+        set_source_mode "main"
+        shift
+        ;;
+      --ref)
+        [[ $# -ge 2 ]] || die '--ref requires a tag, branch, or commit'
+        [[ -n "$2" ]] || die '--ref requires a non-empty value'
+        set_source_mode "ref" "$2"
         shift 2
         ;;
       --no-deps)
@@ -208,12 +235,31 @@ parse_args() {
   done
 }
 
+source_mode_label() {
+  case "$source_mode" in
+    release) printf 'latest release\n' ;;
+    main) printf 'main branch\n' ;;
+    ref) printf 'specific ref\n' ;;
+    *) printf '%s\n' "$source_mode" ;;
+  esac
+}
+
+source_ref_label() {
+  case "$source_mode" in
+    release) printf 'resolved during install\n' ;;
+    main) printf '%s\n' "$branch" ;;
+    ref) printf '%s\n' "$source_ref" ;;
+    *) printf '%s\n' "${source_ref:-unknown}" ;;
+  esac
+}
+
 dry_run_plan() {
   local os_name="$1"
 
   log 'dry run: no commands will be executed'
   printf 'repository: %s\n' "$repo_url"
-  printf 'branch: %s\n' "$branch"
+  printf 'source mode: %s\n' "$(source_mode_label)"
+  printf 'source ref: %s\n' "$(source_ref_label)"
   printf 'toolchain: %s\n' "$toolchain"
   printf 'prefix: %s\n' "$prefix"
   printf 'source checkout: %s\n' "$source_dir"
@@ -472,8 +518,143 @@ ensure_linux_packages() {
   run sudo apt-get install -y "${packages[@]}"
 }
 
+latest_release_tag() {
+  local api response line tag
+  api="$repo_api_url/releases?per_page=20"
+
+  log 'resolving latest RailOxide GitHub release'
+  response="$(curl -fsSL \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "$api")" || die 'failed to query GitHub releases; rerun with --main to build the main branch'
+
+  tag=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ \"tag_name\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+      tag="${BASH_REMATCH[1]}"
+      break
+    fi
+  done <<<"$response"
+
+  [[ -n "$tag" ]] || die 'No RailOxide release found; rerun with --main to build the main branch.'
+  printf '%s\n' "$tag"
+}
+
+choose_source_ref() {
+  local latest answer custom_ref
+
+  case "$source_mode" in
+    main)
+      source_ref="$branch"
+      log "using latest $branch branch"
+      return
+      ;;
+    ref)
+      [[ -n "$source_ref" ]] || die '--ref requires a non-empty value'
+      log "using source ref $source_ref"
+      return
+      ;;
+  esac
+
+  latest="$(latest_release_tag)"
+  source_ref="$latest"
+
+  if [[ "$source_mode_set" -eq 1 || "$assume_yes" -eq 1 || ! -r /dev/tty ]]; then
+    log "using latest RailOxide release $source_ref"
+    return
+  fi
+
+  printf '\nRailOxide source to build:\n' >/dev/tty
+  printf '  1. Latest release: %s\n' "$latest" >/dev/tty
+  printf '  2. Latest %s branch\n' "$branch" >/dev/tty
+  printf '  3. Specific tag, branch, or commit\n' >/dev/tty
+  printf 'Choose source [1]: ' >/dev/tty
+  IFS= read -r answer </dev/tty || die 'failed to read source selection'
+
+  case "$answer" in
+    ''|1|r|R|release|Release)
+      source_mode="release"
+      source_ref="$latest"
+      log "using latest RailOxide release $source_ref"
+      ;;
+    2|m|M|main|Main)
+      source_mode="main"
+      source_ref="$branch"
+      log "using latest $branch branch"
+      ;;
+    3|ref|Ref|custom|Custom)
+      printf 'Enter tag, branch, or commit: ' >/dev/tty
+      IFS= read -r custom_ref </dev/tty || die 'failed to read source ref'
+      [[ -n "$custom_ref" ]] || die 'source ref is required'
+      source_mode="ref"
+      source_ref="$custom_ref"
+      log "using source ref $source_ref"
+      ;;
+    *)
+      die "invalid source selection: $answer"
+      ;;
+  esac
+}
+
 managed_marker_path() {
   printf '%s/.railoxide-installer-managed\n' "$source_dir"
+}
+
+git_ref_exists() {
+  git -C "$source_dir" rev-parse --verify --quiet "$1" >/dev/null
+}
+
+fetch_source_refs() {
+  run git -C "$source_dir" remote set-url origin "$repo_url"
+  run git -C "$source_dir" remote set-branches origin '*'
+
+  case "$source_mode" in
+    main)
+      log "fetching latest $branch branch"
+      run git -C "$source_dir" fetch --prune origin "$branch"
+      ;;
+    release|ref)
+      log 'fetching source refs and tags'
+      run git -C "$source_dir" fetch --prune --tags origin
+      ;;
+    *)
+      die "unknown source mode: $source_mode"
+      ;;
+  esac
+}
+
+checkout_main_branch() {
+  if git_ref_exists "refs/heads/$branch"; then
+    run git -C "$source_dir" checkout "$branch"
+    run git -C "$source_dir" merge --ff-only "origin/$branch"
+  else
+    run git -C "$source_dir" checkout -b "$branch" "origin/$branch"
+  fi
+}
+
+checkout_release_ref() {
+  git_ref_exists "refs/tags/$source_ref^{commit}" || \
+    die "release tag $source_ref was not found after fetching tags"
+  run git -C "$source_dir" checkout --detach "refs/tags/$source_ref"
+}
+
+checkout_custom_ref() {
+  if git_ref_exists "$source_ref^{commit}"; then
+    run git -C "$source_dir" checkout --detach "$source_ref"
+  elif git_ref_exists "origin/$source_ref^{commit}"; then
+    run git -C "$source_dir" checkout --detach "origin/$source_ref"
+  else
+    die "source ref $source_ref was not found after fetching refs"
+  fi
+}
+
+checkout_source_ref() {
+  case "$source_mode" in
+    main) checkout_main_branch ;;
+    release) checkout_release_ref ;;
+    ref) checkout_custom_ref ;;
+    *) die "unknown source mode: $source_mode" ;;
+  esac
 }
 
 ensure_source_checkout() {
@@ -482,29 +663,20 @@ ensure_source_checkout() {
   parent="$(dirname "$source_dir")"
 
   if [[ ! -d "$source_dir" ]]; then
-    log "cloning RailOxide main into $source_dir"
+    log "cloning RailOxide into $source_dir"
     run mkdir -p "$parent"
-    run git clone --branch "$branch" --single-branch "$repo_url" "$source_dir"
+    run git clone "$repo_url" "$source_dir"
     write_installer_marker "$marker"
-    return
-  fi
-
-  if [[ ! -f "$marker" ]]; then
+  elif [[ ! -f "$marker" ]]; then
     die "$source_dir already exists and is not marked as installer-managed; pass --source-dir to use another path"
-  fi
-
-  if [[ ! -d "$source_dir/.git" ]]; then
+  elif [[ ! -d "$source_dir/.git" ]]; then
     die "$source_dir exists but is not a Git checkout"
-  fi
-
-  if [[ -n "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ]]; then
+  elif [[ -n "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ]]; then
     die "$source_dir has local modifications; resolve them or use --source-dir with a fresh path"
   fi
 
-  log "updating RailOxide main in $source_dir"
-  run git -C "$source_dir" fetch origin "$branch"
-  run git -C "$source_dir" checkout "$branch"
-  run git -C "$source_dir" merge --ff-only "origin/$branch"
+  fetch_source_refs
+  checkout_source_ref
 }
 
 current_source_commit() {
@@ -621,6 +793,7 @@ main() {
   if [[ "$os_name" == "Darwin" ]]; then
     ensure_macos_command_line_tools
     ensure_common_tools
+    choose_source_ref
     ensure_macos_protoc
     ensure_rust
     ensure_source_checkout
@@ -632,6 +805,7 @@ main() {
   else
     ensure_linux_packages
     ensure_common_tools
+    choose_source_ref
     ensure_rust
     ensure_source_checkout
     log "building source commit $(current_source_commit)"

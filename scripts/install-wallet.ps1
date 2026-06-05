@@ -1,6 +1,8 @@
 param(
     [string]$InstallDir = "",
     [string]$SourceDir = "",
+    [switch]$Main,
+    [string]$Ref = "",
     [switch]$NoDeps,
     [switch]$NoHardware,
     [switch]$Yes,
@@ -13,17 +15,22 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $RepoUrl = "https://github.com/triamazikamno/railoxide.git"
+$RepoApiUrl = "https://api.github.com/repos/triamazikamno/railoxide"
 $Branch = "main"
 $Toolchain = "1.91.0"
 $Target = "x86_64-pc-windows-msvc"
 $SqliteVersion = "3530200"
+$SourceMode = "release"
+$SourceRef = ""
+$ExplicitSource = $false
 
 function Show-Usage {
     @"
 RailOxide Windows source installer.
 
-This installer builds the latest main branch from source. It does not install
-prebuilt binaries.
+This installer builds RailOxide from source. By default it prompts for the
+source to build and defaults to the latest published GitHub release, including
+pre-releases. It does not install prebuilt binaries.
 
 Usage:
   irm https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 | iex
@@ -31,6 +38,8 @@ Usage:
 Options:
   -InstallDir PATH       Install wallet.exe and sqlite3.dll under PATH
   -SourceDir PATH        Use PATH for the managed source checkout
+  -Main                  Build the latest main branch without prompting
+  -Ref REF               Build a specific tag, branch, or commit without prompting
   -NoDeps                Do not install missing system dependencies
   -NoHardware            Build without hardware-wallet support
   -Yes                   Do not prompt before dependency installs/downloads
@@ -240,44 +249,205 @@ function Get-ManagedMarkerPath {
     return (Join-Path $SourceDir ".railoxide-installer-managed")
 }
 
+function Initialize-SourceOptions {
+    if ($Main -and -not [string]::IsNullOrWhiteSpace($Ref)) {
+        Stop-Install "-Main and -Ref cannot be combined"
+    }
+
+    if ($Main) {
+        $script:SourceMode = "main"
+        $script:SourceRef = $Branch
+        $script:ExplicitSource = $true
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Ref)) {
+        $script:SourceMode = "ref"
+        $script:SourceRef = $Ref.Trim()
+        $script:ExplicitSource = $true
+        return
+    }
+
+    $script:SourceMode = "release"
+    $script:SourceRef = ""
+    $script:ExplicitSource = $false
+}
+
+function Resolve-LatestReleaseTag {
+    Write-Step "resolving latest RailOxide GitHub release"
+    $uri = "$RepoApiUrl/releases?per_page=20"
+    try {
+        $releases = Invoke-RestMethod -Uri $uri -Headers @{
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+        }
+    } catch {
+        Stop-Install "failed to query GitHub releases; rerun with -Main to build the main branch"
+    }
+
+    $release = @($releases | Where-Object { -not $_.draft } | Select-Object -First 1)
+    if ($release.Count -eq 0 -or [string]::IsNullOrWhiteSpace($release[0].tag_name)) {
+        Stop-Install "No RailOxide release found; rerun with -Main to build the main branch."
+    }
+
+    return [string]$release[0].tag_name
+}
+
+function Select-SourceRef {
+    if ($SourceMode -eq "main") {
+        $script:SourceRef = $Branch
+        Write-Step "using latest $Branch branch"
+        return
+    }
+
+    if ($SourceMode -eq "ref") {
+        if ([string]::IsNullOrWhiteSpace($SourceRef)) {
+            Stop-Install "-Ref requires a non-empty value"
+        }
+        Write-Step "using source ref $SourceRef"
+        return
+    }
+
+    $latest = Resolve-LatestReleaseTag
+    $script:SourceRef = $latest
+
+    if ($ExplicitSource -or $Yes) {
+        Write-Step "using latest RailOxide release $SourceRef"
+        return
+    }
+
+    try {
+        Write-Host ""
+        Write-Host "RailOxide source to build:"
+        Write-Host "  1. Latest release: $latest"
+        Write-Host "  2. Latest $Branch branch"
+        Write-Host "  3. Specific tag, branch, or commit"
+        $answer = Read-Host "Choose source [1]"
+    } catch {
+        Write-Step "using latest RailOxide release $SourceRef"
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        Write-Step "using latest RailOxide release $SourceRef"
+        return
+    }
+
+    switch ($answer.Trim().ToLowerInvariant()) {
+        { $_ -eq "1" -or $_ -eq "r" -or $_ -eq "release" } {
+            $script:SourceMode = "release"
+            $script:SourceRef = $latest
+            Write-Step "using latest RailOxide release $SourceRef"
+            return
+        }
+        { $_ -eq "2" -or $_ -eq "m" -or $_ -eq "main" } {
+            $script:SourceMode = "main"
+            $script:SourceRef = $Branch
+            Write-Step "using latest $Branch branch"
+            return
+        }
+        { $_ -eq "3" -or $_ -eq "ref" -or $_ -eq "custom" } {
+            $customRef = Read-Host "Enter tag, branch, or commit"
+            if ([string]::IsNullOrWhiteSpace($customRef)) {
+                Stop-Install "source ref is required"
+            }
+            $script:SourceMode = "ref"
+            $script:SourceRef = $customRef.Trim()
+            Write-Step "using source ref $SourceRef"
+            return
+        }
+        default {
+            Stop-Install "invalid source selection: $answer"
+        }
+    }
+}
+
+function Test-GitRef {
+    param([string]$RefName)
+    & git -C $SourceDir rev-parse --verify --quiet $RefName | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Fetch-SourceRefs {
+    Invoke-External "git" @("-C", $SourceDir, "remote", "set-url", "origin", $RepoUrl)
+    Invoke-External "git" @("-C", $SourceDir, "remote", "set-branches", "origin", "*")
+
+    if ($SourceMode -eq "main") {
+        Write-Step "fetching latest $Branch branch"
+        Invoke-External "git" @("-C", $SourceDir, "fetch", "--prune", "origin", $Branch)
+        return
+    }
+
+    Write-Step "fetching source refs and tags"
+    Invoke-External "git" @("-C", $SourceDir, "fetch", "--prune", "--tags", "origin")
+}
+
+function Checkout-MainBranch {
+    if (Test-GitRef "refs/heads/$Branch") {
+        Invoke-External "git" @("-C", $SourceDir, "checkout", $Branch)
+        Invoke-External "git" @("-C", $SourceDir, "merge", "--ff-only", "origin/$Branch")
+    } else {
+        Invoke-External "git" @("-C", $SourceDir, "checkout", "-b", $Branch, "origin/$Branch")
+    }
+}
+
+function Checkout-ReleaseRef {
+    if (-not (Test-GitRef "refs/tags/$SourceRef^{commit}")) {
+        Stop-Install "release tag $SourceRef was not found after fetching tags"
+    }
+    Invoke-External "git" @("-C", $SourceDir, "checkout", "--detach", "refs/tags/$SourceRef")
+}
+
+function Checkout-CustomRef {
+    if (Test-GitRef "$SourceRef^{commit}") {
+        Invoke-External "git" @("-C", $SourceDir, "checkout", "--detach", $SourceRef)
+    } elseif (Test-GitRef "origin/$SourceRef^{commit}") {
+        Invoke-External "git" @("-C", $SourceDir, "checkout", "--detach", "origin/$SourceRef")
+    } else {
+        Stop-Install "source ref $SourceRef was not found after fetching refs"
+    }
+}
+
+function Checkout-SourceRef {
+    switch ($SourceMode) {
+        "main" { Checkout-MainBranch; return }
+        "release" { Checkout-ReleaseRef; return }
+        "ref" { Checkout-CustomRef; return }
+        default { Stop-Install "unknown source mode: $SourceMode" }
+    }
+}
+
 function Ensure-SourceCheckout {
     $marker = Get-ManagedMarkerPath
     $parent = Split-Path -Parent $SourceDir
 
     if (-not (Test-Path -LiteralPath $SourceDir)) {
-        Write-Step "cloning RailOxide main into $SourceDir"
+        Write-Step "cloning RailOxide into $SourceDir"
         if ($DryRun) {
             Write-Host "+ New-Item -ItemType Directory -Force $parent"
-            Write-Host "+ git clone --branch $Branch --single-branch $RepoUrl $SourceDir"
+            Write-Host "+ git clone $RepoUrl $SourceDir"
             Write-Host "+ write installer marker $marker"
         } else {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            Invoke-External "git" @("clone", "--branch", $Branch, "--single-branch", $RepoUrl, $SourceDir)
+            Invoke-External "git" @("clone", $RepoUrl, $SourceDir)
             Set-Content -LiteralPath $marker -Value $RepoUrl -Encoding ASCII
         }
-        return
-    }
-
-    if (-not (Test-Path -LiteralPath $marker)) {
+    } elseif (-not (Test-Path -LiteralPath $marker)) {
         Stop-Install "$SourceDir already exists and is not marked as installer-managed; pass -SourceDir to use another path"
-    }
-
-    if (-not (Test-Path -LiteralPath (Join-Path $SourceDir ".git"))) {
+    } elseif (-not (Test-Path -LiteralPath (Join-Path $SourceDir ".git"))) {
         Stop-Install "$SourceDir exists but is not a Git checkout"
+    } else {
+        $status = (& git -C $SourceDir status --porcelain --untracked-files=no)
+        if ($LASTEXITCODE -ne 0) {
+            Stop-Install "git status failed in $SourceDir"
+        }
+        if (-not [string]::IsNullOrWhiteSpace(($status -join "`n"))) {
+            Stop-Install "$SourceDir has local modifications; resolve them or use -SourceDir with a fresh path"
+        }
     }
 
-    $status = (& git -C $SourceDir status --porcelain --untracked-files=no)
-    if ($LASTEXITCODE -ne 0) {
-        Stop-Install "git status failed in $SourceDir"
-    }
-    if (-not [string]::IsNullOrWhiteSpace(($status -join "`n"))) {
-        Stop-Install "$SourceDir has local modifications; resolve them or use -SourceDir with a fresh path"
-    }
-
-    Write-Step "updating RailOxide main in $SourceDir"
-    Invoke-External "git" @("-C", $SourceDir, "fetch", "origin", $Branch)
-    Invoke-External "git" @("-C", $SourceDir, "checkout", $Branch)
-    Invoke-External "git" @("-C", $SourceDir, "merge", "--ff-only", "origin/$Branch")
+    Fetch-SourceRefs
+    Checkout-SourceRef
 }
 
 function Get-SourceCommit {
@@ -406,9 +576,23 @@ function Invoke-SmokeTest {
 }
 
 function Show-DryRunPlan {
+    $sourceModeText = switch ($SourceMode) {
+        "release" { "latest release"; break }
+        "main" { "main branch"; break }
+        "ref" { "specific ref"; break }
+        default { $SourceMode; break }
+    }
+    $sourceRefText = switch ($SourceMode) {
+        "release" { "resolved during install"; break }
+        "main" { $Branch; break }
+        "ref" { $SourceRef; break }
+        default { if ([string]::IsNullOrWhiteSpace($SourceRef)) { "unknown" } else { $SourceRef }; break }
+    }
+
     Write-Step "dry run: no commands will be executed"
     Write-Host "repository: $RepoUrl"
-    Write-Host "branch: $Branch"
+    Write-Host "source mode: $sourceModeText"
+    Write-Host "source ref: $sourceRefText"
     Write-Host "toolchain: $Toolchain"
     Write-Host "target: $Target"
     Write-Host "install directory: $InstallDir"
@@ -442,6 +626,8 @@ function Main {
         $script:SourceDir = Join-Path $env:LOCALAPPDATA "RailOxide\src\railoxide"
     }
 
+    Initialize-SourceOptions
+
     if ($DryRun) {
         Show-DryRunPlan
         return
@@ -449,6 +635,7 @@ function Main {
 
     Ensure-Dependencies
     Ensure-RequiredTools
+    Select-SourceRef
     Ensure-RustToolchain
     Ensure-SourceCheckout
     Write-Step "building source commit $(Get-SourceCommit)"

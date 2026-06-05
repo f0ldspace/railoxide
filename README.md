@@ -38,7 +38,7 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 
 ## Install From Source
 
-RailOxide is alpha software and currently installs by building the latest `main` branch from source.
+RailOxide is alpha software and installs by building from source. The installer prompts for the source to build and defaults to the latest published GitHub release.
 
 macOS/Linux:
 
