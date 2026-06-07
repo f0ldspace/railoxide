@@ -107,7 +107,7 @@ impl SpendAuthorizationCache {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationIntent {
     PrivateSend(UnshieldAssetKey),
     PrivateSendSelfBroadcastGasPassword(UnshieldAssetKey),
@@ -117,10 +117,14 @@ pub(super) enum SpendAuthorizationIntent {
     BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
     PublicSend,
     PublicShield,
+    WalletConnectRequest {
+        request_key: String,
+        review_token: u64,
+    },
 }
 
 impl SpendAuthorizationIntent {
-    const fn uses_private_wallet(self) -> bool {
+    fn uses_private_wallet(&self) -> bool {
         matches!(
             self,
             Self::PrivateSend(_) | Self::PrivateUnshield(_) | Self::BlockedShieldRefund(_)
@@ -190,6 +194,24 @@ impl SpendAuthorizationSummary {
             detail: detail.into(),
             rows,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::root) fn title_for_test(&self) -> &str {
+        self.title.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(in crate::root) fn detail_for_test(&self) -> &str {
+        self.detail.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(in crate::root) fn rows_for_test(&self) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .map(|row| (row.label.to_string(), row.value.to_string()))
+            .collect()
     }
 }
 
@@ -431,7 +453,7 @@ impl SpendAuthorizationDialogContent {
             return;
         }
 
-        let intent = self.intent;
+        let intent = self.intent.clone();
         let lifetime = self.lifetime;
         let root = self.root.clone();
         root.update(cx, |root, cx| {
@@ -866,18 +888,22 @@ impl WalletRoot {
                         root.clear_trezor_app_passphrase_input(window, cx);
                     });
                 })
-                .on_ok(move |_event, window, cx| {
-                    submit_root.update(cx, |root, cx| {
-                        root.continue_authorized_spend(
-                            intent,
-                            DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
-                                String::new(),
-                            )),
-                            window,
-                            cx,
-                        );
-                    });
-                    true
+                .on_ok({
+                    let intent = intent.clone();
+                    move |_event, window, cx| {
+                        let intent = intent.clone();
+                        submit_root.update(cx, |root, cx| {
+                            root.continue_authorized_spend(
+                                intent,
+                                DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                                    String::new(),
+                                )),
+                                window,
+                                cx,
+                            );
+                        });
+                        true
+                    }
                 })
                 .child(scrollable_dialog_content(
                     content_max_height,
@@ -1156,6 +1182,26 @@ impl WalletRoot {
                     return;
                 };
                 self.submit_public_shield_authorized(password, window, cx);
+            }
+            SpendAuthorizationIntent::WalletConnectRequest {
+                request_key,
+                review_token,
+            } => {
+                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
+                else {
+                    self.set_vault_error(
+                        "WalletConnect Public account authorization requires the vault password",
+                        cx,
+                    );
+                    return;
+                };
+                self.submit_walletconnect_request_authorized(
+                    &request_key,
+                    review_token,
+                    password,
+                    window,
+                    cx,
+                );
             }
         }
     }

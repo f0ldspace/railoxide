@@ -142,6 +142,20 @@ impl Render for WalletSettingsEditor {
             |settings| settings.waku.nwaku_url.clone().unwrap_or_default(),
             |settings, value| settings.waku.nwaku_url = non_empty_setting(&value),
         );
+        let walletconnect_project_id = Self::shared_string_field(
+            "walletconnect-project-id-override",
+            editor.clone(),
+            |settings| {
+                settings
+                    .walletconnect
+                    .project_id_override
+                    .clone()
+                    .unwrap_or_default()
+            },
+            |settings, value| {
+                settings.walletconnect.project_id_override = non_empty_setting(&value);
+            },
+        );
         let waku_dns_enr_kind = SettingsUrlListKind::WakuDnsEnrTree;
         let waku_dns_enr_trees = waku_dns_enr_kind.endpoints(&self.draft);
         let waku_dns_enr_editor = editor.clone();
@@ -516,6 +530,26 @@ impl Render for WalletSettingsEditor {
                     .item(SettingItem::new("Peer timeout seconds", waku_timeout))
                     .item(SettingItem::new("nwaku REST URL", waku_nwaku).layout(Axis::Vertical)),
             );
+        let walletconnect_default_label = format!(
+            "Uses bundled RailOxide Project ID {WALLETCONNECT_DEFAULT_PROJECT_ID} unless an override is set. WalletConnect uses the standard WalletConnect/Reown IRN relay; custom relay URLs are not exposed in v1."
+        );
+        let walletconnect_override_notice = "A Project ID override uses your configured Reown/WalletConnect project for relay authentication. WalletConnect message payloads remain encrypted, but relay metadata may still be visible to Reown.";
+        let walletconnect_page = SettingPage::new("WalletConnect")
+            .description("Advanced WalletConnect relay identity settings for Public accounts.")
+            .group(
+                settings_group()
+                    .item(SettingItem::render(move |_options, _window, _cx| {
+                        settings_info_banner(walletconnect_default_label.clone())
+                    }))
+                    .item(SettingItem::render(move |_options, _window, _cx| {
+                        settings_warning_banner(walletconnect_override_notice)
+                    }))
+                    .item(
+                        SettingItem::new("Project ID override", walletconnect_project_id)
+                            .description("Optional Reown/WalletConnect Project ID used instead of the bundled RailOxide Project ID.")
+                            .layout(Axis::Vertical),
+                    ),
+            );
         div()
             .size_full()
             .min_h(px(0.0))
@@ -543,7 +577,8 @@ impl Render for WalletSettingsEditor {
                             .page(chains_page)
                             .page(contracts_page)
                             .page(token_page)
-                            .page(public_broadcasters_page),
+                            .page(public_broadcasters_page)
+                            .page(walletconnect_page),
                     ),
             )
             .child(

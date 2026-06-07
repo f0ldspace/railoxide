@@ -1,6 +1,8 @@
 use super::*;
 use crate::root::public_action::public_action_progress_steps_for_source;
-use crate::root::public_balances::public_balance_entry_for_chain;
+use crate::root::public_balances::{
+    public_account_usd_total_label_for_chain, public_balance_entry_for_chain,
+};
 
 #[test]
 fn private_action_metrics_hide_values_matching_total() {
@@ -555,6 +557,59 @@ fn self_broadcast_gas_payer_search_matches_label_and_addresses() {
 }
 
 #[test]
+fn walletconnect_account_selector_defaulting_preserves_valid_selection() {
+    let first =
+        public_account_for_search_with_uuid("public-1", Some("Main"), Address::from([0x11; 20]));
+    let second =
+        public_account_for_search_with_uuid("public-2", Some("Backup"), Address::from([0x22; 20]));
+    let selected = Arc::<str>::from("public-2");
+
+    assert_eq!(normalized_walletconnect_account_uuid(None, &[]), None);
+    assert_eq!(
+        normalized_walletconnect_account_uuid(None, &[first.clone(), second.clone()]).as_deref(),
+        Some("public-1")
+    );
+    assert_eq!(
+        normalized_walletconnect_account_uuid(Some(&selected), &[first.clone(), second]).as_deref(),
+        Some("public-2")
+    );
+}
+
+#[test]
+fn walletconnect_account_selector_replaces_invalid_selection() {
+    let first =
+        public_account_for_search_with_uuid("public-1", Some("Main"), Address::from([0x11; 20]));
+    let selected = Arc::<str>::from("missing-public");
+
+    assert_eq!(
+        normalized_walletconnect_account_uuid(Some(&selected), std::slice::from_ref(&first))
+            .as_deref(),
+        Some("public-1")
+    );
+}
+
+#[test]
+fn walletconnect_account_selector_matches_label_address_and_uuid() {
+    let account = public_account_for_search_with_uuid(
+        "public-walletconnect-1",
+        Some("DeFi spending"),
+        Address::from([0xab; 20]),
+    );
+    let items = walletconnect_account_select_items(&[account], None, 1, None);
+    let item = &items[0];
+
+    assert!(walletconnect_account_matches_search(item, "defi"));
+    assert!(walletconnect_account_matches_search(item, "0xabab"));
+    assert!(walletconnect_account_matches_search(
+        item,
+        "walletconnect-1"
+    ));
+    assert!(!walletconnect_account_matches_search(item, "imported"));
+    assert!(item.matches("ABAB"));
+    assert!(!walletconnect_account_matches_search(item, "savings"));
+}
+
+#[test]
 fn random_self_broadcast_gas_payer_returns_eligible_account_uuid() {
     let first =
         public_account_for_search_with_uuid("public-1", Some("Main"), Address::from([0x11; 20]));
@@ -951,6 +1006,95 @@ fn public_balance_usd_label_omits_unpriced_and_unavailable_balances() {
             56,
             PublicAssetId::Native,
             &PublicBalanceAmount::Available(uint!(1_000_000_000_000_000_000_U256)),
+            Some(&cache),
+        ),
+        None
+    );
+}
+
+#[test]
+fn public_account_usd_total_label_sums_priced_balances() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+    let snapshot = PublicBalanceSnapshot {
+        chain_id: 1,
+        refreshed_at: SystemTime::UNIX_EPOCH,
+        accounts: vec![PublicAccountBalance {
+            account,
+            balances: vec![
+                PublicBalanceEntry {
+                    asset: PublicBalanceAsset {
+                        id: PublicAssetId::Native,
+                        symbol: "ETH".to_string(),
+                        decimals: 18,
+                    },
+                    amount: PublicBalanceAmount::Available(uint!(2_000_000_000_000_000_000_U256)),
+                },
+                PublicBalanceEntry {
+                    asset: PublicBalanceAsset {
+                        id: PublicAssetId::Erc20(usdc),
+                        symbol: "USDC".to_string(),
+                        decimals: 6,
+                    },
+                    amount: PublicBalanceAmount::Available(uint!(1_234_567_U256)),
+                },
+            ],
+        }],
+    };
+
+    assert_eq!(
+        public_account_usd_total_label_for_chain(
+            Some(&snapshot),
+            1,
+            "public-account",
+            PublicAccountStatus::Active,
+            Some(&cache),
+        )
+        .as_deref(),
+        Some("$6,001.23")
+    );
+}
+
+#[test]
+fn public_account_usd_total_label_omits_unpriced_and_unavailable_balances() {
+    let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    let snapshot = PublicBalanceSnapshot {
+        chain_id: 1,
+        refreshed_at: SystemTime::UNIX_EPOCH,
+        accounts: vec![PublicAccountBalance {
+            account,
+            balances: vec![
+                PublicBalanceEntry {
+                    asset: PublicBalanceAsset {
+                        id: PublicAssetId::Native,
+                        symbol: "ETH".to_string(),
+                        decimals: 18,
+                    },
+                    amount: PublicBalanceAmount::Unavailable,
+                },
+                PublicBalanceEntry {
+                    asset: PublicBalanceAsset {
+                        id: PublicAssetId::Erc20(Address::from([0x77; 20])),
+                        symbol: "UNKNOWN".to_string(),
+                        decimals: 18,
+                    },
+                    amount: PublicBalanceAmount::Available(uint!(1_234_567_U256)),
+                },
+            ],
+        }],
+    };
+
+    assert_eq!(
+        public_account_usd_total_label_for_chain(
+            Some(&snapshot),
+            1,
+            "public-account",
+            PublicAccountStatus::Active,
             Some(&cache),
         ),
         None

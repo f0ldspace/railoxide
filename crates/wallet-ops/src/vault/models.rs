@@ -1,5 +1,7 @@
+use std::fmt;
+
 use super::{
-    Address, Deserialize, HardwareDerivationDescriptor, HardwareDeviceKind,
+    Address, BTreeMap, Deserialize, HardwareDerivationDescriptor, HardwareDeviceKind,
     HardwarePublicAccountDescriptor, KEY_LEN, Serialize, U256, VaultError, ViewingKeyData,
     WalletKeys, Zeroize,
 };
@@ -558,6 +560,101 @@ impl PublicAccountMetadata {
     pub const fn is_global(&self) -> bool {
         matches!(self.scope, PublicAccountScope::Global)
     }
+}
+
+struct RedactedSecret;
+
+impl fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize)]
+#[zeroize(drop)]
+pub struct WalletConnectRelayIdentity {
+    pub signing_key: [u8; KEY_LEN],
+    pub client_id: String,
+}
+
+impl fmt::Debug for WalletConnectRelayIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletConnectRelayIdentity")
+            .field("signing_key", &RedactedSecret)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalletConnectPeerMetadata {
+    pub name: String,
+    pub description: String,
+    pub url: String,
+    #[serde(default)]
+    pub icons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WalletConnectApprovedNamespace {
+    pub chains: Vec<String>,
+    pub accounts: Vec<String>,
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize)]
+#[zeroize(drop)]
+pub struct WalletConnectSessionKeys {
+    pub sym_key: [u8; KEY_LEN],
+    pub responder_private_key: [u8; KEY_LEN],
+    pub responder_public_key: [u8; KEY_LEN],
+}
+
+impl fmt::Debug for WalletConnectSessionKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletConnectSessionKeys")
+            .field("sym_key", &RedactedSecret)
+            .field("responder_private_key", &RedactedSecret)
+            .field("responder_public_key", &RedactedSecret)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WalletConnectSessionLifecycleState {
+    Active,
+    TemporarilyPaused,
+    Invalid,
+    Disconnected,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalletConnectSessionRecord {
+    pub session_uuid: String,
+    pub pairing_topic: String,
+    pub session_topic: String,
+    pub relay_protocol: String,
+    pub relay_client_id: String,
+    pub peer_metadata: WalletConnectPeerMetadata,
+    pub approved_namespaces: BTreeMap<String, WalletConnectApprovedNamespace>,
+    pub selected_public_account_uuid: String,
+    pub selected_public_account_scope: PublicAccountScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_private_wallet_uuid: Option<String>,
+    pub keys: WalletConnectSessionKeys,
+    pub expiry_timestamp: u64,
+    pub lifecycle_state: WalletConnectSessionLifecycleState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletConnectSessionAccountResolution {
+    Usable(PublicAccountMetadata),
+    TemporarilyPausedWrongPrivateWallet { owning_wallet_uuid: String },
+    InvalidPublicAccount,
 }
 
 #[derive(Serialize, Deserialize, Zeroize)]

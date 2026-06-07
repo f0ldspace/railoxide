@@ -236,6 +236,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-type-parser",
  "alloy-sol-types",
+ "derive_more 2.1.1",
  "itoa",
  "serde",
  "serde_json",
@@ -575,7 +576,9 @@ version = "2.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ffbce94c50dd9d4d1f83e044c5595bbd3ada981bd3057ce28b3a5470e77385d"
 dependencies = [
+ "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-sol-types",
  "async-trait",
  "auto_impl",
  "either",
@@ -1791,6 +1794,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "async-tungstenite"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8acc405d38be14342132609f06f02acaf825ddccfe76c4824a69281e0458ebd4"
+dependencies = [
+ "atomic-waker",
+ "futures-core",
+ "futures-io",
+ "futures-task",
+ "futures-util",
+ "log",
+ "pin-project-lite",
+ "tungstenite",
 ]
 
 [[package]]
@@ -10092,6 +10111,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqwest-websocket"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7705b649c3b66b85c4e9c304a6898b1ae3eecb880c474720ebf925e4a932ae02"
+dependencies = [
+ "async-tungstenite",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tungstenite",
+ "web-sys",
+]
+
+[[package]]
 name = "reseeding_rng"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13724,6 +13761,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1",
+ "thiserror 2.0.18",
+ "utf-8",
+]
+
+[[package]]
 name = "twox-hash"
 version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14238,6 +14292,7 @@ dependencies = [
  "rand 0.10.1",
  "reqwest",
  "rust-embed",
+ "serde_json",
  "structopt",
  "tokio",
  "tracing",
@@ -14252,14 +14307,19 @@ name = "wallet-ops"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-signer",
  "argon2",
  "arti-client",
  "async-trait",
+ "base64 0.22.1",
  "broadcaster-core",
  "broadcaster-monitor",
+ "bs58",
  "chacha20poly1305",
  "coins-ledger",
+ "ed25519-dalek",
  "eyre",
+ "futures-util",
  "getrandom 0.4.2",
  "hidapi-rusb",
  "hkdf 0.13.0",
@@ -14273,6 +14333,7 @@ dependencies = [
  "railgun-wallet",
  "rand 0.10.1",
  "reqwest",
+ "reqwest-websocket",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -14283,8 +14344,10 @@ dependencies = [
  "tor-rtcompat",
  "tracing",
  "trezor-client",
+ "url",
  "waku",
  "waku-relay",
+ "x25519-dalek",
  "zeroize",
 ]
 

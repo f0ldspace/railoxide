@@ -60,6 +60,7 @@ mod utxo;
 mod vault;
 mod vault_ui;
 mod wallet_header;
+mod walletconnect;
 
 #[cfg(test)]
 mod tests;
@@ -241,6 +242,11 @@ use vault_ui::should_show_pre_unlock_settings_action;
 use wallet_header::{parse_repair_cache_block, repair_cache_help_text};
 #[cfg(test)]
 use wallet_ops::public_broadcaster_candidates_for_asset;
+#[cfg(test)]
+use walletconnect::{
+    normalized_walletconnect_account_uuid, walletconnect_account_matches_search,
+    walletconnect_account_select_items,
+};
 
 const SIDEBAR_WIDTH: Pixels = px(220.0);
 const SIDEBAR_AUTO_COLLAPSE_WIDTH: Pixels = px(900.0);
@@ -392,6 +398,7 @@ pub(crate) struct WalletRoot {
     repair_cache_block_input: Entity<InputState>,
     tx_search_input: Entity<InputState>,
     tx_search_query: Arc<str>,
+    walletconnect: walletconnect::WalletConnectUiState,
     show_spent_utxos: bool,
     local_pending_spent_clear_confirming: bool,
     blocked_shield_rescue_lookup_generation: u64,
@@ -702,6 +709,7 @@ impl WalletRoot {
         };
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");
+        let walletconnect = walletconnect::WalletConnectUiState::new(window, cx);
         let chain_select =
             cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
         let wallet_select = cx.new(|cx| {
@@ -877,6 +885,7 @@ impl WalletRoot {
             repair_cache_block_input,
             tx_search_input: tx_search_input.clone(),
             tx_search_query: Arc::from(""),
+            walletconnect,
             show_spent_utxos: false,
             local_pending_spent_clear_confirming: false,
             blocked_shield_rescue_lookup_generation: 0,
@@ -967,6 +976,39 @@ impl WalletRoot {
                     return;
                 };
                 this.select_chain(*chain_id, window, cx);
+                cx.defer_in(window, |_this, window, _cx| {
+                    window.blur();
+                });
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.walletconnect.uri_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    this.start_walletconnect_pairing_from_input(window, cx);
+                }
+                InputEvent::Change => {
+                    this.walletconnect.error = None;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.walletconnect.account_select,
+            window,
+            |this,
+             _select,
+             event: &SelectEvent<SearchableVec<walletconnect::WalletConnectAccountSelectItem>>,
+             window,
+             cx| {
+                let SelectEvent::Confirm(Some(public_account_uuid)) = event else {
+                    return;
+                };
+                this.set_walletconnect_selected_account(public_account_uuid.clone(), cx);
                 cx.defer_in(window, |_this, window, _cx| {
                     window.blur();
                 });

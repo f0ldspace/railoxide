@@ -194,6 +194,7 @@ impl WalletRoot {
             }
         }
 
+        self.ensure_walletconnect_relay_processing(cx);
         cx.notify();
     }
 }

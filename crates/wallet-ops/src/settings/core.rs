@@ -1,7 +1,7 @@
 use super::{
     ChainSettings, Deserialize, Error, GasSettings, NetworkSettings, PoiReadSource,
     PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings, RuntimeSettings, Serialize,
-    TokenSettings, Url, WakuSettings, WalletNetworkMode, fmt,
+    TokenSettings, Url, WakuSettings, WalletConnectSettings, WalletNetworkMode, fmt,
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
@@ -75,6 +75,7 @@ pub struct WalletSettings {
     pub gas: GasSettings,
     pub runtime: RuntimeSettings,
     pub waku: WakuSettings,
+    pub walletconnect: WalletConnectSettings,
 }
 
 impl Default for WalletSettings {
@@ -89,6 +90,7 @@ impl Default for WalletSettings {
             gas: GasSettings::default(),
             runtime: RuntimeSettings::default(),
             waku: WakuSettings::default(),
+            walletconnect: WalletConnectSettings::default(),
         }
     }
 }
@@ -104,6 +106,7 @@ impl WalletSettings {
         self.gas.validate(&mut errors);
         self.runtime.validate(&mut errors);
         self.waku.validate(&mut errors);
+        self.walletconnect.validate(&mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -147,6 +150,10 @@ impl WalletSettings {
 
     pub fn reset_waku(&mut self) {
         self.waku = WakuSettings::default();
+    }
+
+    pub fn reset_walletconnect(&mut self) {
+        self.walletconnect = WalletConnectSettings::default();
     }
 
     #[must_use]

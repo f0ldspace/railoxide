@@ -55,6 +55,9 @@ impl WalletRoot {
         let public_broadcaster_count = self.sidebar_public_broadcaster_count;
         let public_broadcaster_color =
             Self::public_broadcaster_status_color(public_broadcaster_count);
+        let walletconnect_pending_count = self.walletconnect_pending_request_count();
+        let walletconnect_attention =
+            walletconnect_pending_count > 0 && self.active_activity != Activity::Wallet;
 
         Sidebar::left()
             .w(SIDEBAR_WIDTH)
@@ -68,8 +71,19 @@ impl WalletRoot {
                 SidebarMenu::new()
                     .child(
                         SidebarMenuItem::new("Wallets")
-                            .icon(Icon::new(RailgunSidebarIcon::Wallet).size_5())
+                            .icon(
+                                Icon::new(RailgunSidebarIcon::Wallet)
+                                    .size_5()
+                                    .when(walletconnect_attention, |icon| {
+                                        icon.text_color(rgb(theme::WARNING))
+                                    }),
+                            )
                             .active(self.active_activity == Activity::Wallet)
+                            .when(walletconnect_attention, |item| {
+                                item.suffix(Self::render_walletconnect_attention_badge(
+                                    walletconnect_pending_count,
+                                ))
+                            })
                             .on_click(move |_event, _window, cx| {
                                 wallet_root.update(cx, |root, cx| {
                                     root.active_activity = Activity::Wallet;
@@ -189,6 +203,26 @@ impl WalletRoot {
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .line_height(gpui::relative(1.0))
             .child(count.to_string())
+    }
+
+    fn render_walletconnect_attention_badge(count: usize) -> impl IntoElement {
+        let color = theme::WARNING;
+        div()
+            .px(px(6.0))
+            .py(px(1.0))
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(color))
+            .bg(rgb_with_alpha(color, 0.12))
+            .text_color(rgb(color))
+            .text_size(px(11.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .line_height(gpui::relative(1.0))
+            .child(if count > 99 {
+                "99+".to_owned()
+            } else {
+                count.to_string()
+            })
     }
 
     fn render_network_status_pill(&self, root: &Entity<Self>, collapsed: bool) -> impl IntoElement {

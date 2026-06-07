@@ -634,6 +634,12 @@ impl WalletRoot {
                 self.discard_active_trezor_session_if_stale(&message, cx);
                 self.public_form.action_action_error = Some(Arc::from(message));
             }
+            PublicActionSessionEvent::HardwareApprovalStarted
+            | PublicActionSessionEvent::HardwareApprovalCompleted => {}
+            PublicActionSessionEvent::HardwareApprovalFailed { message } => {
+                self.discard_active_trezor_session_if_stale(&message, cx);
+                self.public_form.action_action_error = Some(Arc::from(message));
+            }
             PublicActionSessionEvent::HardwareProfileSessionRefreshed { session } => {
                 #[cfg(feature = "hardware")]
                 self.refresh_active_hardware_profile_session(session, cx);

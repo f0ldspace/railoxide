@@ -123,9 +123,12 @@ impl WalletRoot {
         match self.http.start_new_tor_session() {
             Ok(generation) => {
                 let waku_refreshed = self.waku.refresh_network_session();
+                let walletconnect_refreshed =
+                    self.restart_walletconnect_relay_workers_for_network_session(cx);
                 tracing::info!(
                     tor_session_generation = generation,
                     waku_refreshed,
+                    walletconnect_refreshed,
                     "started new Tor session"
                 );
                 self.network_status_error = None;
@@ -283,8 +286,8 @@ pub(super) fn render_network_status_popover_content(
                     .line_height(px(17.0))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(
-                        "Future wallet HTTP/RPC requests use the active Tor session. Waku peers reconnect and rediscover using the new Tor session.",
-                    ),
+                                "Future wallet HTTP/RPC requests use the active Tor session. Waku peers and WalletConnect relay sockets reconnect using the new Tor session.",
+                            ),
             )
             .child(
                 app_button("wallet-network-new-tor-session", "New Tor session")

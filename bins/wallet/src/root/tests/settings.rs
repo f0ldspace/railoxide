@@ -155,6 +155,13 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
         SettingsApplyMode::NewRequests
     );
 
+    let mut walletconnect_draft = saved.clone();
+    walletconnect_draft.walletconnect.project_id_override = Some("project-override".to_owned());
+    assert_eq!(
+        classify_settings_apply_mode(&saved, &walletconnect_draft),
+        SettingsApplyMode::NewRequests
+    );
+
     let mut session_draft = saved.clone();
     session_draft.runtime.public_balance_refresh_interval_secs += 1;
     assert_eq!(

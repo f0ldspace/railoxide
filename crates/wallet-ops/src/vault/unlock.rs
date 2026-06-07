@@ -3,8 +3,9 @@ use super::{
     HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN,
     Mac, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret,
     PublicAddressBookEntry, RecordKind, SecretKey, VaultError, WalletChainMetadataBundle,
-    WalletMetadataBundle, WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing,
-    decrypt_payload, decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
+    WalletConnectRelayIdentity, WalletConnectSessionRecord, WalletMetadataBundle,
+    WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload,
+    decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -300,6 +301,58 @@ impl ViewUnlock {
         record: &EncryptedRecord,
     ) -> Result<BroadcasterPreferenceEntry, VaultError> {
         decrypt_serialized(&self.view_dek, kind, entry_uuid, record)
+    }
+
+    pub fn encrypt_walletconnect_relay_identity(
+        &self,
+        wallet_uuid: &str,
+        identity: &WalletConnectRelayIdentity,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletConnectRelayIdentity,
+            wallet_uuid,
+            identity,
+        )
+    }
+
+    pub fn decrypt_walletconnect_relay_identity(
+        &self,
+        wallet_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<WalletConnectRelayIdentity, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletConnectRelayIdentity,
+            wallet_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_walletconnect_session(
+        &self,
+        session_uuid: &str,
+        session: &WalletConnectSessionRecord,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletConnectSession,
+            session_uuid,
+            session,
+        )
+    }
+
+    pub fn decrypt_walletconnect_session(
+        &self,
+        session_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<WalletConnectSessionRecord, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletConnectSession,
+            session_uuid,
+            record,
+        )
     }
 
     pub fn derive_cache_keys(&self, wallet_chain_uuid: &str) -> Result<CacheKeys, VaultError> {

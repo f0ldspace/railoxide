@@ -50,6 +50,7 @@ use super::public_action::{PublicActionMode, PublicActionStepState};
 use super::public_balances::{
     public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
 };
+use super::walletconnect::walletconnect_logo_with_presence;
 use super::{
     PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, WalletRoot,
     dialog_content_max_height, dialog_max_height, public_account_visible_balances_for_chain,
@@ -323,6 +324,7 @@ impl WalletRoot {
                             .items_center()
                             .gap_3()
                             .child(div().flex_1().min_w(px(0.0)))
+                            .child(self.render_walletconnect_toolbar_button(root))
                             .child(
                                 app_button(
                                     "wallet-public-refresh",
@@ -381,6 +383,7 @@ impl WalletRoot {
         self.public_form.error = None;
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
+        self.walletconnect.clear_runtime();
         self.public_form.adding_account = false;
         self.public_form.hardware_derivation_status = HardwarePublicAccountDerivationStatus::Idle;
         self.public_form.hardware_confirmation_address = None;
@@ -408,6 +411,7 @@ impl WalletRoot {
             &self.public_form.send_recipient_input,
             &self.public_form.send_amount_input,
             &self.public_form.shield_amount_input,
+            &self.walletconnect.uri_input,
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -471,6 +475,7 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.as_ref() else {
             self.public_accounts.clear();
             self.public_form.selected_account_uuid = None;
+            self.sync_walletconnect_account_select(window, cx);
             self.sync_self_broadcast_gas_payer_selects(window, cx);
             self.invalidate_blocked_shield_rescue_rows(cx);
             return;
@@ -503,6 +508,8 @@ impl WalletRoot {
                 self.sync_self_broadcast_gas_payer_selects(window, cx);
                 self.sync_public_edit_label_input(window, cx);
                 self.invalidate_blocked_shield_rescue_rows(cx);
+                self.reload_walletconnect_sessions(cx);
+                self.sync_walletconnect_account_select(window, cx);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1573,6 +1580,7 @@ impl WalletRoot {
             account.public_account_uuid
         ));
         let edit_root = root.clone();
+        let walletconnect_root = root.clone();
         let address_dialog_root = root.clone();
         let deactivate_root = root.clone();
         let activate_root = root.clone();
@@ -1581,6 +1589,8 @@ impl WalletRoot {
         let edit_uuid = Arc::clone(&account_uuid);
         let address_dialog_uuid = Arc::clone(&account_uuid);
         let address_dialog_address = account.address;
+        let has_walletconnect_session =
+            self.walletconnect_account_has_session(&account.public_account_uuid);
         let source_badge = public_account_metadata_badge(
             SharedString::from(format!(
                 "wallet-public-account-source-{}",
@@ -1602,7 +1612,7 @@ impl WalletRoot {
         }
         let account_label = public_account_display_label(account);
         let address_dialog_label = account_label.clone();
-        let action_buttons = div()
+        let mut action_buttons = div()
             .group(row_group.clone())
             .flex()
             .flex_none()
@@ -1613,23 +1623,71 @@ impl WalletRoot {
             .hover(|this| this.opacity(1.0))
             .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                 cx.stop_propagation();
-            })
-            .child(
-                public_account_icon_button(
+            });
+        if account.status == PublicAccountStatus::Active {
+            let walletconnect_uuid = Arc::clone(&account_uuid);
+            let walletconnect_button = public_account_walletconnect_button(
+                SharedString::from(format!(
+                    "wallet-public-walletconnect-{}",
+                    account.public_account_uuid
+                )),
+                has_walletconnect_session,
+            )
+            .on_click(move |_event, window, cx| {
+                cx.stop_propagation();
+                let account_uuid = Arc::clone(&walletconnect_uuid);
+                walletconnect_root.update(cx, |root, cx| {
+                    root.open_walletconnect_connection_dialog(account_uuid, window, cx);
+                });
+            });
+            if !has_walletconnect_session {
+                action_buttons = action_buttons.child(walletconnect_button);
+            }
+        }
+        action_buttons = action_buttons.child(
+            public_account_icon_button(
+                SharedString::from(format!(
+                    "wallet-public-edit-{}",
+                    account.public_account_uuid
+                )),
+                Icon::new(RailgunActionIcon::Pencil),
+                "Edit label",
+            )
+            .on_click(move |_event, window, cx| {
+                let account_uuid = Arc::clone(&edit_uuid);
+                edit_root.update(cx, |root, cx| {
+                    root.open_public_account_edit_dialog(account_uuid, window, cx);
+                });
+            }),
+        );
+        let mut persistent_action_buttons = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+            });
+        if account.status == PublicAccountStatus::Active && has_walletconnect_session {
+            let walletconnect_uuid = Arc::clone(&account_uuid);
+            let walletconnect_root = root.clone();
+            persistent_action_buttons = persistent_action_buttons.child(
+                public_account_walletconnect_button(
                     SharedString::from(format!(
-                        "wallet-public-edit-{}",
+                        "wallet-public-walletconnect-{}",
                         account.public_account_uuid
                     )),
-                    Icon::new(RailgunActionIcon::Pencil),
-                    "Edit label",
+                    true,
                 )
                 .on_click(move |_event, window, cx| {
-                    let account_uuid = Arc::clone(&edit_uuid);
-                    edit_root.update(cx, |root, cx| {
-                        root.open_public_account_edit_dialog(account_uuid, window, cx);
+                    cx.stop_propagation();
+                    let account_uuid = Arc::clone(&walletconnect_uuid);
+                    walletconnect_root.update(cx, |root, cx| {
+                        root.open_walletconnect_account_sessions_dialog(account_uuid, window, cx);
                     });
                 }),
             );
+        }
         let action_buttons = match account.source {
             PublicAccountSource::Derived | PublicAccountSource::HardwareDerived => {
                 let status_uuid = Arc::clone(&account_uuid);
@@ -1721,7 +1779,15 @@ impl WalletRoot {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w(px(0.0)).child(account_label))
-                    .child(action_buttons),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(persistent_action_buttons)
+                            .child(action_buttons),
+                    ),
             )
             .child(
                 div()
@@ -1984,6 +2050,26 @@ fn public_account_icon_button(
         .xsmall()
         .compact()
         .tooltip(tooltip)
+}
+
+fn public_account_walletconnect_button(
+    id: impl Into<ElementId>,
+    has_active_session: bool,
+) -> Button {
+    Button::new(id)
+        .text()
+        .xsmall()
+        .compact()
+        .cursor_pointer()
+        .tooltip(if has_active_session {
+            "Manage WalletConnect sessions"
+        } else {
+            "Connect dapp with WalletConnect"
+        })
+        .child(walletconnect_logo_with_presence(
+            px(16.0),
+            has_active_session,
+        ))
 }
 
 fn public_account_metadata_badge(

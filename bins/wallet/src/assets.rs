@@ -13,6 +13,7 @@ pub(crate) const WARM_GLOW_PATH: &str = "railgun/backgrounds/warm-glow.svg";
 pub(crate) const LEDGER_LOGO_SHORT_WHITE_ICON_PATH: &str =
     "railgun/icons/ledger-logo-short-white.svg";
 pub(crate) const TREZOR_SYMBOL_WHITE_ICON_PATH: &str = "railgun/icons/trezor-symbol-white-rgb.svg";
+pub(crate) const WALLETCONNECT_ICON_PATH: &str = "railgun/icons/walletconnect.svg";
 const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
@@ -43,6 +44,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     WARM_GLOW_PATH,
     LEDGER_LOGO_SHORT_WHITE_ICON_PATH,
     TREZOR_SYMBOL_WHITE_ICON_PATH,
+    WALLETCONNECT_ICON_PATH,
     ARROW_BIG_RIGHT_DASH_ICON_PATH,
     SHIELD_ICON_PATH,
     WALLET_ICON_PATH,
@@ -73,6 +75,7 @@ const LEDGER_LOGO_SHORT_WHITE_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/ledger-logo-short-white.svg");
 const TREZOR_SYMBOL_WHITE_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/trezor-symbol-white-rgb.svg");
+const WALLETCONNECT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/walletconnect.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/arrow-big-right-dash.svg");
 const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
@@ -277,6 +280,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         WARM_GLOW_PATH => Some(WARM_GLOW_BYTES),
         LEDGER_LOGO_SHORT_WHITE_ICON_PATH => Some(LEDGER_LOGO_SHORT_WHITE_ICON_BYTES),
         TREZOR_SYMBOL_WHITE_ICON_PATH => Some(TREZOR_SYMBOL_WHITE_ICON_BYTES),
+        WALLETCONNECT_ICON_PATH => Some(WALLETCONNECT_ICON_BYTES),
         ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
@@ -366,6 +370,12 @@ mod tests {
             assets
                 .load("railgun/icons/trezor-symbol-white-rgb.svg")
                 .expect("load trezor icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/walletconnect.svg")
+                .expect("load walletconnect icon")
                 .is_some()
         );
     }

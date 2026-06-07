@@ -12,6 +12,7 @@ use super::{
     decode_wallet_settings, encode_wallet_settings, load_wallet_settings, save_wallet_settings,
     should_show_chain_deployment_metadata_settings,
 };
+use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
 use sync_service::ChainConfigDefaults;
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -128,12 +129,63 @@ fn reset_helpers_restore_defaults() {
     let mut settings = WalletSettings::default();
     settings.network.mode = super::NetworkModeSetting::Direct;
     settings.poi.artifact.gateway_urls.clear();
+    settings.walletconnect.project_id_override = Some("custom-project".to_owned());
 
     settings.reset_network();
     settings.reset_poi();
+    settings.reset_walletconnect();
 
     assert_eq!(settings.network, super::NetworkSettings::default());
     assert_eq!(settings.poi, super::PoiSettings::default());
+    assert_eq!(
+        settings.walletconnect,
+        super::WalletConnectSettings::default()
+    );
+}
+
+#[test]
+fn walletconnect_settings_use_default_or_project_id_override() {
+    let mut settings = WalletSettings::default();
+
+    assert_eq!(
+        settings.walletconnect.effective_project_id(),
+        WALLETCONNECT_DEFAULT_PROJECT_ID
+    );
+
+    settings.walletconnect.project_id_override = Some("user-project-id".to_owned());
+
+    assert_eq!(
+        settings.walletconnect.effective_project_id(),
+        "user-project-id"
+    );
+}
+
+#[test]
+fn walletconnect_settings_reject_empty_project_id_override() {
+    let mut settings = WalletSettings::default();
+    settings.walletconnect.project_id_override = Some("   ".to_owned());
+
+    let err = settings.validate().expect_err("empty override rejected");
+    assert!(err.messages.iter().any(|message| {
+        message.contains("walletconnect.project_id_override")
+            && message.contains("must not be empty")
+    }));
+}
+
+#[test]
+fn walletconnect_settings_do_not_persist_custom_relay_url() {
+    let mut settings = WalletSettings::default();
+    settings.walletconnect.project_id_override = Some("user-project-id".to_owned());
+
+    let encoded = encode_wallet_settings(&settings).expect("encode settings");
+    let serialized = serde_json::to_value(&settings).expect("serialize settings");
+
+    assert_eq!(
+        serialized["walletconnect"]["project_id_override"],
+        "user-project-id"
+    );
+    assert!(serialized["walletconnect"].get("relay_url").is_none());
+    assert!(!String::from_utf8_lossy(&encoded).contains("relay_url"));
 }
 
 #[test]

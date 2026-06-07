@@ -29,6 +29,7 @@ use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
     HERO_WIDE_BREAKPOINT, LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT,
     SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, chain_load_overrides,
+    rgb_with_alpha,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,6 +165,7 @@ impl Render for WalletRoot {
         if !matches!(self.vault_state, VaultState::ViewUnlocked) {
             return self.render_locked_vault_screen(root, window);
         }
+        self.open_next_walletconnect_request_dialog_if_idle(window, cx);
         let sidebar_is_narrow = window.viewport_size().width < SIDEBAR_AUTO_COLLAPSE_WIDTH;
         if !sidebar_is_narrow {
             self.sidebar_narrow_expanded = false;
@@ -503,6 +505,7 @@ impl WalletRoot {
             .position(|tab| *tab == self.active_wallet_tab)
             .unwrap_or(0);
         let tab_root = root.clone();
+        let pending_walletconnect_requests = self.walletconnect_pending_request_count();
 
         TabBar::new("wallet-tabs")
             .underline()
@@ -519,12 +522,25 @@ impl WalletRoot {
                 });
             })
             .children(WalletTab::ALL.into_iter().map(|tab| {
-                Tab::new().min_w(px(92.0)).label(tab.label()).prefix(
-                    Icon::empty()
-                        .path(tab.icon_path())
-                        .with_size(px(18.0))
-                        .text_color(rgb(theme::TEXT)),
-                )
+                Tab::new()
+                    .min_w(px(92.0))
+                    .label(tab.label())
+                    .prefix(
+                        Icon::empty()
+                            .path(tab.icon_path())
+                            .with_size(px(18.0))
+                            .text_color(rgb(theme::TEXT)),
+                    )
+                    .when(
+                        tab == WalletTab::Public
+                            && self.active_wallet_tab != WalletTab::Public
+                            && pending_walletconnect_requests > 0,
+                        |tab| {
+                            tab.suffix(walletconnect_tab_attention_badge(
+                                pending_walletconnect_requests,
+                            ))
+                        },
+                    )
             }))
     }
 
@@ -623,5 +639,28 @@ impl WalletRoot {
                     .min_h(px(0.0))
                     .child(self.logs.clone()),
             )
+    }
+}
+
+fn walletconnect_tab_attention_badge(count: usize) -> gpui::Div {
+    div()
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(theme::WARNING))
+        .bg(rgb_with_alpha(theme::WARNING, 0.12))
+        .text_color(rgb(theme::WARNING))
+        .text_size(px(11.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .line_height(gpui::relative(1.0))
+        .child(attention_count_label(count))
+}
+
+fn attention_count_label(count: usize) -> String {
+    if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
     }
 }

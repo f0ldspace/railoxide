@@ -36,6 +36,7 @@ pub const PRIMARY: u32 = 0x8cd0d3;
 pub const ACCENT_BLUE: u32 = 0x8cd0d3;
 pub const INFO: u32 = 0x93e0e3;
 pub const SUCCESS: u32 = 0x7f9f7f;
+pub const PRESENCE_ONLINE: u32 = 0x4ade80;
 pub const WARNING: u32 = 0xf0dfaf;
 pub const WARNING_STRONG: u32 = 0xdfaf8f;
 pub const WARNING_BG: u32 = 0x4f4632;

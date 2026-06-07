@@ -1,0 +1,386 @@
+use super::*;
+
+impl WalletRoot {
+    pub(in crate::root) fn open_next_walletconnect_request_dialog_if_idle(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let active_dialog = window.has_active_dialog(cx);
+        if self.walletconnect.request_dialog_open && !active_dialog {
+            let stale_request_key = self
+                .walletconnect
+                .request_dialog_key
+                .as_deref()
+                .map(walletconnect_request_key_log_label);
+            tracing::debug!(
+                target: "wallet::root::walletconnect",
+                request_key = stale_request_key.as_deref().unwrap_or("<none>"),
+                "clearing stale walletconnect request dialog state"
+            );
+            self.clear_walletconnect_request_dialog_state(window, cx);
+            self.walletconnect.request_dialog_deferred_logged = false;
+        }
+        if self.walletconnect.pending_requests.is_empty() {
+            self.walletconnect.request_dialog_deferred_logged = false;
+            return;
+        }
+        let Some(request_key) = next_walletconnect_auto_open_request_key(
+            &self.walletconnect.pending_requests,
+            &self.walletconnect.dismissed_request_dialog_keys,
+        ) else {
+            self.walletconnect.request_dialog_deferred_logged = false;
+            return;
+        };
+        if self.walletconnect.request_dialog_open || active_dialog {
+            if !self.walletconnect.request_dialog_deferred_logged {
+                tracing::debug!(
+                    target: "wallet::root::walletconnect",
+                    pending_count = self.walletconnect.pending_requests.len(),
+                    walletconnect_dialog_open = self.walletconnect.request_dialog_open,
+                    active_dialog,
+                    request_key = %walletconnect_request_key_log_label(&request_key),
+                    "walletconnect request dialog deferred"
+                );
+                self.walletconnect.request_dialog_deferred_logged = true;
+            }
+            return;
+        };
+        self.walletconnect.request_dialog_deferred_logged = false;
+        tracing::info!(
+            target: "wallet::root::walletconnect",
+            request_key = %walletconnect_request_key_log_label(&request_key),
+            "opening walletconnect request dialog"
+        );
+        self.open_walletconnect_request_dialog(request_key, window, cx);
+    }
+
+    pub(in crate::root) fn open_walletconnect_pending_request_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(request_key) =
+            first_walletconnect_pending_request_key(&self.walletconnect.pending_requests)
+        else {
+            return;
+        };
+        self.open_walletconnect_request_dialog(request_key, window, cx);
+    }
+
+    pub(in crate::root::walletconnect) fn clear_walletconnect_request_dialog_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let current_key = self.walletconnect.request_dialog_key.clone();
+        if let Some(current_key) = current_key.as_deref() {
+            self.walletconnect.dismiss_request_dialog(current_key);
+            self.walletconnect
+                .completed_request_dialogs
+                .remove(current_key);
+        }
+        self.clear_trezor_app_passphrase_input(window, cx);
+        self.walletconnect.request_dialog_open = false;
+        self.walletconnect.request_dialog_key = None;
+    }
+
+    pub(in crate::root::walletconnect) fn close_walletconnect_request_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.clear_walletconnect_request_dialog_state(window, cx);
+        window.close_dialog(cx);
+        cx.notify();
+    }
+
+    pub(in crate::root::walletconnect) fn open_walletconnect_request_dialog(
+        &mut self,
+        request_key: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self
+            .walletconnect
+            .pending_requests
+            .contains_key(&request_key)
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let request_key = Arc::<str>::from(request_key);
+        self.walletconnect.request_dialog_open = true;
+        self.walletconnect.request_dialog_deferred_logged = false;
+        self.walletconnect.request_dialog_key = Some(Arc::clone(&request_key));
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
+        let dialog_max_height = (window.viewport_size().height * 0.88).min(px(820.0));
+        let content_max_height = dialog_content_max_height(window);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
+            let content_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .max_h(dialog_max_height)
+                .title(walletconnect_title_row("WalletConnect request"))
+                .on_close(move |_event, window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.clear_walletconnect_request_dialog_state(window, cx);
+                        cx.notify();
+                    });
+                })
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content_root
+                        .read(cx)
+                        .render_walletconnect_request_dialog_content(&content_root, content_width),
+                ))
+        });
+        cx.defer_in(window, |root, window, _cx| {
+            root.walletconnect.request_dialog_focus.focus(window);
+        });
+        cx.notify();
+    }
+
+    pub(in crate::root::walletconnect) fn render_walletconnect_request_dialog_content(
+        &self,
+        root: &Entity<Self>,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        let keyboard_root = root.clone();
+        let focus_handle = self.walletconnect.request_dialog_focus.clone();
+        let mut content = div()
+            .w(content_width)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .track_focus(&focus_handle.tab_stop(true))
+            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                let target_key = keyboard_root
+                    .read(cx)
+                    .walletconnect
+                    .request_dialog_key
+                    .as_ref()
+                    .and_then(|request_key| {
+                        walletconnect_request_dialog_nav(
+                            &keyboard_root.read(cx).walletconnect.pending_requests,
+                            request_key,
+                        )
+                    })
+                    .and_then(|nav| match event.keystroke.key.as_str() {
+                        "left" => nav.previous_key,
+                        "right" => nav.next_key,
+                        _ => None,
+                    });
+                let Some(target_key) = target_key else {
+                    return;
+                };
+                keyboard_root.update(cx, |root, cx| {
+                    root.navigate_walletconnect_request_dialog(target_key, cx);
+                });
+                cx.stop_propagation();
+            });
+        let Some(request_key) = self.walletconnect.request_dialog_key.as_deref() else {
+            return content.child(app_muted_text(
+                "This WalletConnect request was already resolved or is no longer available.",
+            ));
+        };
+        if let Some(completed) = self
+            .walletconnect
+            .completed_request_dialogs
+            .get(request_key)
+        {
+            return content.child(self.render_walletconnect_completed_request(root, completed));
+        }
+        if let Some(error) = self.walletconnect.error.as_ref() {
+            content = content.child(
+                Alert::error("walletconnect-request-dialog-error", error.to_string()).small(),
+            );
+        }
+        if let Some(nav) =
+            walletconnect_request_dialog_nav(&self.walletconnect.pending_requests, request_key)
+            && nav.total > 1
+        {
+            content = content.child(self.render_walletconnect_request_dialog_nav(root, nav));
+        }
+        match self.walletconnect.pending_requests.get(request_key) {
+            Some(request) => content.child(self.render_walletconnect_request(root, request)),
+            None => content.child(app_muted_text(
+                "This WalletConnect request was already resolved or is no longer available.",
+            )),
+        }
+    }
+
+    pub(in crate::root::walletconnect) fn render_walletconnect_request_dialog_nav(
+        &self,
+        root: &Entity<Self>,
+        nav: WalletConnectRequestDialogNav,
+    ) -> gpui::Div {
+        let previous_key = nav.previous_key.clone();
+        let next_key = nav.next_key.clone();
+        let previous_root = root.clone();
+        let next_root = root.clone();
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                app_button_base("walletconnect-request-previous")
+                    .icon(IconName::ArrowLeft)
+                    .outline()
+                    .small()
+                    .disabled(previous_key.is_none())
+                    .on_click(move |_event, _window, cx| {
+                        let Some(key) = previous_key.clone() else {
+                            return;
+                        };
+                        previous_root.update(cx, |root, cx| {
+                            root.navigate_walletconnect_request_dialog(key, cx);
+                        });
+                    }),
+            )
+            .child(
+                app_strong_text(format!("{} out of {}", nav.index, nav.total))
+                    .text_size(px(13.0))
+                    .text_color(rgb(theme::TEXT)),
+            )
+            .child(
+                app_button_base("walletconnect-request-next")
+                    .icon(IconName::ArrowRight)
+                    .outline()
+                    .small()
+                    .disabled(next_key.is_none())
+                    .on_click(move |_event, _window, cx| {
+                        let Some(key) = next_key.clone() else {
+                            return;
+                        };
+                        next_root.update(cx, |root, cx| {
+                            root.navigate_walletconnect_request_dialog(key, cx);
+                        });
+                    }),
+            )
+    }
+
+    pub(in crate::root::walletconnect) fn navigate_walletconnect_request_dialog(
+        &mut self,
+        request_key: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self
+            .walletconnect
+            .pending_requests
+            .contains_key(&request_key)
+        {
+            return;
+        }
+        let current_key = self.walletconnect.request_dialog_key.clone();
+        if let Some(current_key) = current_key.as_deref()
+            && current_key != request_key
+        {
+            self.walletconnect.dismiss_request_dialog(current_key);
+        }
+        self.walletconnect.request_dialog_key = Some(Arc::from(request_key.as_str()));
+        self.walletconnect.request_dialog_open = true;
+        self.walletconnect.request_dialog_deferred_logged = false;
+        cx.notify();
+    }
+
+    pub(in crate::root::walletconnect) fn render_walletconnect_completed_request(
+        &self,
+        root: &Entity<Self>,
+        completed: &WalletConnectCompletedRequestUi,
+    ) -> gpui::Div {
+        let close_root = root.clone();
+        let next_root = root.clone();
+        let current_key = Arc::<str>::from(completed.request.key.as_str());
+        let next_key =
+            first_walletconnect_pending_request_key(&self.walletconnect.pending_requests);
+        let status_color = walletconnect_completed_request_color(completed.status);
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER_SUBTLE))
+            .bg(rgb(theme::SURFACE_ELEVATED))
+            .p(px(10.0))
+            .child(walletconnect_notice(
+                completed.message.clone(),
+                status_color,
+                theme::SURFACE_HOVER_SUBTLE,
+            ))
+            .child(walletconnect_kv_element_row(
+                "Dapp",
+                app_strong_text(completed.request.item.dapp_name.clone()),
+            ))
+            .child(walletconnect_kv_row(
+                "Method",
+                completed.request.item.method.as_str().to_owned(),
+            ))
+            .child(walletconnect_kv_element_row(
+                "Chain",
+                walletconnect_approved_chain_chip(&approved_chain_display_item(
+                    &completed.request.item.chain_id,
+                )),
+            ))
+            .child(walletconnect_kv_row(
+                "Public account",
+                short_address(&completed.request.item.account).to_string(),
+            ));
+        if let Some(tx_hash) = completed.submitted_tx_hash.as_ref() {
+            card = card.child(walletconnect_completed_tx_hash_row(
+                &completed.request.key,
+                tx_hash,
+            ));
+        }
+        if let Some(error) = completed.error.as_ref() {
+            card = card.child(
+                Alert::error("walletconnect-request-result-error", error.to_string()).small(),
+            );
+        }
+        card.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .when_some(next_key, |this, next_key| {
+                    this.child(
+                        app_button("walletconnect-request-review-next", "Review next")
+                            .outline()
+                            .small()
+                            .on_click(move |_event, _window, cx| {
+                                let next_key = next_key.clone();
+                                let current_key = Arc::clone(&current_key);
+                                next_root.update(cx, |root, cx| {
+                                    root.walletconnect
+                                        .completed_request_dialogs
+                                        .remove(current_key.as_ref());
+                                    root.walletconnect.request_dialog_key =
+                                        Some(Arc::from(next_key.as_str()));
+                                    root.walletconnect.request_dialog_open = true;
+                                    root.walletconnect.request_dialog_deferred_logged = false;
+                                    root.walletconnect.error = None;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                })
+                .child(
+                    app_button("walletconnect-request-result-close", "Close")
+                        .primary()
+                        .small()
+                        .on_click(move |_event, window, cx| {
+                            close_root.update(cx, |root, cx| {
+                                root.close_walletconnect_request_dialog(window, cx);
+                            });
+                        }),
+                ),
+        )
+    }
+}

@@ -13,10 +13,13 @@ use super::{
     PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
     RecordKind, SoftwareRailgunSpendSigner, SpendGrant, StoredHardwareWalletRecord,
     StoredWalletRecord, VAULT_METADATA_KEY, VaultError, VaultMetadata, VaultRecordEntries,
-    ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX, WalletChainMetadataBundle,
-    WalletKeys, WalletMetadataBundle, WalletSource, WalletSpendBundle, WalletSpendSource,
-    WalletStatus, WalletViewBundle, Zeroizing, assign_missing_display_orders,
-    bip39_entropy_from_mnemonic, broadcaster_banned_record_entry, broadcaster_banned_record_key,
+    ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX,
+    WALLETCONNECT_RELAY_IDENTITY_PREFIX, WALLETCONNECT_SESSION_PREFIX, WalletChainMetadataBundle,
+    WalletConnectRelayIdentity, WalletConnectSessionAccountResolution,
+    WalletConnectSessionLifecycleState, WalletConnectSessionRecord, WalletKeys,
+    WalletMetadataBundle, WalletSource, WalletSpendBundle, WalletSpendSource, WalletStatus,
+    WalletViewBundle, Zeroizing, assign_missing_display_orders, bip39_entropy_from_mnemonic,
+    broadcaster_banned_record_entry, broadcaster_banned_record_key,
     broadcaster_favorite_record_entry, broadcaster_favorite_record_key,
     broadcaster_preference_entry_identity, create_spend_grant, create_with_params,
     current_vault_version, default_wallet_label_for_metadata,
@@ -24,7 +27,7 @@ use super::{
     deserialize_wallet_utxo, ensure_private_address_book_address_available,
     ensure_private_address_book_address_available_for_update,
     ensure_public_account_address_available, ensure_public_address_book_address_available,
-    ensure_public_address_book_address_available_for_update, generate_opaque_id,
+    ensure_public_address_book_address_available_for_update, fill, generate_opaque_id,
     hardware_profile_record_entry, hardware_wallet_account_index_record_entry,
     initial_derived_public_account, next_derived_public_account_index,
     next_private_address_book_display_order, next_public_account_display_order,
@@ -37,13 +40,15 @@ use super::{
     public_evm_address_from_private_key, serialize_wallet_utxo,
     sort_broadcaster_preference_entries, sort_hardware_profile_metadata,
     sort_private_address_book_entries, sort_public_account_metadata,
-    sort_public_address_book_entries, sort_wallet_metadata, unlock_spend, unlock_view,
-    validate_address_book_label, validate_broadcaster_preference_address,
-    validate_private_address_book_address, validate_public_address_book_address,
-    validate_wallet_label, vault_error_from_wallet_cache, wallet_cache_row_prefix,
-    wallet_cache_row_record_key, wallet_chain_metadata_record_key, wallet_metadata_record_entry,
-    wallet_metadata_record_key, wallet_spend_record_key, wallet_utxo_stable_identity,
-    wallet_view_record_key,
+    sort_public_address_book_entries, sort_wallet_metadata, sort_walletconnect_sessions,
+    unlock_spend, unlock_view, validate_address_book_label,
+    validate_broadcaster_preference_address, validate_private_address_book_address,
+    validate_public_address_book_address, validate_wallet_label, vault_error_from_wallet_cache,
+    wallet_cache_row_prefix, wallet_cache_row_record_key, wallet_chain_metadata_record_key,
+    wallet_metadata_record_entry, wallet_metadata_record_key, wallet_spend_record_key,
+    wallet_utxo_stable_identity, wallet_view_record_key, walletconnect_relay_identity_record_entry,
+    walletconnect_relay_identity_record_key, walletconnect_session_record_entry,
+    walletconnect_session_record_key,
 };
 
 #[derive(Clone)]
@@ -549,6 +554,217 @@ impl DesktopVaultStore {
         });
         sort_public_account_metadata(&mut accounts);
         Ok(accounts)
+    }
+
+    pub fn load_walletconnect_relay_identity(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Option<WalletConnectRelayIdentity>, VaultError> {
+        self.load_walletconnect_relay_identity_for_wallet(view_session, view_session.wallet_id())
+    }
+
+    pub fn load_walletconnect_relay_identity_for_wallet(
+        &self,
+        view_session: &DesktopViewSession,
+        wallet_uuid: &str,
+    ) -> Result<Option<WalletConnectRelayIdentity>, VaultError> {
+        let key = walletconnect_relay_identity_record_key(wallet_uuid);
+        let Some(record) = self.encrypted_record_optional(&key)? else {
+            return Ok(None);
+        };
+        let mut identity = view_session
+            .view
+            .decrypt_walletconnect_relay_identity(wallet_uuid, &record)?;
+        let auth = crate::WalletConnectRelayClientAuth::from_signing_key(identity.signing_key);
+        if identity.client_id != auth.client_id {
+            identity.client_id.clone_from(&auth.client_id);
+            let (key, payload) = walletconnect_relay_identity_record_entry(
+                &view_session.view,
+                wallet_uuid,
+                &identity,
+            )?;
+            self.db.put_desktop_wallet_vault_record(&key, &payload)?;
+        }
+        Ok(Some(identity))
+    }
+
+    pub fn load_walletconnect_relay_identity_for_client_id(
+        &self,
+        view_session: &DesktopViewSession,
+        client_id: &str,
+    ) -> Result<Option<WalletConnectRelayIdentity>, VaultError> {
+        let records = self
+            .db
+            .list_desktop_wallet_vault_records(WALLETCONNECT_RELAY_IDENTITY_PREFIX)?;
+        for stored in records {
+            let Some(wallet_uuid) = stored.key.strip_prefix(WALLETCONNECT_RELAY_IDENTITY_PREFIX)
+            else {
+                continue;
+            };
+            let Some(identity) =
+                self.load_walletconnect_relay_identity_for_wallet(view_session, wallet_uuid)?
+            else {
+                continue;
+            };
+            if identity.client_id == client_id {
+                return Ok(Some(identity));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn load_or_create_walletconnect_relay_identity(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<WalletConnectRelayIdentity, VaultError> {
+        if let Some(identity) = self.load_walletconnect_relay_identity(view_session)? {
+            return Ok(identity);
+        }
+
+        let mut signing_key = [0u8; KEY_LEN];
+        fill(&mut signing_key).map_err(|_| VaultError::Random)?;
+        let auth = crate::WalletConnectRelayClientAuth::from_signing_key(signing_key);
+        let identity = WalletConnectRelayIdentity {
+            signing_key,
+            client_id: auth.client_id.clone(),
+        };
+        let (key, payload) = walletconnect_relay_identity_record_entry(
+            &view_session.view,
+            view_session.wallet_id(),
+            &identity,
+        )?;
+        self.db.put_desktop_wallet_vault_record(&key, &payload)?;
+        Ok(identity)
+    }
+
+    pub fn store_walletconnect_session(
+        &self,
+        view_session: &DesktopViewSession,
+        session: &WalletConnectSessionRecord,
+    ) -> Result<(), VaultError> {
+        let (key, payload) = walletconnect_session_record_entry(&view_session.view, session)?;
+        self.db.put_desktop_wallet_vault_record(&key, &payload)?;
+        Ok(())
+    }
+
+    pub fn list_walletconnect_sessions(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<WalletConnectSessionRecord>, VaultError> {
+        let records = self
+            .db
+            .list_desktop_wallet_vault_records(WALLETCONNECT_SESSION_PREFIX)?;
+        let mut sessions = Vec::with_capacity(records.len());
+        for stored in records {
+            let Some(session_uuid) = stored.key.strip_prefix(WALLETCONNECT_SESSION_PREFIX) else {
+                continue;
+            };
+            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
+            let mut session = view_session
+                .view
+                .decrypt_walletconnect_session(session_uuid, &record)?;
+            if session.session_uuid != session_uuid {
+                session_uuid.clone_into(&mut session.session_uuid);
+            }
+            sessions.push(session);
+        }
+        sort_walletconnect_sessions(&mut sessions);
+        Ok(sessions)
+    }
+
+    pub fn load_walletconnect_session(
+        &self,
+        view_session: &DesktopViewSession,
+        session_uuid: &str,
+    ) -> Result<WalletConnectSessionRecord, VaultError> {
+        let key = walletconnect_session_record_key(session_uuid);
+        let record = self.encrypted_record(&key)?;
+        view_session
+            .view
+            .decrypt_walletconnect_session(session_uuid, &record)
+    }
+
+    pub fn update_walletconnect_session(
+        &self,
+        view_session: &DesktopViewSession,
+        session: &WalletConnectSessionRecord,
+    ) -> Result<(), VaultError> {
+        self.store_walletconnect_session(view_session, session)
+    }
+
+    pub fn delete_walletconnect_session(&self, session_uuid: &str) -> Result<(), VaultError> {
+        self.db
+            .delete_desktop_wallet_vault_record(&walletconnect_session_record_key(session_uuid))?;
+        Ok(())
+    }
+
+    pub fn resolve_walletconnect_session_account(
+        &self,
+        view_session: &DesktopViewSession,
+        session: &WalletConnectSessionRecord,
+    ) -> Result<WalletConnectSessionAccountResolution, VaultError> {
+        let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let Some(account) = accounts
+            .into_iter()
+            .find(|account| account.public_account_uuid == session.selected_public_account_uuid)
+        else {
+            return Ok(WalletConnectSessionAccountResolution::InvalidPublicAccount);
+        };
+
+        if account.status != PublicAccountStatus::Active
+            || account.scope != session.selected_public_account_scope
+        {
+            return Ok(WalletConnectSessionAccountResolution::InvalidPublicAccount);
+        }
+
+        match &account.scope {
+            PublicAccountScope::Global => {
+                Ok(WalletConnectSessionAccountResolution::Usable(account))
+            }
+            PublicAccountScope::PrivateWallet { wallet_uuid } => {
+                if session.owning_private_wallet_uuid.as_deref() != Some(wallet_uuid.as_str()) {
+                    return Ok(WalletConnectSessionAccountResolution::InvalidPublicAccount);
+                }
+                if wallet_uuid == view_session.wallet_id() {
+                    Ok(WalletConnectSessionAccountResolution::Usable(account))
+                } else {
+                    Ok(
+                        WalletConnectSessionAccountResolution::TemporarilyPausedWrongPrivateWallet {
+                            owning_wallet_uuid: wallet_uuid.clone(),
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    pub fn reconcile_walletconnect_session_account_state(
+        &self,
+        view_session: &DesktopViewSession,
+        session_uuid: &str,
+    ) -> Result<WalletConnectSessionRecord, VaultError> {
+        let mut session = self.load_walletconnect_session(view_session, session_uuid)?;
+        session.lifecycle_state = match session.lifecycle_state {
+            WalletConnectSessionLifecycleState::Invalid
+            | WalletConnectSessionLifecycleState::Disconnected
+            | WalletConnectSessionLifecycleState::Expired => session.lifecycle_state,
+            WalletConnectSessionLifecycleState::Active
+            | WalletConnectSessionLifecycleState::TemporarilyPaused => match self
+                .resolve_walletconnect_session_account(view_session, &session)?
+            {
+                WalletConnectSessionAccountResolution::Usable(_) => {
+                    WalletConnectSessionLifecycleState::Active
+                }
+                WalletConnectSessionAccountResolution::TemporarilyPausedWrongPrivateWallet {
+                    ..
+                } => WalletConnectSessionLifecycleState::TemporarilyPaused,
+                WalletConnectSessionAccountResolution::InvalidPublicAccount => {
+                    WalletConnectSessionLifecycleState::Invalid
+                }
+            },
+        };
+        self.update_walletconnect_session(view_session, &session)?;
+        Ok(session)
     }
 
     pub fn next_derived_public_account_index_for_session(

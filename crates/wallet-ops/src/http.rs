@@ -816,7 +816,7 @@ async fn run_arti_socks_bridge(
                         };
                         tokio::spawn(async move {
                             if let Err(error) = handle_socks_connection(stream, arti_client).await {
-                                tracing::debug!(%peer_addr, %error, "internal Arti SOCKS connection failed");
+                                tracing::debug!(%peer_addr, ?error, "internal Arti SOCKS connection failed");
                             }
                         });
                     }
@@ -861,10 +861,23 @@ async fn handle_socks_connection(
     };
     send_socks_reply(&mut inbound, SOCKS_REPLY_SUCCEEDED).await?;
     let mut outbound = outbound;
-    tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
-        .await
-        .wrap_err("relay SOCKS stream through Arti")?;
+    match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
+        Ok(_) => {}
+        Err(error) if is_expected_socks_stream_close(&error) => {
+            tracing::trace!(%error, "internal Arti SOCKS stream closed");
+        }
+        Err(error) => return Err(error).wrap_err("relay SOCKS stream through Arti"),
+    }
     Ok(())
+}
+
+fn is_expected_socks_stream_close(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 async fn negotiate_socks_no_auth(inbound: &mut TcpStream) -> Result<()> {

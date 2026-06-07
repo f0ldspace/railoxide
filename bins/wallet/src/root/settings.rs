@@ -32,9 +32,9 @@ use tokio::sync::watch;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::{
-    HttpContext, ProverCacheBuildProgress, WalletDbStore, WalletNetworkConfig, WalletNetworkMode,
-    begin_prover_cache_build, build_cache_with_context_and_progress_with_session,
-    build_wallet_network_context,
+    HttpContext, ProverCacheBuildProgress, WALLETCONNECT_DEFAULT_PROJECT_ID, WalletDbStore,
+    WalletNetworkConfig, WalletNetworkMode, begin_prover_cache_build,
+    build_cache_with_context_and_progress_with_session, build_wallet_network_context,
     settings::{
         BuiltInTokenOverride, ChainContractSettings, ChainDeploymentSettings,
         ChainSettingsOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,

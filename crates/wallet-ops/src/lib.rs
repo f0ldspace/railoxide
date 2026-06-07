@@ -80,6 +80,7 @@ mod poi_contexts;
 mod public_wallet;
 mod signer;
 mod utxos;
+pub mod walletconnect;
 
 pub mod settings;
 pub mod vault;
@@ -108,12 +109,15 @@ pub use public_wallet::{
     PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicActionSessionEvent, PublicActionSessionEventSender, PublicAssetId, PublicBalanceAmount,
     PublicBalanceAsset, PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot,
-    PublicSendRequest, PublicSendResult, PublicShieldRequest,
-    estimate_public_native_action_gas_reserve, public_action_replacement_bumped_fee,
-    public_balance_assets_for_chain, public_balance_refresh_interval_secs,
-    public_native_action_gas_reserve, public_native_action_gas_units, quote_public_action_gas_fee,
-    refresh_public_balances, submit_public_send, submit_public_send_with_progress,
-    submit_public_shield, submit_public_shield_with_progress,
+    PublicSendRequest, PublicSendResult, PublicShieldRequest, WalletConnectPersonalSignRequest,
+    WalletConnectSendTransactionRequest, WalletConnectSendTransactionResult,
+    WalletConnectTypedDataSignRequest, estimate_public_native_action_gas_reserve,
+    public_action_replacement_bumped_fee, public_balance_assets_for_chain,
+    public_balance_refresh_interval_secs, public_native_action_gas_reserve,
+    public_native_action_gas_units, quote_public_action_gas_fee, refresh_public_balances,
+    submit_public_send, submit_public_send_with_progress, submit_public_shield,
+    submit_public_shield_with_progress, submit_walletconnect_send_transaction,
+    walletconnect_sign_personal_message, walletconnect_sign_typed_data_v4,
 };
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 use utxos::apply_pending_overlay_to_outputs;
@@ -121,6 +125,34 @@ pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,
     max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
     max_unshield_amount_from_outputs,
+};
+pub use walletconnect::{
+    WALLETCONNECT_DEFAULT_PROJECT_ID, WALLETCONNECT_EIP155_NAMESPACE,
+    WALLETCONNECT_IRN_RELAY_PROTOCOL, WALLETCONNECT_RELAY_RPC_URL,
+    WALLETCONNECT_REQUIRED_PAIRING_METHOD, WC_SESSION_PROPOSE, WC_SESSION_PROPOSE_RESPONSE_TAG,
+    WC_SESSION_SETTLE, WC_SESSION_SETTLE_REQUEST_TAG, WalletConnectApprovalMessages,
+    WalletConnectDisconnectPlan, WalletConnectEnvelope, WalletConnectErc20CallSummary,
+    WalletConnectError, WalletConnectEvmTransaction, WalletConnectJsonRpcRequest,
+    WalletConnectJsonRpcResponse, WalletConnectLifecycleRequestOutcome,
+    WalletConnectNamespaceNegotiation, WalletConnectNamespaceProposal, WalletConnectPairingStart,
+    WalletConnectPairingUri, WalletConnectParsedRequest, WalletConnectPendingRequest,
+    WalletConnectPendingRequestQueue, WalletConnectProposalRejectionReason,
+    WalletConnectProposalSummary, WalletConnectRelayClient, WalletConnectRelayClientAuth,
+    WalletConnectRelayConfig, WalletConnectRelayLifecycle, WalletConnectRelayRpc,
+    WalletConnectRelaySocket, WalletConnectRelayStep, WalletConnectRelaySubscriptionPayload,
+    WalletConnectRequestErrorKind, WalletConnectRequestValidation, WalletConnectSessionApproval,
+    WalletConnectSessionProposal, WalletConnectSessionRequest, WalletConnectSupportedEvent,
+    WalletConnectSupportedMethod, WalletConnectTerminalLifecycleEnd,
+    WalletConnectTransactionRequest, WalletConnectUnsupportedNamespaceItem,
+    approve_walletconnect_session, build_walletconnect_disconnect_plan,
+    build_walletconnect_jsonrpc_error, build_walletconnect_session_event,
+    decode_walletconnect_message, decode_walletconnect_session_proposal,
+    derive_walletconnect_session_sym_key, derive_walletconnect_session_topic,
+    encode_walletconnect_message, generate_walletconnect_key_pair,
+    handle_walletconnect_lifecycle_request, hash_walletconnect_key,
+    negotiate_walletconnect_namespaces, parse_walletconnect_session_request,
+    reject_walletconnect_session_proposal, start_walletconnect_pairing,
+    validate_walletconnect_session_request,
 };
 
 #[cfg(test)]

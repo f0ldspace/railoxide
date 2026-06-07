@@ -1,4 +1,7 @@
 use super::*;
+use alloy::dyn_abi::TypedData;
+use alloy::primitives::Signature;
+use alloy_signer::SignerSync;
 
 pub(crate) trait EvmTransactionSigner {
     fn address(&self) -> Address;
@@ -24,6 +27,18 @@ impl SoftwareEvmSigner {
             private_key,
             signer,
         })
+    }
+
+    pub(crate) fn sign_personal_message(&self, message: &[u8]) -> Result<Signature> {
+        self.signer
+            .sign_message_sync(message)
+            .wrap_err("software personal_sign")
+    }
+
+    pub(crate) fn sign_typed_data_v4(&self, typed_data: &TypedData) -> Result<Signature> {
+        self.signer
+            .sign_dynamic_typed_data_sync(typed_data)
+            .wrap_err("software eth_signTypedData_v4")
     }
 }
 

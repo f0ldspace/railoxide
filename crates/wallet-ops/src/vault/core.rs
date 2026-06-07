@@ -27,6 +27,8 @@ pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
 pub(super) const PUBLIC_ADDRESS_BOOK_PREFIX: &str = "public-address-book|";
 pub(super) const BROADCASTER_FAVORITE_PREFIX: &str = "broadcaster-favorite|";
 pub(super) const BROADCASTER_BANNED_PREFIX: &str = "broadcaster-banned|";
+pub(super) const WALLETCONNECT_RELAY_IDENTITY_PREFIX: &str = "walletconnect-relay-identity|";
+pub(super) const WALLETCONNECT_SESSION_PREFIX: &str = "walletconnect-session|";
 pub const PRIMARY_WALLET_LABEL: &str = "Primary wallet";
 pub(super) const ADDITIONAL_WALLET_LABEL_PREFIX: &str = "Wallet ";
 pub(super) type HmacSha256 = Hmac<Sha256>;
@@ -194,6 +196,8 @@ pub enum RecordKind {
     PublicAddressBookEntry,
     BroadcasterFavoriteEntry,
     BroadcasterBannedEntry,
+    WalletConnectRelayIdentity,
+    WalletConnectSession,
 }
 
 impl RecordKind {
@@ -217,6 +221,8 @@ impl RecordKind {
             Self::PublicAddressBookEntry => "public-address-book-entry",
             Self::BroadcasterFavoriteEntry => "broadcaster-favorite-entry",
             Self::BroadcasterBannedEntry => "broadcaster-banned-entry",
+            Self::WalletConnectRelayIdentity => "walletconnect-relay-identity",
+            Self::WalletConnectSession => "walletconnect-session",
         }
     }
 

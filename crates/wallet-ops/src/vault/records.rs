@@ -8,8 +8,10 @@ use super::{
     PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
     PublicAddressBookEntry, RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock,
     WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
-    WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WalletCacheError, WalletMetadataBundle, WalletUtxo,
-    Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
+    WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
+    WALLETCONNECT_SESSION_PREFIX, WalletCacheError, WalletConnectRelayIdentity,
+    WalletConnectSessionRecord, WalletMetadataBundle, WalletUtxo, Zeroizing,
+    bip39_mnemonic_from_entropy, generate_opaque_id,
 };
 use crate::parse_railgun_recipient;
 
@@ -66,6 +68,14 @@ pub(super) fn private_address_book_record_key(entry_uuid: &str) -> String {
 
 pub(super) fn public_address_book_record_key(entry_uuid: &str) -> String {
     format!("{PUBLIC_ADDRESS_BOOK_PREFIX}{entry_uuid}")
+}
+
+pub(super) fn walletconnect_relay_identity_record_key(wallet_uuid: &str) -> String {
+    format!("{WALLETCONNECT_RELAY_IDENTITY_PREFIX}{wallet_uuid}")
+}
+
+pub(super) fn walletconnect_session_record_key(session_uuid: &str) -> String {
+    format!("{WALLETCONNECT_SESSION_PREFIX}{session_uuid}")
 }
 
 pub(super) fn broadcaster_favorite_record_key(entry_uuid: &str) -> String {
@@ -188,6 +198,25 @@ pub(super) fn broadcaster_banned_record_entry(
         entry_uuid,
         entry,
     )?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn walletconnect_relay_identity_record_entry(
+    view: &ViewUnlock,
+    wallet_uuid: &str,
+    identity: &WalletConnectRelayIdentity,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = walletconnect_relay_identity_record_key(wallet_uuid);
+    let record = view.encrypt_walletconnect_relay_identity(wallet_uuid, identity)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn walletconnect_session_record_entry(
+    view: &ViewUnlock,
+    session: &WalletConnectSessionRecord,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = walletconnect_session_record_key(&session.session_uuid);
+    let record = view.encrypt_walletconnect_session(&session.session_uuid, session)?;
     record.to_record_entry(key)
 }
 
@@ -377,6 +406,15 @@ pub fn sort_public_address_book_entries(entries: &mut [PublicAddressBookEntry]) 
             .cmp(&right.display_order)
             .then_with(|| left.label.cmp(&right.label))
             .then_with(|| left.entry_uuid.cmp(&right.entry_uuid))
+    });
+}
+
+pub fn sort_walletconnect_sessions(sessions: &mut [WalletConnectSessionRecord]) {
+    sessions.sort_by(|left, right| {
+        left.peer_metadata
+            .name
+            .cmp(&right.peer_metadata.name)
+            .then_with(|| left.session_uuid.cmp(&right.session_uuid))
     });
 }
 

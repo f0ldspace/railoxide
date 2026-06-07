@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::SignableTransaction;
+use alloy::dyn_abi::TypedData;
 use alloy::eips::Encodable2718;
 use alloy::network::{NetworkTransactionBuilder, TransactionBuilder as _};
 use alloy::primitives::{Address, FixedBytes, Signature, U256, keccak256};
@@ -16,6 +17,7 @@ use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, WrapErr, eyre};
 use railgun_ui::{chain_name, known_tokens_for_chain};
 use reqwest::Url;
+use serde_json::Value;
 use sync_service::ChainConfigDefaults;
 use zeroize::Zeroizing;
 
@@ -29,10 +31,10 @@ use crate::vault::{
     DesktopVaultStore, DesktopViewSession, HardwareProfileSession, PublicAccountMetadata,
 };
 use crate::{
-    GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, ShieldSendOutput, TxReceiptOutput,
-    WETH_DEPOSIT_SELECTOR, chain_defaults_for_chain, effective_rpc_urls_for_chain,
-    query_rpc_pool_with_http_client, report_chain_string, resolve_self_broadcast_gas_fee,
-    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
+    GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback,
+    ShieldSendOutput, TxReceiptOutput, WETH_DEPOSIT_SELECTOR, chain_defaults_for_chain,
+    effective_rpc_urls_for_chain, query_rpc_pool_with_http_client, report_chain_string,
+    resolve_self_broadcast_gas_fee, self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
     self_broadcast_replacement_bumped_fee, self_broadcast_send_raw_transaction_to_rpc_pool,
     tx_receipt_output,
 };
@@ -216,6 +218,45 @@ pub struct PublicShieldRequest {
     pub event_tx: Option<PublicActionSessionEventSender>,
 }
 
+pub struct WalletConnectPersonalSignRequest {
+    pub view_session: Arc<DesktopViewSession>,
+    pub vault_store: Arc<DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub trezor_app_passphrase: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    pub public_account_uuid: String,
+    pub message: Vec<u8>,
+    pub event_tx: Option<PublicActionSessionEventSender>,
+}
+
+pub struct WalletConnectTypedDataSignRequest {
+    pub view_session: Arc<DesktopViewSession>,
+    pub vault_store: Arc<DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub public_account_uuid: String,
+    pub typed_data: Value,
+}
+
+pub struct WalletConnectSendTransactionRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<EffectiveChainConfig>,
+    pub view_session: Arc<DesktopViewSession>,
+    pub vault_store: Arc<DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub trezor_app_passphrase: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    pub public_account_uuid: String,
+    pub tx_req: TransactionRequest,
+    pub gas_fee: PublicActionGasFeeSelection,
+    pub expiry_timestamp: Option<u64>,
+    pub event_tx: Option<PublicActionSessionEventSender>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletConnectSendTransactionResult {
+    pub tx_hash: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PublicActionProgressStep {
     ShieldKey,
@@ -255,6 +296,11 @@ pub enum PublicActionSessionEvent {
     },
     AttemptRejected {
         step: PublicActionProgressStep,
+        message: String,
+    },
+    HardwareApprovalStarted,
+    HardwareApprovalCompleted,
+    HardwareApprovalFailed {
         message: String,
     },
     HardwareProfileSessionRefreshed {
@@ -521,6 +567,120 @@ pub async fn submit_public_send(
     http: &HttpContext,
 ) -> Result<PublicSendResult> {
     submit_public_send_with_progress(request, http, |_| {}).await
+}
+
+pub async fn walletconnect_sign_personal_message(
+    request: WalletConnectPersonalSignRequest,
+) -> Result<String> {
+    let signer = vaulted_public_signer(
+        &request.vault_store,
+        &request.view_session,
+        Some(request.vault_password.as_str()),
+        &request.public_account_uuid,
+        request.trezor_app_passphrase,
+        request.trezor_pin_matrix_provider,
+    )?;
+    let event_tx = request.event_tx.as_ref();
+    let requires_device_approval = signer.requires_device_approval();
+    if requires_device_approval {
+        emit_public_action_event(event_tx, PublicActionSessionEvent::HardwareApprovalStarted);
+    }
+    let signature = match signer.sign_personal_message(&request.message).await {
+        Ok(signature) => {
+            emit_refreshed_public_action_hardware_session(event_tx, &signer);
+            if requires_device_approval {
+                emit_public_action_event(
+                    event_tx,
+                    PublicActionSessionEvent::HardwareApprovalCompleted,
+                );
+            }
+            signature
+        }
+        Err(error) => {
+            if requires_device_approval {
+                let message = report_chain_string(&error);
+                emit_public_action_event(
+                    event_tx,
+                    PublicActionSessionEvent::HardwareApprovalFailed { message },
+                );
+            }
+            return Err(error).wrap_err("WalletConnect personal_sign");
+        }
+    };
+    Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
+}
+
+pub async fn walletconnect_sign_typed_data_v4(
+    request: WalletConnectTypedDataSignRequest,
+) -> Result<String> {
+    let signer = vaulted_public_signer(
+        &request.vault_store,
+        &request.view_session,
+        Some(request.vault_password.as_str()),
+        &request.public_account_uuid,
+        None,
+        None,
+    )?;
+    let typed_data: TypedData =
+        serde_json::from_value(request.typed_data).wrap_err("WalletConnect typed-data payload")?;
+    let signature = signer
+        .sign_typed_data_v4(&typed_data)
+        .await
+        .wrap_err("WalletConnect eth_signTypedData_v4")?;
+    Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
+}
+
+pub async fn submit_walletconnect_send_transaction(
+    request: WalletConnectSendTransactionRequest,
+    http: &HttpContext,
+) -> Result<WalletConnectSendTransactionResult> {
+    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
+    let signer = vaulted_public_signer(
+        &request.vault_store,
+        &request.view_session,
+        Some(request.vault_password.as_str()),
+        &request.public_account_uuid,
+        request.trezor_app_passphrase,
+        request.trezor_pin_matrix_provider,
+    )?;
+    let from_address = signer.address();
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let preflight = public_action_preflight_from_rpc_pool_with_mode(
+        &query_rpc_pool,
+        http.network_mode(),
+        request.chain_id,
+        from_address,
+        request.tx_req,
+        request.gas_fee,
+        &chain.gas,
+        None,
+        None,
+        PublicActionPreflightMode::PreserveRequestFields,
+    )
+    .await
+    .wrap_err("WalletConnect eth_sendTransaction preflight")?;
+    emit_public_action_event(
+        request.event_tx.as_ref(),
+        PublicActionSessionEvent::AttemptHandoff {
+            step: PublicActionProgressStep::Send,
+        },
+    );
+    let attempt = submit_public_action_attempt(
+        PublicActionProgressStep::Send,
+        preflight,
+        &query_rpc_pool,
+        http.network_mode(),
+        &signer,
+        "WalletConnect eth_sendTransaction",
+        request.event_tx.as_ref(),
+        request.expiry_timestamp,
+    )
+    .await
+    .map_err(|error| eyre!(error.message()))?;
+
+    Ok(WalletConnectSendTransactionResult {
+        tx_hash: attempt.info.tx_hash,
+    })
 }
 
 pub async fn submit_public_send_with_progress(
@@ -797,6 +957,25 @@ struct PublicActionPreflight {
     live_native_balance: U256,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicActionPreflightMode {
+    Managed,
+    PreserveRequestFields,
+}
+
+impl PublicActionPreflightMode {
+    fn needs_fee_quote(self, tx_req: &TransactionRequest) -> bool {
+        match self {
+            Self::Managed => true,
+            Self::PreserveRequestFields => {
+                tx_req.gas_price.is_none()
+                    && (tx_req.max_fee_per_gas.is_none()
+                        || tx_req.max_priority_fee_per_gas.is_none())
+            }
+        }
+    }
+}
+
 struct SubmittedPublicActionAttempt {
     provider_handles: Vec<ProviderHandle>,
     tx_hash: FixedBytes<32>,
@@ -859,6 +1038,22 @@ impl VaultedPublicSigner {
         match self {
             Self::Software(signer) => Ok(Zeroizing::new(signer.derive_shield_private_key()?)),
             Self::Hardware(signer) => signer.derive_shield_private_key().await,
+        }
+    }
+
+    async fn sign_personal_message(&self, message: &[u8]) -> Result<Signature> {
+        match self {
+            Self::Software(signer) => signer.sign_personal_message(message),
+            Self::Hardware(signer) => signer.sign_message(message).await,
+        }
+    }
+
+    async fn sign_typed_data_v4(&self, typed_data: &TypedData) -> Result<Signature> {
+        match self {
+            Self::Software(signer) => signer.sign_typed_data_v4(typed_data),
+            Self::Hardware(_) => Err(eyre!(
+                "WalletConnect eth_signTypedData_v4 is unsupported for hardware Public accounts"
+            )),
         }
     }
 
@@ -1241,6 +1436,7 @@ async fn submit_public_action_step_session(
             signer,
             label,
             event_tx,
+            None,
         )
         .await
         {
@@ -1329,6 +1525,7 @@ async fn submit_public_action_step_session(
                             signer,
                             label,
                             event_tx,
+                            None,
                         )
                         .await
                         {
@@ -1424,6 +1621,7 @@ async fn submit_public_action_attempt(
     signer: &VaultedPublicSigner,
     label: &str,
     event_tx: Option<&PublicActionSessionEventSender>,
+    expiry_timestamp: Option<u64>,
 ) -> Result<SubmittedPublicActionAttempt, PublicActionAttemptError> {
     let sent = sign_send_public_action_transaction(
         query_rpc_pool,
@@ -1432,6 +1630,7 @@ async fn submit_public_action_attempt(
         preflight.tx_req,
         label,
         event_tx,
+        expiry_timestamp,
     )
     .await?;
     let info = PublicActionAttemptInfo {
@@ -1482,9 +1681,42 @@ async fn public_action_preflight_from_rpc_pool(
     nonce: Option<u64>,
     gas_limit: Option<u64>,
 ) -> Result<PublicActionPreflight> {
-    let quote = public_action_gas_fee_quote_from_rpc_pool(query_rpc_pool, network_mode, chain_id)
-        .await
-        .wrap_err("fetch public action gas price")?;
+    public_action_preflight_from_rpc_pool_with_mode(
+        query_rpc_pool,
+        network_mode,
+        chain_id,
+        from,
+        base_tx_req,
+        gas_fee,
+        gas,
+        nonce,
+        gas_limit,
+        PublicActionPreflightMode::Managed,
+    )
+    .await
+}
+
+async fn public_action_preflight_from_rpc_pool_with_mode(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    chain_id: u64,
+    from: Address,
+    base_tx_req: TransactionRequest,
+    gas_fee: PublicActionGasFeeSelection,
+    gas: &EffectiveChainGasSettings,
+    nonce: Option<u64>,
+    gas_limit: Option<u64>,
+    mode: PublicActionPreflightMode,
+) -> Result<PublicActionPreflight> {
+    let quote = if mode.needs_fee_quote(&base_tx_req) {
+        Some(
+            public_action_gas_fee_quote_from_rpc_pool(query_rpc_pool, network_mode, chain_id)
+                .await
+                .wrap_err("fetch public action gas price")?,
+        )
+    } else {
+        None
+    };
     let mut last_error = None;
     for _ in 0..query_rpc_pool.len() {
         let Some(provider_handle) = query_rpc_pool.random_provider() else {
@@ -1500,6 +1732,7 @@ async fn public_action_preflight_from_rpc_pool(
             gas,
             nonce,
             gas_limit,
+            mode,
         )
         .await
         {
@@ -1523,14 +1756,26 @@ async fn public_action_preflight(
     from: Address,
     base_tx_req: TransactionRequest,
     gas_fee: PublicActionGasFeeSelection,
-    quote: PublicActionGasFeeQuote,
+    quote: Option<PublicActionGasFeeQuote>,
     gas: &EffectiveChainGasSettings,
     nonce: Option<u64>,
     gas_limit: Option<u64>,
+    mode: PublicActionPreflightMode,
 ) -> Result<PublicActionPreflight> {
     let provider = &provider_handle.provider;
-    let resolved = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
-    let nonce = if let Some(nonce) = nonce {
+    let resolved = match quote {
+        Some(quote) => resolve_self_broadcast_gas_fee(gas_fee, quote)?,
+        None => walletconnect_resolved_gas_fee_from_request(&base_tx_req)?,
+    };
+    let requested_nonce = match mode {
+        PublicActionPreflightMode::Managed => nonce,
+        PublicActionPreflightMode::PreserveRequestFields => base_tx_req.nonce.or(nonce),
+    };
+    let requested_gas_limit = match mode {
+        PublicActionPreflightMode::Managed => gas_limit,
+        PublicActionPreflightMode::PreserveRequestFields => base_tx_req.gas.or(gas_limit),
+    };
+    let nonce = if let Some(nonce) = requested_nonce {
         nonce
     } else {
         provider
@@ -1538,15 +1783,38 @@ async fn public_action_preflight(
             .await
             .wrap_err("fetch public action nonce")?
     };
-    let tx_req = public_action_eip1559_transaction_request(
-        base_tx_req,
-        chain_id,
-        from,
-        resolved.max_fee_per_gas,
-        resolved.max_priority_fee_per_gas,
-        nonce,
-    );
-    let gas_limit = if let Some(gas_limit) = gas_limit {
+    let tx_req = match mode {
+        PublicActionPreflightMode::Managed => public_action_eip1559_transaction_request(
+            base_tx_req,
+            chain_id,
+            from,
+            resolved.max_fee_per_gas,
+            resolved.max_priority_fee_per_gas,
+            nonce,
+        ),
+        PublicActionPreflightMode::PreserveRequestFields => {
+            public_action_fill_walletconnect_transaction_request(
+                base_tx_req,
+                chain_id,
+                from,
+                resolved.max_fee_per_gas,
+                resolved.max_priority_fee_per_gas,
+                nonce,
+            )?
+        }
+    };
+    let max_fee_per_gas = tx_req
+        .max_fee_per_gas
+        .or(tx_req.gas_price)
+        .unwrap_or(resolved.max_fee_per_gas);
+    let max_priority_fee_per_gas = tx_req.max_priority_fee_per_gas.unwrap_or_else(|| {
+        if tx_req.gas_price.is_some() {
+            0
+        } else {
+            resolved.max_priority_fee_per_gas
+        }
+    });
+    let gas_limit = if let Some(gas_limit) = requested_gas_limit {
         gas_limit
     } else {
         provider
@@ -1555,11 +1823,8 @@ async fn public_action_preflight(
             .wrap_err("estimate public action gas")?
             .saturating_add(gas.gas_limit_buffer)
     };
-    let estimated_native_gas_cost = public_action_native_gas_cost(
-        tx_req.value.unwrap_or_default(),
-        gas_limit,
-        resolved.max_fee_per_gas,
-    );
+    let estimated_native_gas_cost =
+        public_action_native_gas_cost(tx_req.value.unwrap_or_default(), gas_limit, max_fee_per_gas);
     let live_native_balance = provider
         .get_balance(from)
         .await
@@ -1574,8 +1839,8 @@ async fn public_action_preflight(
         nonce,
         gas_limit,
         rpc_gas_price: resolved.rpc_gas_price,
-        max_fee_per_gas: resolved.max_fee_per_gas,
-        max_priority_fee_per_gas: resolved.max_priority_fee_per_gas,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
         estimated_native_gas_cost,
         live_native_balance,
     })
@@ -1597,6 +1862,74 @@ fn public_action_eip1559_transaction_request(
         .with_nonce(nonce)
 }
 
+fn public_action_fill_walletconnect_transaction_request(
+    mut tx_req: TransactionRequest,
+    chain_id: u64,
+    from: Address,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    nonce: u64,
+) -> Result<TransactionRequest> {
+    tx_req = tx_req
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_nonce(nonce);
+    if tx_req.gas_price.is_some() {
+        return Ok(tx_req);
+    }
+    if tx_req.max_fee_per_gas.is_none() {
+        tx_req = tx_req.with_max_fee_per_gas(max_fee_per_gas);
+    }
+    if tx_req.max_priority_fee_per_gas.is_none() {
+        tx_req = tx_req.with_max_priority_fee_per_gas(max_priority_fee_per_gas);
+    }
+    if let (Some(max_fee), Some(priority_fee)) =
+        (tx_req.max_fee_per_gas, tx_req.max_priority_fee_per_gas)
+        && priority_fee > max_fee
+    {
+        return Err(eyre!(
+            "WalletConnect max priority fee per gas cannot exceed max fee per gas"
+        ));
+    }
+    Ok(tx_req)
+}
+
+fn walletconnect_resolved_gas_fee_from_request(
+    tx_req: &TransactionRequest,
+) -> Result<SelfBroadcastResolvedGasFee> {
+    if let Some(gas_price) = tx_req.gas_price {
+        if gas_price == 0 {
+            return Err(eyre!("WalletConnect gasPrice must be greater than zero"));
+        }
+        return Ok(SelfBroadcastResolvedGasFee {
+            rpc_gas_price: gas_price,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: tx_req.max_priority_fee_per_gas.unwrap_or(0),
+        });
+    }
+    let max_fee_per_gas = tx_req
+        .max_fee_per_gas
+        .ok_or_else(|| eyre!("WalletConnect maxFeePerGas is required"))?;
+    let max_priority_fee_per_gas = tx_req
+        .max_priority_fee_per_gas
+        .ok_or_else(|| eyre!("WalletConnect maxPriorityFeePerGas is required"))?;
+    if max_fee_per_gas == 0 {
+        return Err(eyre!(
+            "WalletConnect maxFeePerGas must be greater than zero"
+        ));
+    }
+    if max_priority_fee_per_gas > max_fee_per_gas {
+        return Err(eyre!(
+            "WalletConnect max priority fee per gas cannot exceed max fee per gas"
+        ));
+    }
+    Ok(SelfBroadcastResolvedGasFee {
+        rpc_gas_price: max_fee_per_gas,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    })
+}
+
 fn public_action_native_gas_cost(value: U256, gas_limit: u64, max_fee_per_gas: u128) -> U256 {
     value + (U256::from(gas_limit) * U256::from(max_fee_per_gas))
 }
@@ -1608,6 +1941,7 @@ async fn sign_send_public_action_transaction(
     tx_req: TransactionRequest,
     label: &str,
     event_tx: Option<&PublicActionSessionEventSender>,
+    expiry_timestamp: Option<u64>,
 ) -> Result<PublicActionSentTx, PublicActionAttemptError> {
     tracing::info!(
         from = %tx_req.from.unwrap_or_default(),
@@ -1623,6 +1957,8 @@ async fn sign_send_public_action_transaction(
     emit_refreshed_public_action_hardware_session(event_tx, signer);
     // Stop/abort requested during synchronous hardware approval is observed here before RPC broadcast.
     public_action_before_raw_broadcast_checkpoint().await;
+    ensure_public_action_broadcast_not_expired(expiry_timestamp, label)
+        .map_err(PublicActionAttemptError::Sending)?;
     let tx_hash = keccak256(&signed_tx);
     let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
         query_rpc_pool,
@@ -1640,6 +1976,27 @@ async fn sign_send_public_action_transaction(
         tx_hash_string,
         provider_handles,
     })
+}
+
+fn ensure_public_action_broadcast_not_expired(
+    expiry_timestamp: Option<u64>,
+    label: &str,
+) -> Result<()> {
+    let Some(expiry_timestamp) = expiry_timestamp else {
+        return Ok(());
+    };
+    if public_action_current_unix_seconds() >= expiry_timestamp {
+        return Err(eyre!(
+            "{label}: request expired before transaction broadcast"
+        ));
+    }
+    Ok(())
+}
+
+fn public_action_current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 async fn public_action_before_raw_broadcast_checkpoint() {
@@ -1864,6 +2221,9 @@ fn public_chain_runtime_config(
             effective_chain.chain_id
         ));
     }
+    if !effective_chain.enabled {
+        return Err(eyre!("chain {chain_id} is disabled in wallet settings"));
+    }
     let rpc_urls = effective_rpc_urls_for_chain(&defaults, Some(effective_chain))?;
     let railgun_contract =
         parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
@@ -2026,6 +2386,30 @@ mod tests {
         });
     }
 
+    #[test]
+    fn walletconnect_send_rejects_expired_request_before_raw_broadcast() {
+        assert!(ensure_public_action_broadcast_not_expired(None, "walletconnect").is_ok());
+        assert!(
+            ensure_public_action_broadcast_not_expired(
+                Some(public_action_current_unix_seconds() + 60),
+                "walletconnect",
+            )
+            .is_ok()
+        );
+
+        let error = ensure_public_action_broadcast_not_expired(
+            Some(public_action_current_unix_seconds()),
+            "walletconnect",
+        )
+        .expect_err("expired request");
+
+        assert!(
+            error
+                .to_string()
+                .contains("request expired before transaction broadcast")
+        );
+    }
+
     fn test_kdf() -> KdfParams {
         KdfParams::new(1024, 1, 1)
     }
@@ -2114,6 +2498,118 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call.asset.id, PublicAssetId::Erc20(_)))
         );
+    }
+
+    #[test]
+    fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
+        let (root_dir, db, store, view_session) = public_action_request_parts();
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                TEST_IMPORTED_PRIVATE_KEY,
+                Some("WalletConnect signer"),
+                false,
+            )
+            .expect("import public account");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let denied = runtime.block_on(walletconnect_sign_personal_message(
+            WalletConnectPersonalSignRequest {
+                view_session: Arc::clone(&view_session),
+                vault_store: Arc::clone(&store),
+                vault_password: Zeroizing::new("wrong password".to_owned()),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                message: b"hello".to_vec(),
+                event_tx: None,
+            },
+        ));
+        assert!(denied.is_err());
+
+        let signature = runtime
+            .block_on(walletconnect_sign_personal_message(
+                WalletConnectPersonalSignRequest {
+                    view_session: Arc::clone(&view_session),
+                    vault_store: Arc::clone(&store),
+                    vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                    trezor_app_passphrase: None,
+                    trezor_pin_matrix_provider: None,
+                    public_account_uuid: account.public_account_uuid,
+                    message: b"hello".to_vec(),
+                    event_tx: None,
+                },
+            ))
+            .expect("personal sign");
+
+        assert!(signature.starts_with("0x"));
+        assert_eq!(signature.len(), 132);
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn walletconnect_typed_data_signs_for_software_public_account() {
+        let (root_dir, db, store, view_session) = public_action_request_parts();
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                TEST_IMPORTED_PRIVATE_KEY,
+                Some("WalletConnect typed data"),
+                false,
+            )
+            .expect("import public account");
+        let typed_data = serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "version", "type": "string" },
+                    { "name": "chainId", "type": "uint256" }
+                ],
+                "Message": [
+                    { "name": "contents", "type": "string" }
+                ]
+            },
+            "primaryType": "Message",
+            "domain": {
+                "name": "RailOxide",
+                "version": "1",
+                "chainId": 1
+            },
+            "message": {
+                "contents": "hello"
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let signature = runtime
+            .block_on(walletconnect_sign_typed_data_v4(
+                WalletConnectTypedDataSignRequest {
+                    view_session: Arc::clone(&view_session),
+                    vault_store: Arc::clone(&store),
+                    vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                    public_account_uuid: account.public_account_uuid,
+                    typed_data,
+                },
+            ))
+            .expect("typed-data sign");
+
+        assert!(signature.starts_with("0x"));
+        assert_eq!(signature.len(), 132);
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     #[test]
@@ -2307,6 +2803,44 @@ mod tests {
     }
 
     #[test]
+    fn walletconnect_effective_public_chain_config_rejects_disabled_chain() {
+        let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
+        let effective = EffectiveChainConfig {
+            chain_id: 1,
+            enabled: false,
+            rpc_endpoints: vec!["https://rpc.example".to_string()],
+            archive_rpc_url: None,
+            quick_sync_enabled: true,
+            quick_sync_endpoint: defaults.quick_sync_endpoint.map(|url| url.to_string()),
+            indexed_wallet_block_range: defaults.indexed_wallet_block_range,
+            deployment_block: defaults.deployment_block,
+            v2_start_block: defaults.v2_start_block,
+            legacy_shield_block: defaults.legacy_shield_block,
+            archive_until_block: defaults.archive_until_block,
+            railgun_contract: defaults.contract.to_string(),
+            relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
+            relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
+            wrapped_native_token: None,
+            multicall_contract: defaults.multicall_contract.to_string(),
+            finality_depth: defaults.finality_depth,
+            block_range: None,
+            poll_interval_secs: None,
+            gas: EffectiveChainGasSettings {
+                gas_limit_buffer: 42,
+                gas_price_buffer_numerator: 111,
+                gas_price_buffer_denominator: 100,
+            },
+        };
+
+        let error = match public_chain_runtime_config(1, Some(&effective)) {
+            Ok(_) => panic!("disabled chain was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("disabled"));
+    }
+
+    #[test]
     fn effective_public_chain_config_uses_default_rpc_fallbacks() {
         let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
         let config = public_chain_runtime_config(1, None).expect("default config");
@@ -2362,6 +2896,45 @@ mod tests {
         assert_eq!(tx.max_fee_per_gas, Some(42));
         assert_eq!(tx.max_priority_fee_per_gas, Some(3));
         assert_eq!(tx.nonce, Some(9));
+    }
+
+    #[test]
+    fn walletconnect_transaction_fill_preserves_supplied_fee_and_nonce_fields() {
+        let from = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let legacy = TransactionRequest {
+            from: Some(from),
+            to: Some(recipient.into()),
+            gas_price: Some(9),
+            gas: Some(21_000),
+            nonce: Some(4),
+            ..Default::default()
+        };
+
+        let legacy =
+            public_action_fill_walletconnect_transaction_request(legacy, 1, from, 42, 3, 4)
+                .expect("fill legacy request");
+
+        assert_eq!(legacy.gas_price, Some(9));
+        assert_eq!(legacy.max_fee_per_gas, None);
+        assert_eq!(legacy.max_priority_fee_per_gas, None);
+        assert_eq!(legacy.gas, Some(21_000));
+        assert_eq!(legacy.nonce, Some(4));
+
+        let eip1559 = TransactionRequest {
+            from: Some(from),
+            to: Some(recipient.into()),
+            max_fee_per_gas: Some(42),
+            nonce: Some(5),
+            ..Default::default()
+        };
+        let eip1559 =
+            public_action_fill_walletconnect_transaction_request(eip1559, 1, from, 99, 3, 5)
+                .expect("fill eip1559 request");
+
+        assert_eq!(eip1559.max_fee_per_gas, Some(42));
+        assert_eq!(eip1559.max_priority_fee_per_gas, Some(3));
+        assert_eq!(eip1559.nonce, Some(5));
     }
 
     #[test]

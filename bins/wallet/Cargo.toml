@@ -24,6 +24,7 @@ qrcodegen = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rust-embed = "8.11"
+serde_json = { workspace = true }
 structopt = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = { workspace = true }

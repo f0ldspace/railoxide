@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use alloy::primitives::U256;
 use gpui::{Context, Window};
 use railgun_ui::{
     chain_icon_asset_path, chain_name, format_token_amount, format_usd_micro_value, short_address,
@@ -112,6 +113,41 @@ pub(super) fn public_balance_usd_label(
         PublicAssetId::Erc20(token) => cache.cached_token_usd_micro_value(chain_id, token, *amount),
     }?;
     Some(format_usd_micro_value(usd_micro_value))
+}
+
+pub(super) fn public_account_usd_total_label_for_chain(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+    status: PublicAccountStatus,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+) -> Option<String> {
+    let cache = anchor_cache?;
+    let snapshot = snapshot.filter(|snapshot| snapshot.chain_id == chain_id)?;
+    let account = snapshot.accounts.iter().find(|account| {
+        account.account.public_account_uuid.as_str() == public_account_uuid
+            && account.account.status == status
+    })?;
+
+    let mut total = U256::ZERO;
+    let mut has_priced_balance = false;
+    for entry in &account.balances {
+        let PublicBalanceAmount::Available(amount) = entry.amount else {
+            continue;
+        };
+        let usd_micro_value = match entry.asset.id {
+            PublicAssetId::Native => cache.cached_native_usd_micro_value(chain_id, amount),
+            PublicAssetId::Erc20(token) => {
+                cache.cached_token_usd_micro_value(chain_id, token, amount)
+            }
+        };
+        if let Some(usd_micro_value) = usd_micro_value {
+            total = total.saturating_add(usd_micro_value);
+            has_priced_balance = true;
+        }
+    }
+
+    has_priced_balance.then(|| format_usd_micro_value(total))
 }
 
 pub(super) fn public_balance_entry_for_chain(

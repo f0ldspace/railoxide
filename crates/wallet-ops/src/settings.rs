@@ -26,6 +26,7 @@ mod poi_broadcaster;
 mod storage;
 mod tokens_gas_waku;
 mod validation;
+mod walletconnect;
 
 use validation::{
     parse_fixed_hex_32, validate_address, validate_enr_tree, validate_optional_address,
@@ -39,6 +40,7 @@ pub use network_chains::*;
 pub use poi_broadcaster::*;
 pub use storage::*;
 pub use tokens_gas_waku::*;
+pub use walletconnect::*;
 
 #[cfg(test)]
 mod tests;
