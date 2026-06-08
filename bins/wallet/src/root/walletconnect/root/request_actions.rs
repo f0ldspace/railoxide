@@ -15,17 +15,16 @@ impl WalletRoot {
             .walletconnect
             .request_actions
             .contains(request.key.as_str());
-        let approve_label = if in_flight {
-            if hardware_request {
-                "Waiting for device..."
-            } else {
-                "Approving..."
-            }
-        } else if hardware_request {
-            "Approve on device"
-        } else {
-            "Approve"
-        };
+        let hardware_typed_data_hash_fallback =
+            walletconnect_request_uses_hardware_typed_data_hash_fallback(
+                request,
+                self.walletconnect_request_hardware_typed_data_mode(request),
+            );
+        let approve_label = walletconnect_request_approve_label(
+            in_flight,
+            hardware_request,
+            hardware_typed_data_hash_fallback,
+        );
         let mut card = div()
             .w_full()
             .flex()
@@ -61,6 +60,13 @@ impl WalletRoot {
             ));
         }
         card = card.child(walletconnect_raw_details(&request.item.raw_details));
+        if hardware_typed_data_hash_fallback {
+            card = card.child(walletconnect_notice(
+                "This hardware session will use the device's EIP-712 hash-signing fallback. RailOxide computed the typed-data hashes from the validated request and will verify the signature before responding, but the device may show hashes instead of structured fields. Continue only if you accept this reduced device visibility.",
+                theme::WARNING,
+                theme::WARNING_BG,
+            ));
+        }
         if matches!(request.account_source, PublicAccountSource::HardwareDerived) {
             card = card.child(walletconnect_notice(
                 hardware_walletconnect_notice(request.item.method),
@@ -123,6 +129,17 @@ impl WalletRoot {
                         });
                     }),
                 ),
+        )
+    }
+
+    fn walletconnect_request_hardware_typed_data_mode(
+        &self,
+        request: &WalletConnectRequestUi,
+    ) -> HardwareTypedDataSigningMode {
+        walletconnect_hardware_typed_data_mode_for_request(
+            request,
+            &self.public_accounts,
+            self.view_session.as_deref(),
         )
     }
 
@@ -263,6 +280,10 @@ impl WalletRoot {
         let trezor_pin_matrix_provider = None;
         let http = self.http.clone();
         let hardware_request = request.account_source == PublicAccountSource::HardwareDerived;
+        let hash_fallback_confirmed = walletconnect_request_uses_hardware_typed_data_hash_fallback(
+            &request,
+            self.walletconnect_request_hardware_typed_data_mode(&request),
+        );
         let progress_generation = hardware_request.then(|| {
             self.walletconnect
                 .start_request_approval_progress(request_key, &request)
@@ -301,6 +322,7 @@ impl WalletRoot {
                 effective_chain,
                 context,
                 http,
+                hash_fallback_confirmed,
                 approval_event_tx,
             )
             .await
@@ -319,6 +341,18 @@ impl WalletRoot {
                             tx_submitted = outcome.submitted_tx_hash.is_some(),
                             "walletconnect request approval handled"
                         );
+                        if outcome.hash_fallback_confirmation_required {
+                            #[cfg(feature = "hardware")]
+                            if let Some(session) = outcome.refreshed_hardware_session {
+                                root.refresh_active_hardware_profile_session(session, cx);
+                            }
+                            root.walletconnect.request_approval_progress.remove(&request_key);
+                            root.walletconnect.status = Some(Arc::from(
+                                "Review the EIP-712 hash fallback warning, then continue if you still want to approve on device.",
+                            ));
+                            cx.notify();
+                            return;
+                        }
                         let completed_request = root.walletconnect.remove_pending_request(&request_key);
                         let show_completion = completed_request.is_some();
                         if let Some(request) = completed_request {
@@ -559,9 +593,23 @@ impl WalletRoot {
                 });
             }
         };
-        let validation = validate_walletconnect_session_request(
+        let selected_account_support = match &resolution {
+            WalletConnectSessionAccountResolution::Usable(account) => {
+                walletconnect_namespace_account_support(account, Some(view_session))
+            }
+            WalletConnectSessionAccountResolution::TemporarilyPausedWrongPrivateWallet {
+                ..
+            }
+            | WalletConnectSessionAccountResolution::InvalidPublicAccount => {
+                WalletConnectNamespaceAccountSupport::for_account_source(
+                    PublicAccountSource::Derived,
+                )
+            }
+        };
+        let validation = validate_walletconnect_session_request_with_account_support(
             &session,
             &resolution,
+            selected_account_support,
             &request.item.topic,
             request.item.id,
             &request.item.chain_id,

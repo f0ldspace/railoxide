@@ -1133,9 +1133,12 @@ pub(super) fn process_walletconnect_session_request_message(
         }
     };
     let account_source = selected_account.source;
-    let validation = validate_walletconnect_session_request(
+    let selected_account_support =
+        walletconnect_namespace_account_support(&selected_account, Some(view_session));
+    let validation = validate_walletconnect_session_request_with_account_support(
         session,
         &resolution,
+        selected_account_support,
         &message.topic,
         request_id,
         chain_id,

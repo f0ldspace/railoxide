@@ -235,7 +235,7 @@ fn emit_refreshed_self_broadcast_hardware_session(
     event_tx: Option<&SelfBroadcastSessionEventSender>,
     signer: &VaultedPublicSigner,
 ) {
-    match signer.refreshed_trezor_hardware_session() {
+    match signer.refreshed_hardware_session() {
         Ok(Some(session)) => emit_self_broadcast_event(
             event_tx,
             SelfBroadcastSessionEvent::HardwareProfileSessionRefreshed { session },

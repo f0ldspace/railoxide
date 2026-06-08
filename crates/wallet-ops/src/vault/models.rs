@@ -8,6 +8,8 @@ use super::{
 use serde::{Deserializer, Serializer, de};
 use sha2::Digest;
 
+use crate::hardware::HardwareTypedDataSigningMode;
+
 #[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub struct WalletViewBundle {
@@ -193,12 +195,54 @@ impl HardwareProfileBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareTypedDataSessionCapability {
+    pub mode: HardwareTypedDataSigningMode,
+    device_kind: HardwareDeviceKind,
+    profile_id: Option<String>,
+    binding: HardwareProfileBinding,
+    public_account_path: Vec<u32>,
+    trezor_session_id: Option<Vec<u8>>,
+}
+
+impl HardwareTypedDataSessionCapability {
+    #[must_use]
+    fn new(
+        session: &HardwareProfileSession,
+        descriptor: &HardwarePublicAccountDescriptor,
+        mode: HardwareTypedDataSigningMode,
+    ) -> Self {
+        Self {
+            mode,
+            device_kind: session.device_kind,
+            profile_id: session.profile_id.clone(),
+            binding: session.binding.clone(),
+            public_account_path: descriptor.path.clone(),
+            trezor_session_id: session.trezor_session_id.clone(),
+        }
+    }
+
+    #[must_use]
+    fn matches(
+        &self,
+        session: &HardwareProfileSession,
+        descriptor: &HardwarePublicAccountDescriptor,
+    ) -> bool {
+        self.device_kind == session.device_kind
+            && self.profile_id == session.profile_id
+            && self.binding == session.binding
+            && self.public_account_path == descriptor.path
+            && self.trezor_session_id == session.trezor_session_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfileSession {
     pub device_kind: HardwareDeviceKind,
     pub profile_id: Option<String>,
     pub binding: HardwareProfileBinding,
     pub trezor_session_id: Option<Vec<u8>>,
     pub trezor_passphrase_mode: Option<TrezorPassphraseMode>,
+    pub typed_data_capability: Option<HardwareTypedDataSessionCapability>,
 }
 
 impl HardwareProfileSession {
@@ -214,6 +258,7 @@ impl HardwareProfileSession {
             binding,
             trezor_session_id,
             trezor_passphrase_mode: None,
+            typed_data_capability: None,
         }
     }
 
@@ -230,11 +275,13 @@ impl HardwareProfileSession {
             binding,
             trezor_session_id,
             trezor_passphrase_mode: None,
+            typed_data_capability: None,
         }
     }
 
-    pub const fn set_trezor_passphrase_mode(&mut self, mode: TrezorPassphraseMode) {
+    pub fn set_trezor_passphrase_mode(&mut self, mode: TrezorPassphraseMode) {
         self.trezor_passphrase_mode = Some(mode);
+        self.clear_typed_data_signing_mode();
     }
 
     #[must_use]
@@ -310,8 +357,71 @@ impl HardwareProfileSession {
         self.verify_descriptor(&account.descriptor)
     }
 
+    #[must_use]
+    pub fn typed_data_signing_mode(
+        &self,
+        descriptor: &HardwarePublicAccountDescriptor,
+    ) -> Option<HardwareTypedDataSigningMode> {
+        self.typed_data_capability
+            .as_ref()
+            .filter(|capability| capability.matches(self, descriptor))
+            .map(|capability| capability.mode)
+    }
+
+    pub fn cache_typed_data_signing_mode(
+        &mut self,
+        descriptor: &HardwarePublicAccountDescriptor,
+        mode: HardwareTypedDataSigningMode,
+    ) -> Result<(), VaultError> {
+        descriptor
+            .validate()
+            .map_err(|_| VaultError::InvalidHardwareWalletDescriptor)?;
+        if descriptor.device_kind != self.device_kind {
+            return Err(VaultError::HardwareWalletIdentityMismatch);
+        }
+        self.typed_data_capability = Some(HardwareTypedDataSessionCapability::new(
+            self, descriptor, mode,
+        ));
+        Ok(())
+    }
+
+    pub fn clear_typed_data_signing_mode(&mut self) {
+        self.typed_data_capability = None;
+    }
+
+    pub fn replace_trezor_session_id_preserving_typed_data_signing_mode(
+        &mut self,
+        descriptor: &HardwarePublicAccountDescriptor,
+        session_id: Option<Vec<u8>>,
+    ) -> Result<(), VaultError> {
+        let mode = self.typed_data_signing_mode(descriptor);
+        self.trezor_session_id = session_id;
+        if let Some(mode) = mode {
+            self.cache_typed_data_signing_mode(descriptor, mode)?;
+        } else {
+            self.clear_typed_data_signing_mode();
+        }
+        Ok(())
+    }
+
+    pub fn downgrade_typed_data_signing_mode_to_hash_fallback(
+        &mut self,
+        descriptor: &HardwarePublicAccountDescriptor,
+    ) -> Result<bool, VaultError> {
+        if self.typed_data_signing_mode(descriptor) != Some(HardwareTypedDataSigningMode::ClearSign)
+        {
+            return Ok(false);
+        }
+        self.cache_typed_data_signing_mode(
+            descriptor,
+            HardwareTypedDataSigningMode::Eip712HashFallback,
+        )?;
+        Ok(true)
+    }
+
     pub fn discard_trezor_session(&mut self) {
         self.trezor_session_id = None;
+        self.clear_typed_data_signing_mode();
     }
 }
 

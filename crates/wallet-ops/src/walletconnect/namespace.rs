@@ -4,6 +4,7 @@ use std::str::FromStr;
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
+use crate::hardware::HardwareTypedDataSigningMode;
 use crate::vault::{PublicAccountSource, WalletConnectApprovedNamespace};
 
 use super::eip155::{
@@ -26,6 +27,42 @@ pub struct WalletConnectUnsupportedNamespaceItem {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletConnectNamespaceAccountSupport {
+    pub account_source: PublicAccountSource,
+    pub hardware_typed_data_signing_mode: HardwareTypedDataSigningMode,
+    pub hardware_typed_data_capability_known: bool,
+}
+
+impl WalletConnectNamespaceAccountSupport {
+    #[must_use]
+    pub const fn for_account_source(account_source: PublicAccountSource) -> Self {
+        Self {
+            account_source,
+            hardware_typed_data_signing_mode: HardwareTypedDataSigningMode::Unsupported,
+            hardware_typed_data_capability_known: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn hardware(hardware_typed_data_signing_mode: HardwareTypedDataSigningMode) -> Self {
+        Self {
+            account_source: PublicAccountSource::HardwareDerived,
+            hardware_typed_data_signing_mode,
+            hardware_typed_data_capability_known: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn hardware_typed_data_capability_unknown() -> Self {
+        Self {
+            account_source: PublicAccountSource::HardwareDerived,
+            hardware_typed_data_signing_mode: HardwareTypedDataSigningMode::Unsupported,
+            hardware_typed_data_capability_known: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletConnectNamespaceNegotiation {
     pub approved_namespaces: BTreeMap<String, WalletConnectApprovedNamespace>,
@@ -38,6 +75,22 @@ pub fn negotiate_walletconnect_namespaces(
     supported_chain_ids: &BTreeSet<u64>,
     selected_account: Address,
     selected_account_source: PublicAccountSource,
+) -> Result<WalletConnectNamespaceNegotiation> {
+    negotiate_walletconnect_namespaces_with_account_support(
+        required,
+        optional,
+        supported_chain_ids,
+        selected_account,
+        WalletConnectNamespaceAccountSupport::for_account_source(selected_account_source),
+    )
+}
+
+pub fn negotiate_walletconnect_namespaces_with_account_support(
+    required: &BTreeMap<String, WalletConnectNamespaceProposal>,
+    optional: &BTreeMap<String, WalletConnectNamespaceProposal>,
+    supported_chain_ids: &BTreeSet<u64>,
+    selected_account: Address,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
 ) -> Result<WalletConnectNamespaceNegotiation> {
     let mut unsupported_required = Vec::new();
     let mut approved_namespaces = BTreeMap::new();
@@ -57,7 +110,7 @@ pub fn negotiate_walletconnect_namespaces(
             namespace,
             supported_chain_ids,
             selected_account,
-            selected_account_source,
+            selected_account_support,
             true,
         ) {
             NamespaceNegotiation::Approved { approved, .. } => {
@@ -91,7 +144,7 @@ pub fn negotiate_walletconnect_namespaces(
             namespace,
             supported_chain_ids,
             selected_account,
-            selected_account_source,
+            selected_account_support,
             false,
         ) {
             NamespaceNegotiation::Approved {
@@ -126,7 +179,7 @@ fn negotiate_namespace(
     namespace: &WalletConnectNamespaceProposal,
     supported_chain_ids: &BTreeSet<u64>,
     selected_account: Address,
-    selected_account_source: PublicAccountSource,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
     required: bool,
 ) -> NamespaceNegotiation {
     let Some(requested_chains) = requested_eip155_chains(key, &namespace.chains) else {
@@ -156,15 +209,15 @@ fn negotiate_namespace(
     for method in &namespace.methods {
         match WalletConnectSupportedMethod::from_str(method) {
             Ok(method_kind)
-                if !walletconnect_method_supported_for_account_source(
+                if !walletconnect_method_supported_for_account_support(
                     method_kind,
-                    selected_account_source,
+                    selected_account_support,
                 ) =>
             {
                 unsupported.push(WalletConnectUnsupportedNamespaceItem {
                     namespace: key.to_owned(),
                     item: method.clone(),
-                    reason: "unsupported method for hardware Public account".to_owned(),
+                    reason: unsupported_method_reason(method_kind, selected_account_support),
                 });
             }
             Ok(_) => approved_methods.push(method.clone()),
@@ -208,7 +261,11 @@ fn negotiate_namespace(
                 unsupported
             })
         } else {
-            NamespaceNegotiation::Excluded
+            if unsupported.is_empty() {
+                NamespaceNegotiation::Excluded
+            } else {
+                NamespaceNegotiation::Unsupported(unsupported)
+            }
         };
     }
 
@@ -257,13 +314,17 @@ fn default_eip155_namespace(
     })
 }
 
-pub(crate) const fn walletconnect_method_supported_for_account_source(
+pub(crate) const fn walletconnect_method_supported_for_account_support(
     method: WalletConnectSupportedMethod,
-    selected_account_source: PublicAccountSource,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
 ) -> bool {
+    let selected_account_source = selected_account_support.account_source;
     match selected_account_source {
         PublicAccountSource::HardwareDerived => {
-            walletconnect_method_supported_for_hardware_account(method)
+            walletconnect_method_supported_for_hardware_account(
+                method,
+                selected_account_support.hardware_typed_data_signing_mode,
+            )
         }
         PublicAccountSource::Derived | PublicAccountSource::Imported => true,
     }
@@ -271,9 +332,10 @@ pub(crate) const fn walletconnect_method_supported_for_account_source(
 
 const fn walletconnect_method_supported_for_hardware_account(
     method: WalletConnectSupportedMethod,
+    typed_data_signing_mode: HardwareTypedDataSigningMode,
 ) -> bool {
     match method {
-        WalletConnectSupportedMethod::EthSignTypedDataV4 => false,
+        WalletConnectSupportedMethod::EthSignTypedDataV4 => typed_data_signing_mode.is_supported(),
         #[cfg(not(feature = "hardware"))]
         WalletConnectSupportedMethod::PersonalSign
         | WalletConnectSupportedMethod::EthSendTransaction => false,
@@ -284,6 +346,21 @@ const fn walletconnect_method_supported_for_hardware_account(
         WalletConnectSupportedMethod::PersonalSign
         | WalletConnectSupportedMethod::EthSendTransaction => true,
     }
+}
+
+fn unsupported_method_reason(
+    method: WalletConnectSupportedMethod,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
+) -> String {
+    if selected_account_support.account_source == PublicAccountSource::HardwareDerived
+        && method == WalletConnectSupportedMethod::EthSignTypedDataV4
+        && !selected_account_support
+            .hardware_typed_data_signing_mode
+            .is_supported()
+    {
+        return "hardware Public account session does not support typed-data signing".to_owned();
+    }
+    "unsupported method for hardware Public account".to_owned()
 }
 
 fn merge_optional_approved_namespace(

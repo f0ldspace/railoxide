@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::SignableTransaction;
-use alloy::dyn_abi::TypedData;
 use alloy::eips::Encodable2718;
 use alloy::network::{NetworkTransactionBuilder, TransactionBuilder as _};
 use alloy::primitives::{Address, FixedBytes, Signature, U256, keccak256};
@@ -22,9 +22,10 @@ use sync_service::ChainConfigDefaults;
 use zeroize::Zeroizing;
 
 use crate::amounts::wrapped_native_token_for_chain;
-use crate::hardware::HardwarePublicAccountDescriptor;
 #[cfg(feature = "hardware")]
 use crate::hardware::{DEFAULT_HARDWARE_DERIVATION_PATH, parse_bip32_path};
+use crate::hardware::{HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode};
+use crate::hardware_typed_data::HardwareEip712Model;
 use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings, EffectiveTokenRegistry};
 use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 use crate::vault::{
@@ -233,8 +234,78 @@ pub struct WalletConnectTypedDataSignRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub trezor_app_passphrase: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub typed_data: Value,
+    pub hash_fallback_confirmed: bool,
+    pub event_tx: Option<PublicActionSessionEventSender>,
+}
+
+pub struct WalletConnectHardwareTypedDataHashFallbackConfirmationRequired {
+    refreshed_hardware_session: Option<HardwareProfileSession>,
+}
+
+impl WalletConnectHardwareTypedDataHashFallbackConfirmationRequired {
+    #[must_use]
+    pub const fn new(refreshed_hardware_session: Option<HardwareProfileSession>) -> Self {
+        Self {
+            refreshed_hardware_session,
+        }
+    }
+
+    #[must_use]
+    pub fn refreshed_hardware_session(&self) -> Option<HardwareProfileSession> {
+        self.refreshed_hardware_session.clone()
+    }
+}
+
+impl fmt::Debug for WalletConnectHardwareTypedDataHashFallbackConfirmationRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WalletConnectHardwareTypedDataHashFallbackConfirmationRequired")
+    }
+}
+
+impl fmt::Display for WalletConnectHardwareTypedDataHashFallbackConfirmationRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "WalletConnect hardware typed-data hash fallback requires confirmation before device approval",
+        )
+    }
+}
+
+impl std::error::Error for WalletConnectHardwareTypedDataHashFallbackConfirmationRequired {}
+
+#[must_use]
+pub fn walletconnect_hardware_typed_data_hash_fallback_confirmation_session(
+    error: &eyre::Report,
+) -> Option<HardwareProfileSession> {
+    error
+        .downcast_ref::<WalletConnectHardwareTypedDataHashFallbackConfirmationRequired>()
+        .and_then(WalletConnectHardwareTypedDataHashFallbackConfirmationRequired::refreshed_hardware_session)
+}
+
+#[must_use]
+pub fn is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required(
+    error: &eyre::Report,
+) -> bool {
+    error
+        .downcast_ref::<WalletConnectHardwareTypedDataHashFallbackConfirmationRequired>()
+        .is_some()
+}
+
+pub struct WalletConnectHardwareTypedDataCapabilityRequest {
+    pub view_session: Arc<DesktopViewSession>,
+    pub vault_store: Arc<DesktopVaultStore>,
+    pub trezor_app_passphrase: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    pub public_account_uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletConnectHardwareTypedDataCapabilityResult {
+    pub mode: HardwareTypedDataSigningMode,
+    pub refreshed_hardware_session: Option<HardwareProfileSession>,
 }
 
 pub struct WalletConnectSendTransactionRequest {
@@ -618,16 +689,93 @@ pub async fn walletconnect_sign_typed_data_v4(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
-        None,
-        None,
+        request.trezor_app_passphrase,
+        request.trezor_pin_matrix_provider,
     )?;
-    let typed_data: TypedData =
-        serde_json::from_value(request.typed_data).wrap_err("WalletConnect typed-data payload")?;
-    let signature = signer
-        .sign_typed_data_v4(&typed_data)
+    let typed_data = HardwareEip712Model::from_walletconnect_typed_data_json(request.typed_data)
+        .wrap_err("WalletConnect typed-data payload")?;
+    let event_tx = request.event_tx.as_ref();
+    let requires_device_approval = signer.requires_device_approval();
+    let hardware_typed_data_mode = signer.typed_data_signing_mode().await?;
+    if let Some(mode) = hardware_typed_data_mode {
+        if !mode.is_supported() {
+            return Err(eyre!(
+                "WalletConnect eth_signTypedData_v4 is unsupported for this hardware Public account session"
+            ));
+        }
+        if mode.requires_hash_fallback_warning() && !request.hash_fallback_confirmed {
+            return Err(
+                WalletConnectHardwareTypedDataHashFallbackConfirmationRequired::new(
+                    signer.refreshed_hardware_session()?,
+                ),
+            )
+            .wrap_err("WalletConnect eth_signTypedData_v4");
+        }
+    }
+    if requires_device_approval {
+        emit_public_action_event(event_tx, PublicActionSessionEvent::HardwareApprovalStarted);
+    }
+    let signature = match signer
+        .sign_typed_data_v4(
+            &typed_data,
+            hardware_typed_data_mode,
+            request.hash_fallback_confirmed,
+        )
         .await
-        .wrap_err("WalletConnect eth_signTypedData_v4")?;
+    {
+        Ok(signature) => {
+            emit_refreshed_public_action_hardware_session(event_tx, &signer);
+            if requires_device_approval {
+                emit_public_action_event(
+                    event_tx,
+                    PublicActionSessionEvent::HardwareApprovalCompleted,
+                );
+            }
+            signature
+        }
+        Err(error) => {
+            let confirmation_required =
+                is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required(&error);
+            if confirmation_required {
+                emit_refreshed_public_action_hardware_session(event_tx, &signer);
+            } else if requires_device_approval {
+                let message = report_chain_string(&error);
+                emit_public_action_event(
+                    event_tx,
+                    PublicActionSessionEvent::HardwareApprovalFailed { message },
+                );
+            }
+            return Err(error).wrap_err("WalletConnect eth_signTypedData_v4");
+        }
+    };
     Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
+}
+
+pub async fn walletconnect_probe_hardware_typed_data_signing_mode(
+    request: WalletConnectHardwareTypedDataCapabilityRequest,
+) -> Result<WalletConnectHardwareTypedDataCapabilityResult> {
+    let signer = vaulted_public_signer(
+        &request.vault_store,
+        &request.view_session,
+        None,
+        &request.public_account_uuid,
+        request.trezor_app_passphrase,
+        request.trezor_pin_matrix_provider,
+    )?;
+    let VaultedPublicSigner::Hardware(signer) = &signer else {
+        return Ok(WalletConnectHardwareTypedDataCapabilityResult {
+            mode: HardwareTypedDataSigningMode::Unsupported,
+            refreshed_hardware_session: None,
+        });
+    };
+    let mode = signer
+        .typed_data_signing_mode()
+        .await
+        .wrap_err("probe hardware typed-data capability")?;
+    Ok(WalletConnectHardwareTypedDataCapabilityResult {
+        mode,
+        refreshed_hardware_session: Some(signer.hardware_session()?),
+    })
 }
 
 pub async fn submit_walletconnect_send_transaction(
@@ -1048,21 +1196,37 @@ impl VaultedPublicSigner {
         }
     }
 
-    async fn sign_typed_data_v4(&self, typed_data: &TypedData) -> Result<Signature> {
+    async fn typed_data_signing_mode(&self) -> Result<Option<HardwareTypedDataSigningMode>> {
         match self {
-            Self::Software(signer) => signer.sign_typed_data_v4(typed_data),
-            Self::Hardware(_) => Err(eyre!(
-                "WalletConnect eth_signTypedData_v4 is unsupported for hardware Public accounts"
-            )),
+            Self::Software(_) => Ok(None),
+            Self::Hardware(signer) => signer.typed_data_signing_mode().await.map(Some),
         }
     }
 
-    pub(crate) fn refreshed_trezor_hardware_session(
+    async fn sign_typed_data_v4(
         &self,
-    ) -> Result<Option<HardwareProfileSession>> {
+        typed_data: &HardwareEip712Model,
+        hardware_typed_data_mode: Option<HardwareTypedDataSigningMode>,
+        hash_fallback_confirmed: bool,
+    ) -> Result<Signature> {
+        match self {
+            Self::Software(signer) => signer.sign_typed_data_v4(typed_data.typed_data()),
+            Self::Hardware(signer) => {
+                signer
+                    .sign_typed_data_v4(
+                        typed_data,
+                        hardware_typed_data_mode,
+                        hash_fallback_confirmed,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub(crate) fn refreshed_hardware_session(&self) -> Result<Option<HardwareProfileSession>> {
         match self {
             Self::Software(_) => Ok(None),
-            Self::Hardware(signer) => signer.refreshed_trezor_hardware_session(),
+            Self::Hardware(signer) => signer.hardware_session().map(Some),
         }
     }
 }
@@ -1145,6 +1309,84 @@ impl HardwarePublicEvmSigner {
         Ok(signature)
     }
 
+    async fn sign_typed_data_v4(
+        &self,
+        typed_data: &HardwareEip712Model,
+        hardware_typed_data_mode: Option<HardwareTypedDataSigningMode>,
+        hash_fallback_confirmed: bool,
+    ) -> Result<Signature> {
+        let mut mode = match hardware_typed_data_mode {
+            Some(mode) => mode,
+            None => self.typed_data_signing_mode().await?,
+        };
+        loop {
+            if !mode.is_supported() {
+                return Err(eyre!(
+                    "WalletConnect eth_signTypedData_v4 is unsupported for this hardware Public account session"
+                ));
+            }
+            if mode.requires_hash_fallback_warning() && !hash_fallback_confirmed {
+                return Err(
+                    WalletConnectHardwareTypedDataHashFallbackConfirmationRequired::new(Some(
+                        self.hardware_session()?,
+                    ))
+                    .into(),
+                );
+            }
+            let hardware_session = self.hardware_session()?;
+            let outcome = sign_hardware_public_typed_data(
+                &self.descriptor,
+                &hardware_session,
+                self.take_trezor_app_passphrase(),
+                self.trezor_pin_matrix_provider.clone(),
+                self.address,
+                typed_data,
+                mode,
+            )
+            .await?;
+            let HardwareTypedDataSignOutcome::Signed {
+                signature,
+                trezor_session_id,
+            } = outcome
+            else {
+                self.downgrade_typed_data_signing_mode_to_hash_fallback()?;
+                mode = HardwareTypedDataSigningMode::Eip712HashFallback;
+                continue;
+            };
+            self.replace_trezor_session_id_if_trezor(trezor_session_id)?;
+            verify_hardware_typed_data_signature_address(self.address, &signature, typed_data)?;
+            return Ok(signature);
+        }
+    }
+
+    async fn typed_data_signing_mode(&self) -> Result<HardwareTypedDataSigningMode> {
+        if let Some(mode) = self
+            .hardware_session()?
+            .typed_data_signing_mode(&self.descriptor)
+        {
+            return Ok(mode);
+        }
+        let hardware_session = self.hardware_session()?;
+        let (mode, trezor_session_id) = probe_hardware_public_typed_data_signing_mode(
+            &self.descriptor,
+            &hardware_session,
+            self.take_trezor_app_passphrase(),
+            self.trezor_pin_matrix_provider.clone(),
+            self.address,
+        )
+        .await?;
+
+        let mut session = self
+            .hardware_session
+            .lock()
+            .map_err(|_| eyre!("hardware public signer session lock poisoned"))?;
+        if self.descriptor.device_kind == crate::hardware::HardwareDeviceKind::Trezor {
+            session.trezor_session_id = trezor_session_id;
+        }
+        session.cache_typed_data_signing_mode(&self.descriptor, mode)?;
+        Ok(mode)
+    }
+
     fn hardware_session(&self) -> Result<HardwareProfileSession> {
         let session = self
             .hardware_session
@@ -1161,15 +1403,20 @@ impl HardwarePublicEvmSigner {
             .hardware_session
             .lock()
             .map_err(|_| eyre!("hardware public signer session lock poisoned"))?;
-        session.trezor_session_id = session_id;
+        session.replace_trezor_session_id_preserving_typed_data_signing_mode(
+            &self.descriptor,
+            session_id,
+        )?;
         Ok(())
     }
 
-    fn refreshed_trezor_hardware_session(&self) -> Result<Option<HardwareProfileSession>> {
-        if self.descriptor.device_kind != crate::hardware::HardwareDeviceKind::Trezor {
-            return Ok(None);
-        }
-        self.hardware_session().map(Some)
+    fn downgrade_typed_data_signing_mode_to_hash_fallback(&self) -> Result<()> {
+        let mut session = self
+            .hardware_session
+            .lock()
+            .map_err(|_| eyre!("hardware public signer session lock poisoned"))?;
+        session.downgrade_typed_data_signing_mode_to_hash_fallback(&self.descriptor)?;
+        Ok(())
     }
 
     fn take_trezor_app_passphrase(&self) -> Option<Zeroizing<String>> {
@@ -1178,6 +1425,233 @@ impl HardwarePublicEvmSigner {
             .ok()
             .and_then(|mut passphrase| passphrase.take())
     }
+}
+
+fn verify_hardware_typed_data_signature_address(
+    expected_address: Address,
+    signature: &Signature,
+    typed_data: &HardwareEip712Model,
+) -> Result<()> {
+    let signing_hash = typed_data.signing_hash();
+    let recovered = signature
+        .recover_address_from_prehash(&signing_hash)
+        .wrap_err("recover hardware typed-data signature")?;
+    if recovered != expected_address {
+        return Err(eyre!(
+            "hardware public signer address mismatch: expected {}, got {}",
+            expected_address,
+            recovered
+        ));
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+enum HardwareTypedDataSignOutcome {
+    Signed {
+        signature: Signature,
+        trezor_session_id: Option<Vec<u8>>,
+    },
+    DowngradedToHashFallback,
+}
+
+#[cfg(feature = "hardware")]
+async fn sign_hardware_public_typed_data(
+    descriptor: &HardwarePublicAccountDescriptor,
+    hardware_session: &HardwareProfileSession,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    expected_address: Address,
+    typed_data: &HardwareEip712Model,
+    mode: HardwareTypedDataSigningMode,
+) -> Result<HardwareTypedDataSignOutcome> {
+    match descriptor.device_kind {
+        crate::hardware::HardwareDeviceKind::Ledger => {
+            let client = crate::hardware::ledger::LedgerHardwareDerivationClient::connect()
+                .await
+                .wrap_err("connect Ledger for public typed-data signing")?;
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .await
+                .wrap_err("verify Ledger hardware profile")?;
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .await
+                .wrap_err("verify Ledger public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            let signature = match mode {
+                HardwareTypedDataSigningMode::ClearSign => match client
+                    .sign_typed_data_clear_or_downgrade(descriptor, typed_data)
+                    .await
+                {
+                    Ok(crate::hardware::ledger::LedgerEip712ClearSigningOutcome::Signed(
+                        signature,
+                    )) => signature,
+                    Ok(crate::hardware::ledger::LedgerEip712ClearSigningOutcome::Downgrade(
+                        HardwareTypedDataSigningMode::Eip712HashFallback,
+                    )) => return Ok(HardwareTypedDataSignOutcome::DowngradedToHashFallback),
+                    Ok(crate::hardware::ledger::LedgerEip712ClearSigningOutcome::Downgrade(
+                        HardwareTypedDataSigningMode::ClearSign
+                        | HardwareTypedDataSigningMode::Unsupported,
+                    )) => {
+                        return Err(eyre!(
+                            "WalletConnect eth_signTypedData_v4 cannot downgrade Ledger clear signing to a safe fallback"
+                        ));
+                    }
+                    Err(error) => return Err(error).wrap_err("sign public typed data on Ledger"),
+                },
+                HardwareTypedDataSigningMode::Eip712HashFallback => client
+                    .sign_typed_data_hash(descriptor, typed_data)
+                    .await
+                    .wrap_err("sign public typed-data hashes on Ledger")?,
+                HardwareTypedDataSigningMode::Unsupported => {
+                    return Err(eyre!(
+                        "WalletConnect eth_signTypedData_v4 is unsupported for this Ledger session"
+                    ));
+                }
+            };
+            Ok(HardwareTypedDataSignOutcome::Signed {
+                signature,
+                trezor_session_id: None,
+            })
+        }
+        crate::hardware::HardwareDeviceKind::Trezor => {
+            let mut client =
+                crate::hardware::trezor::TrezorHardwareDerivationClient::connect_with_session(
+                    hardware_session.trezor_session_id.clone(),
+                )
+                .wrap_err("connect Trezor for public typed-data signing")?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .wrap_err("verify Trezor hardware profile")?;
+            let trezor_session_id = active.trezor_session_id.clone();
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .wrap_err("verify Trezor public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            let signature = match mode {
+                HardwareTypedDataSigningMode::ClearSign => client
+                    .sign_typed_data_clear(descriptor, typed_data)
+                    .wrap_err("sign public typed data on Trezor")?,
+                HardwareTypedDataSigningMode::Eip712HashFallback => client
+                    .sign_typed_data_hash(descriptor, typed_data)
+                    .wrap_err("sign public typed-data hashes on Trezor")?,
+                HardwareTypedDataSigningMode::Unsupported => {
+                    return Err(eyre!(
+                        "WalletConnect eth_signTypedData_v4 is unsupported for this Trezor session"
+                    ));
+                }
+            };
+            Ok(HardwareTypedDataSignOutcome::Signed {
+                signature,
+                trezor_session_id,
+            })
+        }
+    }
+}
+
+#[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
+async fn sign_hardware_public_typed_data(
+    _descriptor: &HardwarePublicAccountDescriptor,
+    _hardware_session: &HardwareProfileSession,
+    _trezor_app_passphrase: Option<Zeroizing<String>>,
+    _trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    _expected_address: Address,
+    _typed_data: &HardwareEip712Model,
+    _mode: HardwareTypedDataSigningMode,
+) -> Result<HardwareTypedDataSignOutcome> {
+    Err(eyre!(
+        "hardware public signing is not enabled in this build"
+    ))
+}
+
+#[cfg(feature = "hardware")]
+async fn probe_hardware_public_typed_data_signing_mode(
+    descriptor: &HardwarePublicAccountDescriptor,
+    hardware_session: &HardwareProfileSession,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    expected_address: Address,
+) -> Result<(HardwareTypedDataSigningMode, Option<Vec<u8>>)> {
+    match descriptor.device_kind {
+        crate::hardware::HardwareDeviceKind::Ledger => {
+            let client = crate::hardware::ledger::LedgerHardwareDerivationClient::connect()
+                .await
+                .wrap_err("connect Ledger for typed-data capability probe")?;
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .await
+                .wrap_err("verify Ledger hardware profile")?;
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .await
+                .wrap_err("verify Ledger public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            let mode = client
+                .typed_data_signing_mode()
+                .await
+                .wrap_err("probe Ledger typed-data capability")?;
+            Ok((mode, None))
+        }
+        crate::hardware::HardwareDeviceKind::Trezor => {
+            let mut client =
+                crate::hardware::trezor::TrezorHardwareDerivationClient::connect_with_session(
+                    hardware_session.trezor_session_id.clone(),
+                )
+                .wrap_err("connect Trezor for typed-data capability probe")?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .wrap_err("verify Trezor hardware profile")?;
+            let trezor_session_id = active.trezor_session_id.clone();
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .wrap_err("verify Trezor public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            let mode = client
+                .typed_data_signing_mode()
+                .wrap_err("probe Trezor typed-data capability")?;
+            Ok((mode, trezor_session_id))
+        }
+    }
+}
+
+#[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
+async fn probe_hardware_public_typed_data_signing_mode(
+    _descriptor: &HardwarePublicAccountDescriptor,
+    _hardware_session: &HardwareProfileSession,
+    _trezor_app_passphrase: Option<Zeroizing<String>>,
+    _trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
+    _expected_address: Address,
+) -> Result<(HardwareTypedDataSigningMode, Option<Vec<u8>>)> {
+    Ok((HardwareTypedDataSigningMode::Unsupported, None))
 }
 
 #[cfg(feature = "hardware")]
@@ -2074,7 +2548,7 @@ fn emit_refreshed_public_action_hardware_session(
     event_tx: Option<&PublicActionSessionEventSender>,
     signer: &VaultedPublicSigner,
 ) {
-    match signer.refreshed_trezor_hardware_session() {
+    match signer.refreshed_hardware_session() {
         Ok(Some(session)) => emit_public_action_event(
             event_tx,
             PublicActionSessionEvent::HardwareProfileSessionRefreshed { session },
@@ -2598,8 +3072,12 @@ mod tests {
                     view_session: Arc::clone(&view_session),
                     vault_store: Arc::clone(&store),
                     vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                    trezor_app_passphrase: None,
+                    trezor_pin_matrix_provider: None,
                     public_account_uuid: account.public_account_uuid,
                     typed_data,
+                    hash_fallback_confirmed: false,
+                    event_tx: None,
                 },
             ))
             .expect("typed-data sign");
@@ -2610,6 +3088,229 @@ mod tests {
         drop(store);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_public_account()
+    {
+        let (root_dir, db, store, view_session) = public_action_request_parts();
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                TEST_IMPORTED_PRIVATE_KEY,
+                Some("WalletConnect custom typed data"),
+                false,
+            )
+            .expect("import public account");
+        let typed_data = serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "chainId", "type": "uint256" }
+                ],
+                "bytesPayload": [
+                    { "name": "digest", "type": "bytes32" }
+                ],
+                "Message": [
+                    { "name": "payload", "type": "bytesPayload" }
+                ]
+            },
+            "primaryType": "Message",
+            "domain": {
+                "name": "RailOxide",
+                "chainId": 1
+            },
+            "message": {
+                "payload": {
+                    "digest": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let signature = runtime
+            .block_on(walletconnect_sign_typed_data_v4(
+                WalletConnectTypedDataSignRequest {
+                    view_session: Arc::clone(&view_session),
+                    vault_store: Arc::clone(&store),
+                    vault_password: Zeroizing::new(TEST_PASSWORD.to_owned()),
+                    trezor_app_passphrase: None,
+                    trezor_pin_matrix_provider: None,
+                    public_account_uuid: account.public_account_uuid,
+                    typed_data,
+                    hash_fallback_confirmed: false,
+                    event_tx: None,
+                },
+            ))
+            .expect("typed-data sign");
+
+        assert!(signature.starts_with("0x"));
+        assert_eq!(signature.len(), 132);
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn hardware_typed_data_hash_fallback_confirmation_error_survives_context() {
+        let session = HardwareProfileSession::matched(
+            HardwareDeviceKind::Ledger,
+            "profile-a",
+            HardwareProfileBinding::evm_address_fingerprint("fingerprint-a"),
+            None,
+        );
+        let error = eyre::Report::from(
+            WalletConnectHardwareTypedDataHashFallbackConfirmationRequired::new(Some(
+                session.clone(),
+            )),
+        )
+        .wrap_err("WalletConnect eth_signTypedData_v4");
+
+        assert!(is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required(&error));
+        assert_eq!(
+            walletconnect_hardware_typed_data_hash_fallback_confirmation_session(&error),
+            Some(session)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                error
+                    .downcast_ref::<WalletConnectHardwareTypedDataHashFallbackConfirmationRequired>(
+                    )
+                    .expect("confirmation error")
+            ),
+            "WalletConnectHardwareTypedDataHashFallbackConfirmationRequired"
+        );
+    }
+
+    fn hardware_typed_data_signer_with_mode(
+        mode: HardwareTypedDataSigningMode,
+    ) -> HardwarePublicEvmSigner {
+        let descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+            HardwareDeviceKind::Ledger,
+            0,
+            0,
+        )
+        .expect("ledger descriptor");
+        let mut hardware_session = HardwareProfileSession::unmatched(
+            HardwareDeviceKind::Ledger,
+            HardwareProfileBinding::evm_address_fingerprint(
+                "ledger:evm:0x1111111111111111111111111111111111111111",
+            ),
+            None,
+        );
+        hardware_session
+            .cache_typed_data_signing_mode(&descriptor, mode)
+            .expect("cache typed-data mode");
+        HardwarePublicEvmSigner {
+            address: address!("0x1111111111111111111111111111111111111111"),
+            descriptor,
+            hardware_session: std::sync::Mutex::new(hardware_session),
+            trezor_app_passphrase: std::sync::Mutex::new(None),
+            trezor_pin_matrix_provider: None,
+        }
+    }
+
+    fn hardware_typed_data_model_for_tests() -> HardwareEip712Model {
+        HardwareEip712Model::from_walletconnect_typed_data_json(serde_json::json!({
+            "types": {
+                "EIP712Domain": [
+                    { "name": "name", "type": "string" },
+                    { "name": "chainId", "type": "uint256" }
+                ],
+                "Message": [
+                    { "name": "contents", "type": "string" }
+                ]
+            },
+            "primaryType": "Message",
+            "domain": {
+                "name": "RailOxide",
+                "chainId": 1
+            },
+            "message": {
+                "contents": "hello"
+            }
+        }))
+        .expect("typed-data model")
+    }
+
+    #[test]
+    fn hardware_public_signer_requires_hash_fallback_confirmation_before_signing() {
+        let signer =
+            hardware_typed_data_signer_with_mode(HardwareTypedDataSigningMode::Eip712HashFallback);
+        let model = hardware_typed_data_model_for_tests();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let error = runtime
+            .block_on(signer.sign_typed_data_v4(
+                &model,
+                Some(HardwareTypedDataSigningMode::Eip712HashFallback),
+                false,
+            ))
+            .expect_err("fallback confirmation required");
+
+        assert!(is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required(&error));
+        assert_eq!(
+            walletconnect_hardware_typed_data_hash_fallback_confirmation_session(&error)
+                .and_then(|session| session.typed_data_signing_mode(&signer.descriptor)),
+            Some(HardwareTypedDataSigningMode::Eip712HashFallback)
+        );
+    }
+
+    #[cfg(not(feature = "hardware"))]
+    #[test]
+    fn hardware_public_signer_rejects_confirmed_hash_fallback_without_hardware_feature() {
+        let signer =
+            hardware_typed_data_signer_with_mode(HardwareTypedDataSigningMode::Eip712HashFallback);
+        let model = hardware_typed_data_model_for_tests();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let error = runtime
+            .block_on(signer.sign_typed_data_v4(
+                &model,
+                Some(HardwareTypedDataSigningMode::Eip712HashFallback),
+                true,
+            ))
+            .expect_err("default build cannot sign fallback");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hardware public signing is not enabled in this build")
+        );
+    }
+
+    #[test]
+    fn hardware_typed_data_signature_recovery_mismatch_rejects() {
+        let model = hardware_typed_data_model_for_tests();
+        let signer = SoftwareEvmSigner::from_private_key([7u8; 32]).expect("software signer");
+        let signature = signer
+            .sign_typed_data_v4(model.typed_data())
+            .expect("typed-data signature");
+
+        let error = verify_hardware_typed_data_signature_address(
+            address!("0x1111111111111111111111111111111111111111"),
+            &signature,
+            &model,
+        )
+        .expect_err("recovery mismatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hardware public signer address mismatch")
+        );
     }
 
     #[test]
@@ -3162,6 +3863,15 @@ mod tests {
                 Some("Hardware Ledger Gas"),
             )
             .expect("hardware public account under hardware view");
+        let hardware_secret_key = format!(
+            "public-account-secret|{}",
+            hardware_public.public_account_uuid
+        );
+        assert!(
+            db.get_desktop_wallet_vault_record(&hardware_secret_key)
+                .expect("load hardware public secret record")
+                .is_none()
+        );
         let hardware_signer = vaulted_public_signer(
             &store,
             &hardware_view_session,
@@ -3232,7 +3942,7 @@ mod tests {
     }
 
     #[test]
-    fn hardware_public_signer_updates_in_memory_trezor_session_id() {
+    fn hardware_public_signer_updates_in_memory_trezor_session_id_preserving_typed_data_mode() {
         let mut hardware_session = HardwareProfileSession::unmatched(
             HardwareDeviceKind::Trezor,
             HardwareProfileBinding::evm_address_fingerprint(
@@ -3241,14 +3951,18 @@ mod tests {
             Some(vec![1, 2, 3]),
         );
         hardware_session.set_trezor_passphrase_mode(TrezorPassphraseMode::EnterInApp);
+        let descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+            HardwareDeviceKind::Trezor,
+            0,
+            0,
+        )
+        .expect("trezor descriptor");
+        hardware_session
+            .cache_typed_data_signing_mode(&descriptor, HardwareTypedDataSigningMode::ClearSign)
+            .expect("cache typed-data mode");
         let signer = HardwarePublicEvmSigner {
             address: address!("0x1111111111111111111111111111111111111111"),
-            descriptor: HardwarePublicAccountDescriptor::for_wallet_public_index(
-                HardwareDeviceKind::Trezor,
-                0,
-                0,
-            )
-            .expect("trezor descriptor"),
+            descriptor,
             hardware_session: std::sync::Mutex::new(hardware_session),
             trezor_app_passphrase: std::sync::Mutex::new(None),
             trezor_pin_matrix_provider: None,
@@ -3264,6 +3978,13 @@ mod tests {
                 .trezor_session_id,
             Some(vec![4, 5, 6])
         );
+        assert_eq!(
+            signer
+                .hardware_session()
+                .expect("hardware session")
+                .typed_data_signing_mode(&signer.descriptor),
+            Some(HardwareTypedDataSigningMode::ClearSign)
+        );
         signer
             .replace_trezor_session_id_if_trezor(None)
             .expect("clear Trezor session id");
@@ -3273,6 +3994,54 @@ mod tests {
                 .expect("hardware session")
                 .trezor_session_id,
             None
+        );
+        assert_eq!(
+            signer
+                .hardware_session()
+                .expect("hardware session")
+                .typed_data_signing_mode(&signer.descriptor),
+            Some(HardwareTypedDataSigningMode::ClearSign)
+        );
+    }
+
+    #[cfg(not(feature = "hardware"))]
+    #[test]
+    fn hardware_typed_data_probe_is_unsupported_without_hardware_feature() {
+        let hardware_session = HardwareProfileSession::unmatched(
+            HardwareDeviceKind::Ledger,
+            HardwareProfileBinding::evm_address_fingerprint(
+                "ledger:evm:0x1111111111111111111111111111111111111111",
+            ),
+            None,
+        );
+        let signer = HardwarePublicEvmSigner {
+            address: address!("0x1111111111111111111111111111111111111111"),
+            descriptor: HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Ledger,
+                0,
+                0,
+            )
+            .expect("ledger descriptor"),
+            hardware_session: std::sync::Mutex::new(hardware_session),
+            trezor_app_passphrase: std::sync::Mutex::new(None),
+            trezor_pin_matrix_provider: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let mode = runtime
+            .block_on(signer.typed_data_signing_mode())
+            .expect("default-build typed-data mode");
+
+        assert_eq!(mode, HardwareTypedDataSigningMode::Unsupported);
+        assert_eq!(
+            signer
+                .hardware_session()
+                .expect("hardware session")
+                .typed_data_signing_mode(&signer.descriptor),
+            Some(HardwareTypedDataSigningMode::Unsupported)
         );
     }
 }

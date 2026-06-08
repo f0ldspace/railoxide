@@ -289,6 +289,25 @@ impl ConfirmedHardwarePublicAccount {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareTypedDataSigningMode {
+    ClearSign,
+    Eip712HashFallback,
+    Unsupported,
+}
+
+impl HardwareTypedDataSigningMode {
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::ClearSign | Self::Eip712HashFallback)
+    }
+
+    #[must_use]
+    pub const fn requires_hash_fallback_warning(self) -> bool {
+        matches!(self, Self::Eip712HashFallback)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HardwareDerivationDescriptor {
     pub device_kind: HardwareDeviceKind,
@@ -724,11 +743,16 @@ pub mod ledger {
         ConfirmedHardwarePublicAccount, HardwareAppVersion, HardwareDerivationClient,
         HardwareDerivationDescriptor, HardwareDerivationError, HardwareDerivationMethod,
         HardwareDeviceKind, HardwareOperationOutput, HardwarePublicAccountDescriptor,
-        hardware_profile_fingerprint,
+        HardwareTypedDataSigningMode, hardware_profile_fingerprint,
+    };
+    use crate::hardware_typed_data::{
+        HardwareEip712ArrayElement, HardwareEip712FieldDefinition, HardwareEip712FieldValue,
+        HardwareEip712Model, HardwareEip712PrimitiveType, HardwareEip712StructValue,
+        HardwareEip712Type, HardwareEip712Value,
     };
     use crate::vault::{HardwareProfileBinding, HardwareProfileSession};
     use alloy::hex;
-    use alloy::primitives::{Address, Signature, normalize_v};
+    use alloy::primitives::{Address, Signature, U256, normalize_v};
     use async_trait::async_trait;
     use coins_ledger::{
         LedgerError,
@@ -740,6 +764,10 @@ pub mod ledger {
 
     pub const LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION: HardwareAppVersion =
         HardwareAppVersion::new(1, 9, 17);
+    pub const LEDGER_ETHEREUM_EIP712_HASH_FALLBACK_MIN_APP_VERSION: HardwareAppVersion =
+        HardwareAppVersion::new(1, 5, 0);
+    pub const LEDGER_ETHEREUM_EIP712_CLEAR_MIN_APP_VERSION: HardwareAppVersion =
+        HardwareAppVersion::new(1, 10, 0);
 
     const LEDGER_READY_MESSAGE: &str =
         "Connect and unlock your Ledger, open the Ethereum app, then retry.";
@@ -757,6 +785,62 @@ pub mod ledger {
         0x4d, 0x86, 0xa2, 0x98, 0xe5, 0x96, 0xe5, 0x82, 0x93, 0xee, 0x6a, 0x8d, 0xbb, 0x07, 0x61,
         0x0f, 0x51,
     ];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LedgerDeviceModel {
+        NanoS,
+        NanoX,
+        NanoSPlus,
+        Stax,
+        Flex,
+        Unknown,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LedgerDeviceInfo {
+        pub model: LedgerDeviceModel,
+        pub ethereum_app_version: HardwareAppVersion,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct LedgerEip712Apdu {
+        pub ins: u8,
+        pub p1: u8,
+        pub p2: u8,
+        pub data: Vec<u8>,
+    }
+
+    pub(crate) enum LedgerEip712ClearSigningOutcome {
+        Signed(Signature),
+        Downgrade(HardwareTypedDataSigningMode),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) enum LedgerEip712ClearFailureKind {
+        CapabilityUnsupportedBeforeConfirmation,
+        PayloadUnsupported,
+        UserRejected,
+        Other,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LedgerEip712ArrayLevel {
+        Dynamic,
+        Fixed(usize),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum LedgerEip712BaseType {
+        Custom(String),
+        Int(usize),
+        Uint(usize),
+        Address,
+        Bool,
+        String,
+        FixedBytes(usize),
+        Bytes,
+    }
 
     pub struct LedgerHardwareDerivationClient;
 
@@ -793,6 +877,22 @@ pub mod ledger {
                 u16::from(data[2]),
                 u16::from(data[3]),
             ))
+        }
+
+        pub async fn device_info(&self) -> Result<LedgerDeviceInfo, HardwareDerivationError> {
+            let model = ledger_connected_device_model()?;
+            let ethereum_app_version = self.ethereum_app_version().await?;
+            Ok(LedgerDeviceInfo {
+                model,
+                ethereum_app_version,
+            })
+        }
+
+        pub async fn typed_data_signing_mode(
+            &self,
+        ) -> Result<HardwareTypedDataSigningMode, HardwareDerivationError> {
+            let info = self.device_info().await?;
+            Ok(classify_ledger_typed_data_signing_mode(&info))
         }
 
         pub async fn ethereum_address(
@@ -908,6 +1008,117 @@ pub mod ledger {
             self.sign_payload(0x08, &payload).await
         }
 
+        #[allow(dead_code)]
+        pub(crate) async fn sign_typed_data_clear(
+            &self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<Signature, HardwareDerivationError> {
+            let apdus = ledger_eip712_clear_signing_apdus(descriptor, typed_data)?;
+            self.exchange_eip712_signing_apdus(&apdus, "sign EIP-712 typed data")
+                .await
+        }
+
+        #[allow(dead_code)]
+        pub(crate) async fn sign_typed_data_clear_or_downgrade(
+            &self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<LedgerEip712ClearSigningOutcome, HardwareDerivationError> {
+            let info = self.device_info().await?;
+            let apdus = ledger_eip712_clear_signing_apdus(descriptor, typed_data)?;
+            self.exchange_eip712_clear_signing_apdus(&apdus, "sign EIP-712 typed data", &info)
+                .await
+        }
+
+        #[allow(dead_code)]
+        pub(crate) async fn sign_typed_data_hash(
+            &self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<Signature, HardwareDerivationError> {
+            let apdu = ledger_eip712_hash_signing_apdu(descriptor, typed_data)?;
+            self.exchange_eip712_signing_apdus(&[apdu], "sign EIP-712 typed-data hashes")
+                .await
+        }
+
+        #[allow(dead_code)]
+        async fn exchange_eip712_signing_apdus(
+            &self,
+            apdus: &[LedgerEip712Apdu],
+            operation: &'static str,
+        ) -> Result<Signature, HardwareDerivationError> {
+            let mut signature_response = None;
+            for apdu in apdus {
+                let command = APDUCommand {
+                    cla: 0xe0,
+                    ins: apdu.ins,
+                    p1: apdu.p1,
+                    p2: apdu.p2,
+                    data: APDUData::new(&apdu.data),
+                    response_len: None,
+                };
+                let answer = ledger_exchange(&command)
+                    .await
+                    .map_err(|error| ledger_exchange_error(error, operation))?;
+                ledger_ensure_success(&answer, operation)?;
+                if apdu.ins == 0x0c {
+                    signature_response = Some(answer);
+                }
+            }
+            let answer =
+                signature_response.ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Ledger EIP-712 signing sequence did not include a signature command",
+                ))?;
+            let data = ledger_response_data(&answer, operation)?;
+            ledger_signature_from_response(data, operation)
+        }
+
+        async fn exchange_eip712_clear_signing_apdus(
+            &self,
+            apdus: &[LedgerEip712Apdu],
+            operation: &'static str,
+            info: &LedgerDeviceInfo,
+        ) -> Result<LedgerEip712ClearSigningOutcome, HardwareDerivationError> {
+            let mut signature_response = None;
+            let mut device_confirmation_started = false;
+            for apdu in apdus {
+                let command = APDUCommand {
+                    cla: 0xe0,
+                    ins: apdu.ins,
+                    p1: apdu.p1,
+                    p2: apdu.p2,
+                    data: APDUData::new(&apdu.data),
+                    response_len: None,
+                };
+                let answer = ledger_exchange(&command)
+                    .await
+                    .map_err(|error| ledger_exchange_error(error, operation))?;
+                if let Err(error) = ledger_ensure_success(&answer, operation) {
+                    if let Some(mode) = ledger_eip712_clear_failure_downgrade_mode(
+                        &error,
+                        apdu,
+                        device_confirmation_started,
+                        info,
+                    ) {
+                        return Ok(LedgerEip712ClearSigningOutcome::Downgrade(mode));
+                    }
+                    return Err(error);
+                }
+                if ledger_eip712_sign_apdu(apdu) {
+                    device_confirmation_started = true;
+                    signature_response = Some(answer);
+                }
+            }
+            let answer =
+                signature_response.ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Ledger EIP-712 signing sequence did not include a signature command",
+                ))?;
+            let data = ledger_response_data(&answer, operation)?;
+            ledger_signature_from_response(data, operation)
+                .map(LedgerEip712ClearSigningOutcome::Signed)
+        }
+
         async fn sign_payload(
             &self,
             ins: u8,
@@ -940,18 +1151,7 @@ pub mod ledger {
                 "Ledger signing payload is empty",
             ))?;
             let data = ledger_response_data(&answer, operation)?;
-            if data.len() != 65 {
-                return Err(HardwareDerivationError::UnexpectedResponseLength {
-                    got: data.len(),
-                    expected: 65,
-                });
-            }
-            let parity = normalize_v(u64::from(data[0])).ok_or(
-                HardwareDerivationError::UnexpectedHardwareResponse(
-                    "Ledger signature has invalid recovery id",
-                ),
-            )?;
-            Ok(Signature::from_bytes_and_parity(&data[1..], parity))
+            ledger_signature_from_response(data, operation)
         }
 
         pub async fn profile_fingerprint(
@@ -1034,6 +1234,492 @@ pub mod ledger {
                 LEDGER_READY_MESSAGE,
             ))
         }
+    }
+
+    fn ledger_connected_device_model() -> Result<LedgerDeviceModel, HardwareDerivationError> {
+        let api = HidApi::new().map_err(|error| {
+            tracing::debug!(%error, "Ledger HID model probe failed to initialize HID API");
+            HardwareDerivationError::LedgerUnavailable(LEDGER_READY_MESSAGE)
+        })?;
+        let device = api
+            .device_list()
+            .find(|device| ledger_hid_device_matches(device.vendor_id(), device.usage_page()))
+            .ok_or(HardwareDerivationError::LedgerUnavailable(
+                LEDGER_READY_MESSAGE,
+            ))?;
+        Ok(ledger_device_model(
+            device.product_id(),
+            device.product_string(),
+        ))
+    }
+
+    fn ledger_device_model(product_id: u16, product: Option<&str>) -> LedgerDeviceModel {
+        if let Some(product) = product {
+            let product = product.to_ascii_lowercase();
+            if product.contains("nano s plus") || product.contains("nano s+") {
+                return LedgerDeviceModel::NanoSPlus;
+            }
+            if product.contains("nano x") {
+                return LedgerDeviceModel::NanoX;
+            }
+            if product.contains("nano s") {
+                return LedgerDeviceModel::NanoS;
+            }
+            if product.contains("stax") {
+                return LedgerDeviceModel::Stax;
+            }
+            if product.contains("flex") {
+                return LedgerDeviceModel::Flex;
+            }
+        }
+        match product_id {
+            0x0001 => LedgerDeviceModel::NanoS,
+            0x0004 => LedgerDeviceModel::NanoX,
+            0x0005 => LedgerDeviceModel::NanoSPlus,
+            0x0006 => LedgerDeviceModel::Stax,
+            0x0007 => LedgerDeviceModel::Flex,
+            _ => LedgerDeviceModel::Unknown,
+        }
+    }
+
+    pub fn classify_ledger_typed_data_signing_mode(
+        info: &LedgerDeviceInfo,
+    ) -> HardwareTypedDataSigningMode {
+        if matches!(
+            info.model,
+            LedgerDeviceModel::NanoX | LedgerDeviceModel::NanoSPlus
+        ) && info.ethereum_app_version >= LEDGER_ETHEREUM_EIP712_CLEAR_MIN_APP_VERSION
+        {
+            HardwareTypedDataSigningMode::ClearSign
+        } else if info.ethereum_app_version >= LEDGER_ETHEREUM_EIP712_HASH_FALLBACK_MIN_APP_VERSION
+        {
+            HardwareTypedDataSigningMode::Eip712HashFallback
+        } else {
+            HardwareTypedDataSigningMode::Unsupported
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn classify_ledger_eip712_clear_failure(
+        error: &HardwareDerivationError,
+        failed_apdu: &LedgerEip712Apdu,
+        device_confirmation_started: bool,
+    ) -> LedgerEip712ClearFailureKind {
+        let HardwareDerivationError::LedgerStatus { status, .. } = error else {
+            return LedgerEip712ClearFailureKind::Other;
+        };
+        if ledger_eip712_user_rejection_status(*status) {
+            return LedgerEip712ClearFailureKind::UserRejected;
+        }
+        if ledger_eip712_payload_rejection_status(*status) {
+            return LedgerEip712ClearFailureKind::PayloadUnsupported;
+        }
+        if !device_confirmation_started
+            && !ledger_eip712_sign_apdu(failed_apdu)
+            && ledger_eip712_capability_unsupported_status(*status)
+        {
+            return LedgerEip712ClearFailureKind::CapabilityUnsupportedBeforeConfirmation;
+        }
+        LedgerEip712ClearFailureKind::Other
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn ledger_eip712_clear_failure_downgrade_mode(
+        error: &HardwareDerivationError,
+        failed_apdu: &LedgerEip712Apdu,
+        device_confirmation_started: bool,
+        info: &LedgerDeviceInfo,
+    ) -> Option<HardwareTypedDataSigningMode> {
+        if !matches!(
+            classify_ledger_eip712_clear_failure(error, failed_apdu, device_confirmation_started),
+            LedgerEip712ClearFailureKind::CapabilityUnsupportedBeforeConfirmation
+        ) {
+            return None;
+        }
+        if info.ethereum_app_version >= LEDGER_ETHEREUM_EIP712_HASH_FALLBACK_MIN_APP_VERSION {
+            Some(HardwareTypedDataSigningMode::Eip712HashFallback)
+        } else {
+            None
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    const fn ledger_eip712_sign_apdu(apdu: &LedgerEip712Apdu) -> bool {
+        apdu.ins == 0x0c
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    const fn ledger_eip712_capability_unsupported_status(status: u16) -> bool {
+        matches!(status, 0x6a81 | 0x6a86 | 0x6d00 | 0x6e00)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    const fn ledger_eip712_payload_rejection_status(status: u16) -> bool {
+        matches!(status, 0x6a80 | 0x6b00)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    const fn ledger_eip712_user_rejection_status(status: u16) -> bool {
+        matches!(status, 0x6982 | 0x6985)
+    }
+
+    pub(crate) fn ledger_eip712_clear_signing_apdus(
+        descriptor: &HardwarePublicAccountDescriptor,
+        typed_data: &HardwareEip712Model,
+    ) -> Result<Vec<LedgerEip712Apdu>, HardwareDerivationError> {
+        descriptor.validate()?;
+        if descriptor.device_kind != HardwareDeviceKind::Ledger {
+            return Err(HardwareDerivationError::InvalidDescriptor(
+                "Ledger typed-data signing requires a Ledger descriptor",
+            ));
+        }
+        let mut apdus = ledger_eip712_definition_apdus(typed_data)?;
+        apdus.extend(ledger_eip712_implementation_apdus(typed_data)?);
+        apdus.push(LedgerEip712Apdu {
+            ins: 0x0c,
+            p1: 0x00,
+            p2: 0x01,
+            data: ledger_path_payload(&descriptor.path)?,
+        });
+        Ok(apdus)
+    }
+
+    pub(crate) fn ledger_eip712_hash_signing_apdu(
+        descriptor: &HardwarePublicAccountDescriptor,
+        typed_data: &HardwareEip712Model,
+    ) -> Result<LedgerEip712Apdu, HardwareDerivationError> {
+        descriptor.validate()?;
+        if descriptor.device_kind != HardwareDeviceKind::Ledger {
+            return Err(HardwareDerivationError::InvalidDescriptor(
+                "Ledger typed-data signing requires a Ledger descriptor",
+            ));
+        }
+        let message_hash = typed_data.message_hash().ok_or(
+            HardwareDerivationError::UnexpectedHardwareResponse(
+                "Ledger EIP-712 hash fallback requires a message hash",
+            ),
+        )?;
+        let mut data = ledger_path_payload(&descriptor.path)?;
+        data.extend_from_slice(typed_data.domain_separator_hash().as_slice());
+        data.extend_from_slice(message_hash.as_slice());
+        Ok(LedgerEip712Apdu {
+            ins: 0x0c,
+            p1: 0x00,
+            p2: 0x00,
+            data,
+        })
+    }
+
+    fn ledger_eip712_definition_apdus(
+        typed_data: &HardwareEip712Model,
+    ) -> Result<Vec<LedgerEip712Apdu>, HardwareDerivationError> {
+        let mut apdus = Vec::new();
+        for (type_name, fields) in typed_data.type_definitions() {
+            apdus.push(LedgerEip712Apdu {
+                ins: 0x1a,
+                p1: 0x00,
+                p2: 0x00,
+                data: ledger_len_prefixed_stringless_payload(type_name)?,
+            });
+            for field in fields {
+                apdus.push(LedgerEip712Apdu {
+                    ins: 0x1a,
+                    p1: 0x00,
+                    p2: 0xff,
+                    data: ledger_eip712_field_definition_payload(field)?,
+                });
+            }
+        }
+        Ok(apdus)
+    }
+
+    fn ledger_eip712_field_definition_payload(
+        field: &HardwareEip712FieldDefinition,
+    ) -> Result<Vec<u8>, HardwareDerivationError> {
+        let (base, array_levels) = ledger_eip712_type_parts(&field.value_type);
+        let has_array = !array_levels.is_empty();
+        let type_size = ledger_eip712_type_size(&base);
+        let mut descriptor = ledger_eip712_type_code(&base);
+        if has_array {
+            descriptor |= 0x80;
+        }
+        if type_size.is_some() {
+            descriptor |= 0x40;
+        }
+
+        let mut payload = vec![descriptor];
+        if let LedgerEip712BaseType::Custom(type_name) = &base {
+            push_u8_len_prefixed_bytes(&mut payload, type_name.as_bytes())?;
+        }
+        if let Some(type_size) = type_size {
+            payload.push(u8::try_from(type_size).map_err(|_| {
+                HardwareDerivationError::InvalidDescriptor("Ledger EIP-712 type size is too large")
+            })?);
+        }
+        if has_array {
+            payload.push(u8::try_from(array_levels.len()).map_err(|_| {
+                HardwareDerivationError::InvalidDescriptor(
+                    "Ledger EIP-712 array nesting is too deep",
+                )
+            })?);
+            for level in array_levels {
+                match level {
+                    LedgerEip712ArrayLevel::Dynamic => payload.push(0),
+                    LedgerEip712ArrayLevel::Fixed(len) => {
+                        payload.push(1);
+                        payload.push(u8::try_from(len).map_err(|_| {
+                            HardwareDerivationError::InvalidDescriptor(
+                                "Ledger EIP-712 fixed array length is too large",
+                            )
+                        })?);
+                    }
+                }
+            }
+        }
+        push_u8_len_prefixed_bytes(&mut payload, field.name.as_bytes())?;
+        Ok(payload)
+    }
+
+    fn ledger_eip712_implementation_apdus(
+        typed_data: &HardwareEip712Model,
+    ) -> Result<Vec<LedgerEip712Apdu>, HardwareDerivationError> {
+        let mut apdus = Vec::new();
+        append_ledger_eip712_struct_implementation(&mut apdus, typed_data.domain())?;
+        if let Some(message) = typed_data.message() {
+            append_ledger_eip712_struct_implementation(&mut apdus, message)?;
+        }
+        Ok(apdus)
+    }
+
+    fn append_ledger_eip712_struct_implementation(
+        apdus: &mut Vec<LedgerEip712Apdu>,
+        value: &HardwareEip712StructValue,
+    ) -> Result<(), HardwareDerivationError> {
+        apdus.push(LedgerEip712Apdu {
+            ins: 0x1c,
+            p1: 0x00,
+            p2: 0x00,
+            data: ledger_len_prefixed_stringless_payload(&value.type_name)?,
+        });
+        for field in &value.fields {
+            append_ledger_eip712_field_implementation(apdus, field)?;
+        }
+        Ok(())
+    }
+
+    fn append_ledger_eip712_field_implementation(
+        apdus: &mut Vec<LedgerEip712Apdu>,
+        field: &HardwareEip712FieldValue,
+    ) -> Result<(), HardwareDerivationError> {
+        append_ledger_eip712_value_implementation(apdus, &field.value)
+    }
+
+    fn append_ledger_eip712_value_implementation(
+        apdus: &mut Vec<LedgerEip712Apdu>,
+        value: &HardwareEip712Value,
+    ) -> Result<(), HardwareDerivationError> {
+        match value {
+            HardwareEip712Value::Struct(value) => {
+                append_ledger_eip712_struct_implementation(apdus, value)
+            }
+            HardwareEip712Value::DynamicArray(values) | HardwareEip712Value::FixedArray(values) => {
+                append_ledger_eip712_array_implementation(apdus, values)
+            }
+            _ => {
+                let value = ledger_eip712_raw_value(value)?;
+                let mut payload = Vec::with_capacity(2 + value.len());
+                payload.extend_from_slice(
+                    &u16::try_from(value.len())
+                        .map_err(|_| {
+                            HardwareDerivationError::InvalidDescriptor(
+                                "Ledger EIP-712 field value is too large",
+                            )
+                        })?
+                        .to_be_bytes(),
+                );
+                payload.extend_from_slice(&value);
+                append_ledger_eip712_field_chunks(apdus, payload);
+                Ok(())
+            }
+        }
+    }
+
+    fn append_ledger_eip712_field_chunks(apdus: &mut Vec<LedgerEip712Apdu>, mut payload: Vec<u8>) {
+        while !payload.is_empty() {
+            let chunk_len = payload.len().min(255);
+            let chunk = payload[..chunk_len].to_vec();
+            payload.drain(..chunk_len);
+            apdus.push(LedgerEip712Apdu {
+                ins: 0x1c,
+                p1: u8::from(!payload.is_empty()),
+                p2: 0xff,
+                data: chunk,
+            });
+        }
+    }
+
+    fn append_ledger_eip712_array_implementation(
+        apdus: &mut Vec<LedgerEip712Apdu>,
+        values: &[HardwareEip712ArrayElement],
+    ) -> Result<(), HardwareDerivationError> {
+        apdus.push(LedgerEip712Apdu {
+            ins: 0x1c,
+            p1: 0x00,
+            p2: 0x0f,
+            data: vec![u8::try_from(values.len()).map_err(|_| {
+                HardwareDerivationError::InvalidDescriptor("Ledger EIP-712 array is too large")
+            })?],
+        });
+        for value in values {
+            append_ledger_eip712_value_implementation(apdus, &value.value)?;
+        }
+        Ok(())
+    }
+
+    fn ledger_eip712_raw_value(
+        value: &HardwareEip712Value,
+    ) -> Result<Vec<u8>, HardwareDerivationError> {
+        match value {
+            HardwareEip712Value::Bool(value) => Ok(vec![u8::from(*value)]),
+            HardwareEip712Value::Int { value, .. } => Ok(i256_to_ledger(value)),
+            HardwareEip712Value::Uint { value, .. } => Ok(u256_to_ledger(*value)),
+            HardwareEip712Value::Address(value) => Ok(value.as_slice().to_vec()),
+            HardwareEip712Value::FixedBytes { bytes, .. } | HardwareEip712Value::Bytes(bytes) => {
+                Ok(bytes.clone())
+            }
+            HardwareEip712Value::String(value) => Ok(value.as_bytes().to_vec()),
+            HardwareEip712Value::Struct(_)
+            | HardwareEip712Value::DynamicArray(_)
+            | HardwareEip712Value::FixedArray(_) => {
+                Err(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Ledger EIP-712 container value cannot be encoded as a raw field",
+                ))
+            }
+        }
+    }
+
+    fn ledger_eip712_type_parts(
+        value_type: &HardwareEip712Type,
+    ) -> (LedgerEip712BaseType, Vec<LedgerEip712ArrayLevel>) {
+        match value_type {
+            HardwareEip712Type::Primitive(primitive) => {
+                (ledger_eip712_primitive_type(primitive), Vec::new())
+            }
+            HardwareEip712Type::Struct(name) => {
+                (LedgerEip712BaseType::Custom(name.clone()), Vec::new())
+            }
+            HardwareEip712Type::DynamicArray(element) => {
+                let (base, mut levels) = ledger_eip712_type_parts(element);
+                levels.push(LedgerEip712ArrayLevel::Dynamic);
+                (base, levels)
+            }
+            HardwareEip712Type::FixedArray { element, len } => {
+                let (base, mut levels) = ledger_eip712_type_parts(element);
+                levels.push(LedgerEip712ArrayLevel::Fixed(*len));
+                (base, levels)
+            }
+        }
+    }
+
+    fn ledger_eip712_primitive_type(
+        primitive: &HardwareEip712PrimitiveType,
+    ) -> LedgerEip712BaseType {
+        match primitive {
+            HardwareEip712PrimitiveType::Bool => LedgerEip712BaseType::Bool,
+            HardwareEip712PrimitiveType::Int(bits) => LedgerEip712BaseType::Int(*bits),
+            HardwareEip712PrimitiveType::Uint(bits) => LedgerEip712BaseType::Uint(*bits),
+            HardwareEip712PrimitiveType::Address => LedgerEip712BaseType::Address,
+            HardwareEip712PrimitiveType::FixedBytes(size) => {
+                LedgerEip712BaseType::FixedBytes(*size)
+            }
+            HardwareEip712PrimitiveType::Bytes => LedgerEip712BaseType::Bytes,
+            HardwareEip712PrimitiveType::String => LedgerEip712BaseType::String,
+        }
+    }
+
+    const fn ledger_eip712_type_code(base: &LedgerEip712BaseType) -> u8 {
+        match base {
+            LedgerEip712BaseType::Custom(_) => 0,
+            LedgerEip712BaseType::Int(_) => 1,
+            LedgerEip712BaseType::Uint(_) => 2,
+            LedgerEip712BaseType::Address => 3,
+            LedgerEip712BaseType::Bool => 4,
+            LedgerEip712BaseType::String => 5,
+            LedgerEip712BaseType::FixedBytes(_) => 6,
+            LedgerEip712BaseType::Bytes => 7,
+        }
+    }
+
+    fn ledger_eip712_type_size(base: &LedgerEip712BaseType) -> Option<usize> {
+        match base {
+            LedgerEip712BaseType::Int(bits) | LedgerEip712BaseType::Uint(bits) => Some(bits / 8),
+            LedgerEip712BaseType::FixedBytes(size) => Some(*size),
+            LedgerEip712BaseType::Custom(_)
+            | LedgerEip712BaseType::Address
+            | LedgerEip712BaseType::Bool
+            | LedgerEip712BaseType::String
+            | LedgerEip712BaseType::Bytes => None,
+        }
+    }
+
+    fn push_u8_len_prefixed_bytes(
+        output: &mut Vec<u8>,
+        value: &[u8],
+    ) -> Result<(), HardwareDerivationError> {
+        output.push(u8::try_from(value.len()).map_err(|_| {
+            HardwareDerivationError::InvalidDescriptor("Ledger EIP-712 string is too long")
+        })?);
+        output.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn ledger_len_prefixed_stringless_payload(
+        value: &str,
+    ) -> Result<Vec<u8>, HardwareDerivationError> {
+        if value.len() > u8::MAX as usize {
+            return Err(HardwareDerivationError::InvalidDescriptor(
+                "Ledger EIP-712 name is too long",
+            ));
+        }
+        Ok(value.as_bytes().to_vec())
+    }
+
+    fn u256_to_ledger(value: U256) -> Vec<u8> {
+        let bytes = value.to_be_bytes::<32>();
+        bytes[value.leading_zeros() / 8..].to_vec()
+    }
+
+    fn i256_to_ledger(value: &alloy::primitives::I256) -> Vec<u8> {
+        let bytes = value.to_be_bytes::<32>();
+        let sign_byte = if value.is_negative() { 0xff } else { 0x00 };
+        let mut start = 0;
+        while start < bytes.len()
+            && bytes[start] == sign_byte
+            && bytes
+                .get(start + 1)
+                .is_some_and(|next| (*next & 0x80) == (sign_byte & 0x80))
+        {
+            start += 1;
+        }
+        bytes[start..].to_vec()
+    }
+
+    fn ledger_signature_from_response(
+        data: &[u8],
+        _operation: &'static str,
+    ) -> Result<Signature, HardwareDerivationError> {
+        if data.len() != 65 {
+            return Err(HardwareDerivationError::UnexpectedResponseLength {
+                got: data.len(),
+                expected: 65,
+            });
+        }
+        let parity = normalize_v(u64::from(data[0])).ok_or(
+            HardwareDerivationError::UnexpectedHardwareResponse(
+                "Ledger signature has invalid recovery id",
+            ),
+        )?;
+        Ok(Signature::from_bytes_and_parity(&data[1..], parity))
     }
 
     const fn ledger_hid_device_matches(vendor_id: u16, usage_page: u16) -> bool {
@@ -1337,6 +2023,7 @@ pub mod ledger {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use serde_json::json;
 
         fn answer_with_status(status: u16) -> APDUAnswer {
             APDUAnswer::from_answer(status.to_be_bytes().to_vec()).expect("status answer")
@@ -1425,6 +2112,409 @@ pub mod ledger {
             assert_eq!(ledger_address_display_p1(false), 0x00);
             assert_eq!(ledger_address_display_p1(true), 0x01);
         }
+
+        #[test]
+        fn ledger_typed_data_classification_is_conservative() {
+            let clear = LedgerDeviceInfo {
+                model: LedgerDeviceModel::NanoX,
+                ethereum_app_version: HardwareAppVersion::new(1, 10, 0),
+            };
+            let fallback = LedgerDeviceInfo {
+                model: LedgerDeviceModel::NanoS,
+                ethereum_app_version: HardwareAppVersion::new(1, 5, 0),
+            };
+            let unknown_model = LedgerDeviceInfo {
+                model: LedgerDeviceModel::Unknown,
+                ethereum_app_version: HardwareAppVersion::new(1, 10, 0),
+            };
+            let unsupported = LedgerDeviceInfo {
+                model: LedgerDeviceModel::NanoX,
+                ethereum_app_version: HardwareAppVersion::new(1, 4, 9),
+            };
+
+            assert_eq!(
+                classify_ledger_typed_data_signing_mode(&clear),
+                HardwareTypedDataSigningMode::ClearSign
+            );
+            assert_eq!(
+                classify_ledger_typed_data_signing_mode(&fallback),
+                HardwareTypedDataSigningMode::Eip712HashFallback
+            );
+            assert_eq!(
+                classify_ledger_typed_data_signing_mode(&unknown_model),
+                HardwareTypedDataSigningMode::Eip712HashFallback
+            );
+            assert_eq!(
+                classify_ledger_typed_data_signing_mode(&unsupported),
+                HardwareTypedDataSigningMode::Unsupported
+            );
+        }
+
+        fn ledger_clear_info() -> LedgerDeviceInfo {
+            LedgerDeviceInfo {
+                model: LedgerDeviceModel::NanoX,
+                ethereum_app_version: HardwareAppVersion::new(1, 10, 0),
+            }
+        }
+
+        fn ledger_no_hash_fallback_info() -> LedgerDeviceInfo {
+            LedgerDeviceInfo {
+                model: LedgerDeviceModel::NanoX,
+                ethereum_app_version: HardwareAppVersion::new(1, 4, 9),
+            }
+        }
+
+        fn ledger_definition_apdu() -> LedgerEip712Apdu {
+            LedgerEip712Apdu {
+                ins: 0x1a,
+                p1: 0x00,
+                p2: 0x00,
+                data: b"Message".to_vec(),
+            }
+        }
+
+        fn ledger_sign_apdu() -> LedgerEip712Apdu {
+            LedgerEip712Apdu {
+                ins: 0x0c,
+                p1: 0x00,
+                p2: 0x01,
+                data: vec![0],
+            }
+        }
+
+        #[test]
+        fn ledger_clear_failure_downgrades_only_for_pre_confirmation_capability_rejection() {
+            let error = ledger_status_error("sign EIP-712 typed data", 0x6d00);
+            let failed_apdu = ledger_definition_apdu();
+
+            assert_eq!(
+                classify_ledger_eip712_clear_failure(&error, &failed_apdu, false),
+                LedgerEip712ClearFailureKind::CapabilityUnsupportedBeforeConfirmation
+            );
+            assert_eq!(
+                ledger_eip712_clear_failure_downgrade_mode(
+                    &error,
+                    &failed_apdu,
+                    false,
+                    &ledger_clear_info()
+                ),
+                Some(HardwareTypedDataSigningMode::Eip712HashFallback)
+            );
+            assert_eq!(
+                ledger_eip712_clear_failure_downgrade_mode(
+                    &error,
+                    &failed_apdu,
+                    false,
+                    &ledger_no_hash_fallback_info()
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn ledger_clear_failure_does_not_downgrade_payload_specific_rejection() {
+            let error = ledger_status_error("sign EIP-712 typed data", 0x6a80);
+            let failed_apdu = ledger_definition_apdu();
+
+            assert_eq!(
+                classify_ledger_eip712_clear_failure(&error, &failed_apdu, false),
+                LedgerEip712ClearFailureKind::PayloadUnsupported
+            );
+            assert_eq!(
+                ledger_eip712_clear_failure_downgrade_mode(
+                    &error,
+                    &failed_apdu,
+                    false,
+                    &ledger_clear_info()
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn ledger_clear_failure_does_not_downgrade_signing_or_user_rejection() {
+            let unsupported_error = ledger_status_error("sign EIP-712 typed data", 0x6d00);
+            let rejected_error = ledger_status_error("sign EIP-712 typed data", 0x6985);
+            let sign_apdu = ledger_sign_apdu();
+            let definition_apdu = ledger_definition_apdu();
+
+            assert_eq!(
+                classify_ledger_eip712_clear_failure(&unsupported_error, &sign_apdu, false),
+                LedgerEip712ClearFailureKind::Other
+            );
+            assert_eq!(
+                classify_ledger_eip712_clear_failure(&unsupported_error, &definition_apdu, true),
+                LedgerEip712ClearFailureKind::Other
+            );
+            assert_eq!(
+                classify_ledger_eip712_clear_failure(&rejected_error, &definition_apdu, false),
+                LedgerEip712ClearFailureKind::UserRejected
+            );
+            assert_eq!(
+                ledger_eip712_clear_failure_downgrade_mode(
+                    &rejected_error,
+                    &definition_apdu,
+                    false,
+                    &ledger_clear_info()
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn ledger_device_model_uses_product_string_before_product_id() {
+            assert_eq!(
+                ledger_device_model(0xffff, Some("Ledger Nano X")),
+                LedgerDeviceModel::NanoX
+            );
+            assert_eq!(
+                ledger_device_model(0x0005, None),
+                LedgerDeviceModel::NanoSPlus
+            );
+            assert_eq!(
+                ledger_device_model(0xffff, None),
+                LedgerDeviceModel::Unknown
+            );
+        }
+
+        fn typed_data_model() -> HardwareEip712Model {
+            HardwareEip712Model::from_walletconnect_typed_data_json(json!({
+                "types": {
+                    "EIP712Domain": [
+                        { "name": "name", "type": "string" },
+                        { "name": "chainId", "type": "uint256" }
+                    ],
+                    "Person": [
+                        { "name": "wallet", "type": "address" },
+                        { "name": "name", "type": "string" }
+                    ],
+                    "Message": [
+                        { "name": "count", "type": "uint256" },
+                        { "name": "people", "type": "Person[]" },
+                        { "name": "tags", "type": "string[2]" },
+                        { "name": "payload", "type": "bytes" },
+                        { "name": "digest", "type": "bytes32" }
+                    ]
+                },
+                "primaryType": "Message",
+                "domain": {
+                    "name": "RailOxide",
+                    "chainId": 1
+                },
+                "message": {
+                    "count": 128,
+                    "people": [
+                        {
+                            "wallet": "0x1111111111111111111111111111111111111111",
+                            "name": "Alice"
+                        }
+                    ],
+                    "tags": ["permit", "test"],
+                    "payload": "0x010203",
+                    "digest": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }))
+            .expect("typed-data model")
+        }
+
+        fn reordered_domain_typed_data_model() -> HardwareEip712Model {
+            HardwareEip712Model::from_walletconnect_typed_data_json(json!({
+                "types": {
+                    "EIP712Domain": [
+                        { "name": "chainId", "type": "uint256" },
+                        { "name": "name", "type": "string" }
+                    ],
+                    "Message": [
+                        { "name": "contents", "type": "string" }
+                    ]
+                },
+                "primaryType": "Message",
+                "domain": {
+                    "name": "RailOxide",
+                    "chainId": 1
+                },
+                "message": {
+                    "contents": "hello"
+                }
+            }))
+            .expect("typed-data model")
+        }
+
+        fn long_string_typed_data_model() -> HardwareEip712Model {
+            HardwareEip712Model::from_walletconnect_typed_data_json(json!({
+                "types": {
+                    "EIP712Domain": [],
+                    "Message": [
+                        { "name": "contents", "type": "string" }
+                    ]
+                },
+                "primaryType": "Message",
+                "domain": {},
+                "message": {
+                    "contents": "x".repeat(300)
+                }
+            }))
+            .expect("long string typed-data model")
+        }
+
+        fn ledger_descriptor() -> HardwarePublicAccountDescriptor {
+            HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Ledger,
+                0,
+                0,
+            )
+            .expect("ledger descriptor")
+        }
+
+        #[test]
+        fn ledger_eip712_definition_apdus_encode_doc_type_descriptors() {
+            let model = typed_data_model();
+            let definitions = ledger_eip712_definition_apdus(&model).expect("definitions");
+
+            assert_eq!(definitions[0].ins, 0x1a);
+            assert_eq!(definitions[0].p2, 0x00);
+            assert_eq!(definitions[0].data, b"EIP712Domain");
+
+            let count = definitions
+                .iter()
+                .find(|apdu| apdu.p2 == 0xff && apdu.data.ends_with(b"\x05count"))
+                .expect("count field definition");
+            assert_eq!(count.data, [0x42, 32, 5, b'c', b'o', b'u', b'n', b't']);
+
+            let people = definitions
+                .iter()
+                .find(|apdu| apdu.p2 == 0xff && apdu.data.ends_with(b"\x06people"))
+                .expect("people field definition");
+            assert_eq!(
+                people.data,
+                [
+                    0x80, 6, b'P', b'e', b'r', b's', b'o', b'n', 1, 0, 6, b'p', b'e', b'o', b'p',
+                    b'l', b'e'
+                ]
+            );
+
+            let tags = definitions
+                .iter()
+                .find(|apdu| apdu.p2 == 0xff && apdu.data.ends_with(b"\x04tags"))
+                .expect("tags field definition");
+            assert_eq!(tags.data, [0x85, 1, 1, 2, 4, b't', b'a', b'g', b's']);
+        }
+
+        #[test]
+        fn ledger_eip712_implementation_apdus_traverse_values_in_order() {
+            let model = typed_data_model();
+            let implementations =
+                ledger_eip712_implementation_apdus(&model).expect("implementations");
+
+            assert_eq!(implementations[0].ins, 0x1c);
+            assert_eq!(implementations[0].p1, 0x00);
+            assert_eq!(implementations[0].p2, 0x00);
+            assert_eq!(implementations[0].data, b"EIP712Domain");
+            assert_eq!(implementations[1].p1, 0x00);
+            assert_eq!(implementations[1].p2, 0xff);
+            assert_eq!(implementations[1].data, b"\x00\x09RailOxide");
+            assert_eq!(implementations[2].p1, 0x00);
+            assert_eq!(implementations[2].p2, 0xff);
+            assert_eq!(implementations[2].data, b"\x00\x01\x01");
+
+            let message_root = implementations
+                .iter()
+                .position(|apdu| apdu.p2 == 0x00 && apdu.data == b"Message")
+                .expect("message root");
+            assert_eq!(implementations[message_root + 1].data, b"\x00\x01\x80");
+            assert_eq!(implementations[message_root + 2].p1, 0x00);
+            assert_eq!(implementations[message_root + 2].p2, 0x0f);
+            assert_eq!(implementations[message_root + 2].data, [1]);
+            assert!(implementations.iter().all(|apdu| apdu.p1 == 0x00));
+        }
+
+        #[test]
+        fn ledger_eip712_domain_values_follow_canonical_hash_order() {
+            let model = reordered_domain_typed_data_model();
+            let definitions = ledger_eip712_definition_apdus(&model).expect("definitions");
+            let implementations =
+                ledger_eip712_implementation_apdus(&model).expect("implementations");
+
+            assert_eq!(definitions[0].data, b"EIP712Domain");
+            assert!(definitions[1].data.ends_with(b"\x04name"));
+            assert!(definitions[2].data.ends_with(b"\x07chainId"));
+            assert_eq!(implementations[0].data, b"EIP712Domain");
+            assert_eq!(implementations[1].data, b"\x00\x09RailOxide");
+            assert_eq!(implementations[2].data, b"\x00\x01\x01");
+        }
+
+        #[test]
+        fn ledger_eip712_field_values_are_chunked_without_truncation() {
+            let model = long_string_typed_data_model();
+            let implementations =
+                ledger_eip712_implementation_apdus(&model).expect("implementations");
+            let chunks: Vec<_> = implementations
+                .iter()
+                .filter(|apdu| apdu.p2 == 0xff)
+                .collect();
+
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0].p1, 0x01);
+            assert_eq!(chunks[0].data.len(), 255);
+            assert_eq!(chunks[0].data[..2], [0x01, 0x2c]);
+            assert_eq!(chunks[1].p1, 0x00);
+            assert_eq!(chunks[1].data.len(), 47);
+        }
+
+        #[test]
+        fn ledger_eip712_hash_fallback_payload_uses_local_hashes() {
+            let model = typed_data_model();
+            let descriptor = ledger_descriptor();
+
+            let apdu = ledger_eip712_hash_signing_apdu(&descriptor, &model).expect("hash apdu");
+
+            let path = ledger_path_payload(&descriptor.path).expect("path payload");
+            assert_eq!(apdu.ins, 0x0c);
+            assert_eq!(apdu.p1, 0x00);
+            assert_eq!(apdu.p2, 0x00);
+            assert_eq!(apdu.data.len(), path.len() + 64);
+            assert_eq!(&apdu.data[..path.len()], path.as_slice());
+            assert_eq!(
+                &apdu.data[path.len()..path.len() + 32],
+                model.domain_separator_hash().as_slice()
+            );
+            assert_eq!(
+                &apdu.data[path.len() + 32..],
+                model.message_hash().expect("message hash").as_slice()
+            );
+        }
+
+        #[test]
+        fn ledger_eip712_clear_sequence_sends_definitions_implementations_then_sign() {
+            let model = typed_data_model();
+            let descriptor = ledger_descriptor();
+
+            let apdus =
+                ledger_eip712_clear_signing_apdus(&descriptor, &model).expect("clear apdus");
+
+            assert!(apdus.iter().take_while(|apdu| apdu.ins == 0x1a).count() > 0);
+            let first_implementation = apdus
+                .iter()
+                .position(|apdu| apdu.ins == 0x1c)
+                .expect("implementation APDU");
+            let final_apdu = apdus.last().expect("final sign APDU");
+            assert!(
+                apdus[..first_implementation]
+                    .iter()
+                    .all(|apdu| apdu.ins == 0x1a)
+            );
+            assert!(
+                apdus[first_implementation..apdus.len() - 1]
+                    .iter()
+                    .all(|apdu| apdu.ins == 0x1c)
+            );
+            assert_eq!(final_apdu.ins, 0x0c);
+            assert_eq!(final_apdu.p2, 0x01);
+            assert_eq!(
+                final_apdu.data,
+                ledger_path_payload(&descriptor.path).expect("path")
+            );
+        }
     }
 }
 
@@ -1440,7 +2530,11 @@ pub mod trezor {
         ConfirmedHardwarePublicAccount, HardwareAppVersion, HardwareDerivationClient,
         HardwareDerivationDescriptor, HardwareDerivationError, HardwareDerivationMethod,
         HardwareDeviceKind, HardwareOperationOutput, HardwarePublicAccountDescriptor,
-        hardware_profile_fingerprint,
+        HardwareTypedDataSigningMode, hardware_profile_fingerprint,
+    };
+    use crate::hardware_typed_data::{
+        HardwareEip712FieldDefinition, HardwareEip712Model, HardwareEip712PrimitiveType,
+        HardwareEip712StructValue, HardwareEip712Type, HardwareEip712Value,
     };
     use crate::vault::{HardwareProfileBinding, HardwareProfileSession, TrezorPassphraseMode};
     use alloy::consensus::SignableTransaction;
@@ -1448,9 +2542,11 @@ pub mod trezor {
     use alloy::primitives::{Address, Signature, TxKind, U256, normalize_v};
     use async_trait::async_trait;
     use protobuf::Enum as _;
+    use protobuf::MessageField;
     use serde::Deserialize;
     use trezor_client::TrezorMessage;
     use trezor_client::client::TrezorResponse;
+    use trezor_client::protos::MessageType;
     use trezor_client::transport::{ProtoMessage, Transport, error::Error as TrezorTransportError};
     use zeroize::{Zeroize, Zeroizing};
 
@@ -1462,6 +2558,17 @@ pub mod trezor {
     const TREZOR_BRIDGE_READ_TIMEOUT: Duration = Duration::from_mins(5);
     const TREZOR_BRIDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
     const TREZOR_ETHEREUM_TX_CHUNK_SIZE: usize = 1024;
+    const TREZOR_CLEAR_TYPED_DATA_MIN_VERSION: HardwareAppVersion =
+        HardwareAppVersion::new(2, 4, 3);
+    const TREZOR_HASH_TYPED_DATA_MIN_VERSION: HardwareAppVersion =
+        HardwareAppVersion::new(1, 11, 2);
+
+    type TrezorEthereumDataType =
+        trezor_client::protos::ethereum_typed_data_struct_ack::EthereumDataType;
+    type TrezorEthereumFieldType =
+        trezor_client::protos::ethereum_typed_data_struct_ack::EthereumFieldType;
+    type TrezorEthereumStructMember =
+        trezor_client::protos::ethereum_typed_data_struct_ack::EthereumStructMember;
 
     pub type TrezorPinMatrixProvider = Arc<
         dyn Fn(TrezorPinMatrixRequestKind) -> Result<Zeroizing<String>, HardwareDerivationError>
@@ -2124,6 +3231,14 @@ pub mod trezor {
             })
         }
 
+        pub fn typed_data_signing_mode(
+            &self,
+        ) -> Result<HardwareTypedDataSigningMode, HardwareDerivationError> {
+            Ok(classify_trezor_typed_data_signing_mode(
+                &self.device_info()?,
+            ))
+        }
+
         #[must_use]
         pub fn session_id(&self) -> Option<Vec<u8>> {
             self.client.features().and_then(|features| {
@@ -2382,6 +3497,127 @@ pub mod trezor {
             trezor_signature_to_alloy(signature)
         }
 
+        #[allow(dead_code)]
+        pub(crate) fn sign_typed_data_clear(
+            &mut self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<Signature, HardwareDerivationError> {
+            descriptor.validate()?;
+            if descriptor.device_kind != HardwareDeviceKind::Trezor {
+                return Err(HardwareDerivationError::InvalidDescriptor(
+                    "Trezor typed-data signing requires a Trezor descriptor",
+                ));
+            }
+            let result = self.sign_typed_data_clear_inner(descriptor, typed_data);
+            self.passphrase.clear_app_passphrase();
+            result
+        }
+
+        fn sign_typed_data_clear_inner(
+            &mut self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<Signature, HardwareDerivationError> {
+            let mut request = trezor_client::protos::EthereumSignTypedData::new();
+            request.address_n.clone_from(&descriptor.path);
+            request.set_primary_type(typed_data.primary_type().to_owned());
+            request.set_metamask_v4_compat(true);
+
+            let Self {
+                client,
+                passphrase,
+                pin_matrix_provider,
+            } = self;
+            let mut response = trezor_call_raw_with_interactions(
+                client,
+                request,
+                passphrase,
+                pin_matrix_provider.as_ref(),
+            )?;
+            loop {
+                match response.message_type() {
+                    MessageType::MessageType_EthereumTypedDataStructRequest => {
+                        let request: trezor_client::protos::EthereumTypedDataStructRequest =
+                            trezor_decode_message(response)?;
+                        let ack = trezor_typed_data_struct_ack(typed_data, request.name())?;
+                        response = trezor_call_raw_with_interactions(
+                            client,
+                            ack,
+                            passphrase,
+                            pin_matrix_provider.as_ref(),
+                        )?;
+                    }
+                    MessageType::MessageType_EthereumTypedDataValueRequest => {
+                        let request: trezor_client::protos::EthereumTypedDataValueRequest =
+                            trezor_decode_message(response)?;
+                        let ack = trezor_typed_data_value_ack(typed_data, &request.member_path)?;
+                        response = trezor_call_raw_with_interactions(
+                            client,
+                            ack,
+                            passphrase,
+                            pin_matrix_provider.as_ref(),
+                        )?;
+                    }
+                    MessageType::MessageType_EthereumTypedDataSignature => {
+                        let signature: trezor_client::protos::EthereumTypedDataSignature =
+                            trezor_decode_message(response)?;
+                        return trezor_typed_data_signature_to_alloy(&signature);
+                    }
+                    message_type => {
+                        return Err(
+                            trezor_client::Error::UnexpectedMessageType(message_type).into()
+                        );
+                    }
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        pub(crate) fn sign_typed_data_hash(
+            &mut self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<Signature, HardwareDerivationError> {
+            descriptor.validate()?;
+            if descriptor.device_kind != HardwareDeviceKind::Trezor {
+                return Err(HardwareDerivationError::InvalidDescriptor(
+                    "Trezor typed-data signing requires a Trezor descriptor",
+                ));
+            }
+            let result = self.sign_typed_data_hash_inner(descriptor, typed_data);
+            self.passphrase.clear_app_passphrase();
+            result
+        }
+
+        fn sign_typed_data_hash_inner(
+            &mut self,
+            descriptor: &HardwarePublicAccountDescriptor,
+            typed_data: &HardwareEip712Model,
+        ) -> Result<Signature, HardwareDerivationError> {
+            let mut request = trezor_typed_data_hash_request(typed_data);
+            request.address_n.clone_from(&descriptor.path);
+            let Self {
+                client,
+                passphrase,
+                pin_matrix_provider,
+            } = self;
+            let response = trezor_call_raw_with_interactions(
+                client,
+                request,
+                passphrase,
+                pin_matrix_provider.as_ref(),
+            )?;
+            if response.message_type() != MessageType::MessageType_EthereumTypedDataSignature {
+                return Err(
+                    trezor_client::Error::UnexpectedMessageType(response.message_type()).into(),
+                );
+            }
+            let signature: trezor_client::protos::EthereumTypedDataSignature =
+                trezor_decode_message(response)?;
+            trezor_typed_data_signature_to_alloy(&signature)
+        }
+
         pub fn profile_fingerprint(
             &mut self,
             path: &[u32],
@@ -2454,6 +3690,385 @@ pub mod trezor {
 
     fn trezor_cipher_label(descriptor: &HardwareDerivationDescriptor) -> String {
         trezor_cipher_key_label(descriptor.account_index)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TrezorModelKind {
+        ModelOne,
+        CoreFirmware,
+        Unknown,
+    }
+
+    fn trezor_model_kind(model: &str) -> TrezorModelKind {
+        let normalized = model
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized == "1" || normalized.contains("modelone") || normalized.starts_with("t1") {
+            TrezorModelKind::ModelOne
+        } else if normalized == "t"
+            || normalized.contains("modelt")
+            || normalized.contains("safe")
+            || normalized.starts_with("t2")
+            || normalized.starts_with("t3")
+        {
+            TrezorModelKind::CoreFirmware
+        } else {
+            TrezorModelKind::Unknown
+        }
+    }
+
+    pub fn classify_trezor_typed_data_signing_mode(
+        info: &TrezorDeviceInfo,
+    ) -> HardwareTypedDataSigningMode {
+        if !info.initialized || info.bootloader_mode {
+            return HardwareTypedDataSigningMode::Unsupported;
+        }
+        match trezor_model_kind(&info.model) {
+            TrezorModelKind::CoreFirmware
+                if info.version >= TREZOR_CLEAR_TYPED_DATA_MIN_VERSION =>
+            {
+                HardwareTypedDataSigningMode::ClearSign
+            }
+            TrezorModelKind::ModelOne if info.version >= TREZOR_HASH_TYPED_DATA_MIN_VERSION => {
+                HardwareTypedDataSigningMode::Eip712HashFallback
+            }
+            TrezorModelKind::ModelOne
+            | TrezorModelKind::CoreFirmware
+            | TrezorModelKind::Unknown => HardwareTypedDataSigningMode::Unsupported,
+        }
+    }
+
+    fn trezor_call_raw_with_interactions<S: TrezorMessage>(
+        client: &mut trezor_client::Trezor,
+        message: S,
+        passphrase: &mut TrezorPassphraseState,
+        pin_matrix_provider: Option<&TrezorPinMatrixProvider>,
+    ) -> Result<ProtoMessage, HardwareDerivationError> {
+        let response = client.call_raw(message)?;
+        trezor_handle_raw_interactions(client, response, passphrase, pin_matrix_provider)
+    }
+
+    fn trezor_handle_raw_interactions(
+        client: &mut trezor_client::Trezor,
+        mut response: ProtoMessage,
+        passphrase: &mut TrezorPassphraseState,
+        pin_matrix_provider: Option<&TrezorPinMatrixProvider>,
+    ) -> Result<ProtoMessage, HardwareDerivationError> {
+        loop {
+            match response.message_type() {
+                MessageType::MessageType_Failure => {
+                    let failure: trezor_client::protos::Failure = trezor_decode_message(response)?;
+                    return Err(trezor_client::Error::FailureResponse(failure).into());
+                }
+                MessageType::MessageType_ButtonRequest => {
+                    let _request: trezor_client::protos::ButtonRequest =
+                        trezor_decode_message(response)?;
+                    response = client.call_raw(trezor_client::protos::ButtonAck::new())?;
+                }
+                MessageType::MessageType_PinMatrixRequest => {
+                    let request: trezor_client::protos::PinMatrixRequest =
+                        trezor_decode_message(response)?;
+                    let Some(provider) = pin_matrix_provider else {
+                        return Err(HardwareDerivationError::UnsupportedTrezorPinMatrix);
+                    };
+                    let mut pin = provider(request.type_().into())?;
+                    let mut ack = trezor_client::protos::PinMatrixAck::new();
+                    ack.set_pin(pin.as_str().to_owned());
+                    pin.zeroize();
+                    response = client.call_raw(ack)?;
+                }
+                MessageType::MessageType_PassphraseRequest => {
+                    let request: trezor_client::protos::PassphraseRequest =
+                        trezor_decode_message(response)?;
+                    let ack = passphrase.next_passphrase_ack(request._on_device())?;
+                    response = client.call_raw(ack)?;
+                }
+                _ => return Ok(response),
+            }
+        }
+    }
+
+    fn trezor_decode_message<M: protobuf::Message>(
+        message: ProtoMessage,
+    ) -> Result<M, HardwareDerivationError> {
+        message.into_message().map_err(|_| {
+            HardwareDerivationError::UnexpectedHardwareResponse(
+                "Trezor returned a malformed protobuf response",
+            )
+        })
+    }
+
+    fn trezor_typed_data_struct_ack(
+        typed_data: &HardwareEip712Model,
+        type_name: &str,
+    ) -> Result<trezor_client::protos::EthereumTypedDataStructAck, HardwareDerivationError> {
+        let fields = typed_data.type_definitions().get(type_name).ok_or(
+            HardwareDerivationError::UnexpectedHardwareResponse(
+                "Trezor requested an unknown EIP-712 struct definition",
+            ),
+        )?;
+        let mut ack = trezor_client::protos::EthereumTypedDataStructAck::new();
+        ack.members = fields
+            .iter()
+            .map(|field| trezor_typed_data_struct_member(typed_data, field))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ack)
+    }
+
+    fn trezor_typed_data_struct_member(
+        typed_data: &HardwareEip712Model,
+        field: &HardwareEip712FieldDefinition,
+    ) -> Result<TrezorEthereumStructMember, HardwareDerivationError> {
+        let mut member = TrezorEthereumStructMember::new();
+        member.type_ =
+            MessageField::some(trezor_typed_data_field_type(typed_data, &field.value_type)?);
+        member.set_name(field.name.clone());
+        Ok(member)
+    }
+
+    fn trezor_typed_data_field_type(
+        typed_data: &HardwareEip712Model,
+        value_type: &HardwareEip712Type,
+    ) -> Result<TrezorEthereumFieldType, HardwareDerivationError> {
+        let mut field = TrezorEthereumFieldType::new();
+        match value_type {
+            HardwareEip712Type::Primitive(primitive) => {
+                trezor_set_primitive_field_type(&mut field, primitive)?;
+            }
+            HardwareEip712Type::Struct(name) => {
+                let fields = typed_data.type_definitions().get(name).ok_or(
+                    HardwareDerivationError::UnexpectedHardwareResponse(
+                        "Trezor EIP-712 struct type is missing a definition",
+                    ),
+                )?;
+                field.set_data_type(TrezorEthereumDataType::STRUCT);
+                field.set_size(u32::try_from(fields.len()).map_err(|_| {
+                    HardwareDerivationError::InvalidDescriptor(
+                        "Trezor EIP-712 struct field count is too large",
+                    )
+                })?);
+                field.set_struct_name(name.clone());
+            }
+            HardwareEip712Type::DynamicArray(element) => {
+                field.set_data_type(TrezorEthereumDataType::ARRAY);
+                field.entry_type =
+                    MessageField::some(trezor_typed_data_field_type(typed_data, element)?);
+            }
+            HardwareEip712Type::FixedArray { element, len } => {
+                field.set_data_type(TrezorEthereumDataType::ARRAY);
+                field.set_size(u32::try_from(*len).map_err(|_| {
+                    HardwareDerivationError::InvalidDescriptor(
+                        "Trezor EIP-712 array length is too large",
+                    )
+                })?);
+                field.entry_type =
+                    MessageField::some(trezor_typed_data_field_type(typed_data, element)?);
+            }
+        }
+        Ok(field)
+    }
+
+    fn trezor_set_primitive_field_type(
+        field: &mut TrezorEthereumFieldType,
+        primitive: &HardwareEip712PrimitiveType,
+    ) -> Result<(), HardwareDerivationError> {
+        match primitive {
+            HardwareEip712PrimitiveType::Bool => field.set_data_type(TrezorEthereumDataType::BOOL),
+            HardwareEip712PrimitiveType::Int(bits) => {
+                field.set_data_type(TrezorEthereumDataType::INT);
+                field.set_size(trezor_integer_byte_size(*bits)?);
+            }
+            HardwareEip712PrimitiveType::Uint(bits) => {
+                field.set_data_type(TrezorEthereumDataType::UINT);
+                field.set_size(trezor_integer_byte_size(*bits)?);
+            }
+            HardwareEip712PrimitiveType::Address => {
+                field.set_data_type(TrezorEthereumDataType::ADDRESS);
+            }
+            HardwareEip712PrimitiveType::FixedBytes(size) => {
+                field.set_data_type(TrezorEthereumDataType::BYTES);
+                field.set_size(u32::try_from(*size).map_err(|_| {
+                    HardwareDerivationError::InvalidDescriptor(
+                        "Trezor EIP-712 fixed bytes size is too large",
+                    )
+                })?);
+            }
+            HardwareEip712PrimitiveType::Bytes => {
+                field.set_data_type(TrezorEthereumDataType::BYTES);
+            }
+            HardwareEip712PrimitiveType::String => {
+                field.set_data_type(TrezorEthereumDataType::STRING);
+            }
+        }
+        Ok(())
+    }
+
+    fn trezor_typed_data_value_ack(
+        typed_data: &HardwareEip712Model,
+        member_path: &[u32],
+    ) -> Result<trezor_client::protos::EthereumTypedDataValueAck, HardwareDerivationError> {
+        let mut ack = trezor_client::protos::EthereumTypedDataValueAck::new();
+        ack.set_value(trezor_typed_data_value(typed_data, member_path)?);
+        Ok(ack)
+    }
+
+    enum TrezorTypedDataValueRef<'a> {
+        Struct(&'a HardwareEip712StructValue),
+        Value(&'a HardwareEip712Value),
+    }
+
+    fn trezor_typed_data_value(
+        typed_data: &HardwareEip712Model,
+        member_path: &[u32],
+    ) -> Result<Vec<u8>, HardwareDerivationError> {
+        let Some((&root, path)) = member_path.split_first() else {
+            return Err(HardwareDerivationError::UnexpectedHardwareResponse(
+                "Trezor requested an empty EIP-712 member path",
+            ));
+        };
+        let mut value = match root {
+            0 => TrezorTypedDataValueRef::Struct(typed_data.domain()),
+            1 => TrezorTypedDataValueRef::Struct(typed_data.message().ok_or(
+                HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested EIP-712 message data for a domain-only payload",
+                ),
+            )?),
+            _ => {
+                return Err(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested an invalid EIP-712 root member path",
+                ));
+            }
+        };
+        for index in path {
+            value = trezor_typed_data_descend(
+                value,
+                usize::try_from(*index).map_err(|_| {
+                    HardwareDerivationError::InvalidDescriptor(
+                        "Trezor EIP-712 member path is too large",
+                    )
+                })?,
+            )?;
+        }
+        trezor_typed_data_encode_value(value)
+    }
+
+    fn trezor_typed_data_descend<'a>(
+        value: TrezorTypedDataValueRef<'a>,
+        index: usize,
+    ) -> Result<TrezorTypedDataValueRef<'a>, HardwareDerivationError> {
+        match value {
+            TrezorTypedDataValueRef::Struct(value) => value
+                .fields
+                .get(index)
+                .map(|field| TrezorTypedDataValueRef::Value(&field.value))
+                .ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested an out-of-range EIP-712 struct field",
+                )),
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::Struct(value)) => value
+                .fields
+                .get(index)
+                .map(|field| TrezorTypedDataValueRef::Value(&field.value))
+                .ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested an out-of-range EIP-712 nested struct field",
+                )),
+            TrezorTypedDataValueRef::Value(
+                HardwareEip712Value::DynamicArray(values) | HardwareEip712Value::FixedArray(values),
+            ) => values
+                .get(index)
+                .map(|value| TrezorTypedDataValueRef::Value(&value.value))
+                .ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested an out-of-range EIP-712 array element",
+                )),
+            TrezorTypedDataValueRef::Value(_) => {
+                Err(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested a nested EIP-712 value from a primitive field",
+                ))
+            }
+        }
+    }
+
+    fn trezor_typed_data_encode_value(
+        value: TrezorTypedDataValueRef<'_>,
+    ) -> Result<Vec<u8>, HardwareDerivationError> {
+        match value {
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::Bool(value)) => {
+                Ok(vec![u8::from(*value)])
+            }
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::Int { value, bits }) => {
+                Ok(i256_to_trezor_fixed(value, *bits)?)
+            }
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::Uint { value, bits }) => {
+                Ok(u256_to_trezor_fixed(*value, *bits)?)
+            }
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::Address(value)) => {
+                Ok(value.as_slice().to_vec())
+            }
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::FixedBytes { bytes, .. })
+            | TrezorTypedDataValueRef::Value(HardwareEip712Value::Bytes(bytes)) => {
+                Ok(bytes.clone())
+            }
+            TrezorTypedDataValueRef::Value(HardwareEip712Value::String(value)) => {
+                Ok(value.as_bytes().to_vec())
+            }
+            TrezorTypedDataValueRef::Value(
+                HardwareEip712Value::DynamicArray(values) | HardwareEip712Value::FixedArray(values),
+            ) => Ok(u16::try_from(values.len())
+                .map_err(|_| {
+                    HardwareDerivationError::InvalidDescriptor("Trezor EIP-712 array is too large")
+                })?
+                .to_be_bytes()
+                .to_vec()),
+            TrezorTypedDataValueRef::Struct(_)
+            | TrezorTypedDataValueRef::Value(HardwareEip712Value::Struct(_)) => {
+                Err(HardwareDerivationError::UnexpectedHardwareResponse(
+                    "Trezor requested an EIP-712 struct as a raw value",
+                ))
+            }
+        }
+    }
+
+    fn trezor_typed_data_hash_request(
+        typed_data: &HardwareEip712Model,
+    ) -> trezor_client::protos::EthereumSignTypedHash {
+        let mut request = trezor_client::protos::EthereumSignTypedHash::new();
+        request.set_domain_separator_hash(typed_data.domain_separator_hash().as_slice().to_vec());
+        if let Some(message_hash) = typed_data.message_hash() {
+            request.set_message_hash(message_hash.as_slice().to_vec());
+        }
+        request
+    }
+
+    fn trezor_typed_data_signature_to_alloy(
+        signature: &trezor_client::protos::EthereumTypedDataSignature,
+    ) -> Result<Signature, HardwareDerivationError> {
+        let signature = signature.signature();
+        if signature.len() != 65 {
+            return Err(HardwareDerivationError::UnexpectedResponseLength {
+                got: signature.len(),
+                expected: 65,
+            });
+        }
+        let r = signature
+            .get(0..32)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(HardwareDerivationError::UnexpectedResponseLength {
+                got: signature.len(),
+                expected: 65,
+            })?;
+        let s = signature
+            .get(32..64)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(HardwareDerivationError::UnexpectedResponseLength {
+                got: signature.len(),
+                expected: 65,
+            })?;
+        trezor_signature_to_alloy(trezor_client::client::Signature {
+            r,
+            s,
+            v: u64::from(signature[64]),
+        })
     }
 
     fn trezor_ethereum_get_address_request(
@@ -2600,6 +4215,32 @@ pub mod trezor {
         bytes[value.leading_zeros() / 8..].to_vec()
     }
 
+    fn trezor_integer_byte_size(bits: usize) -> Result<u32, HardwareDerivationError> {
+        if bits == 0 || bits > 256 || bits % 8 != 0 {
+            return Err(HardwareDerivationError::InvalidDescriptor(
+                "Trezor EIP-712 integer size is invalid",
+            ));
+        }
+        Ok(u32::try_from(bits / 8).expect("EIP-712 integer byte size fits in u32"))
+    }
+
+    fn u256_to_trezor_fixed(value: U256, bits: usize) -> Result<Vec<u8>, HardwareDerivationError> {
+        let byte_len = usize::try_from(trezor_integer_byte_size(bits)?)
+            .expect("EIP-712 integer byte size fits in usize");
+        let bytes = value.to_be_bytes::<32>();
+        Ok(bytes[bytes.len() - byte_len..].to_vec())
+    }
+
+    fn i256_to_trezor_fixed(
+        value: &alloy::primitives::I256,
+        bits: usize,
+    ) -> Result<Vec<u8>, HardwareDerivationError> {
+        let byte_len = usize::try_from(trezor_integer_byte_size(bits)?)
+            .expect("EIP-712 integer byte size fits in usize");
+        let bytes = value.to_be_bytes::<32>();
+        Ok(bytes[bytes.len() - byte_len..].to_vec())
+    }
+
     fn trezor_signature_to_alloy(
         signature: trezor_client::client::Signature,
     ) -> Result<Signature, HardwareDerivationError> {
@@ -2635,6 +4276,7 @@ pub mod trezor {
         use std::collections::VecDeque;
         use std::sync::{Arc, Mutex};
 
+        use serde_json::json;
         use trezor_client::protos::MessageType;
 
         use super::*;
@@ -2642,6 +4284,11 @@ pub mod trezor {
         struct QueuedTransport {
             responses: VecDeque<ProtoMessage>,
             writes: Arc<Mutex<Vec<MessageType>>>,
+        }
+
+        struct RecordingTransport {
+            responses: VecDeque<ProtoMessage>,
+            writes: Arc<Mutex<Vec<(MessageType, Vec<u8>)>>>,
         }
 
         impl Transport for QueuedTransport {
@@ -2668,11 +4315,132 @@ pub mod trezor {
             }
         }
 
+        impl Transport for RecordingTransport {
+            fn session_begin(&mut self) -> Result<(), TrezorTransportError> {
+                Ok(())
+            }
+
+            fn session_end(&mut self) -> Result<(), TrezorTransportError> {
+                Ok(())
+            }
+
+            fn write_message(&mut self, message: ProtoMessage) -> Result<(), TrezorTransportError> {
+                let message_type = message.message_type();
+                self.writes
+                    .lock()
+                    .expect("writes lock")
+                    .push((message_type, message.into_payload()));
+                Ok(())
+            }
+
+            fn read_message(&mut self) -> Result<ProtoMessage, TrezorTransportError> {
+                self.responses.pop_front().ok_or_else(|| {
+                    TrezorTransportError::IO(std::io::Error::other("no queued response"))
+                })
+            }
+        }
+
         fn queued_message<M: TrezorMessage>(message: &M) -> ProtoMessage {
             ProtoMessage(
                 M::MESSAGE_TYPE,
                 message.write_to_bytes().expect("encode test message"),
             )
+        }
+
+        fn recording_client(
+            responses: VecDeque<ProtoMessage>,
+            writes: Arc<Mutex<Vec<(MessageType, Vec<u8>)>>>,
+        ) -> TrezorHardwareDerivationClient {
+            let client = trezor_client::client::trezor_with_transport(
+                trezor_client::Model::Trezor,
+                Box::new(RecordingTransport { responses, writes }),
+            );
+            TrezorHardwareDerivationClient {
+                client,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            }
+        }
+
+        fn typed_data_model() -> HardwareEip712Model {
+            HardwareEip712Model::from_walletconnect_typed_data_json(json!({
+                "types": {
+                    "EIP712Domain": [
+                        { "name": "name", "type": "string" },
+                        { "name": "chainId", "type": "uint256" }
+                    ],
+                    "Person": [
+                        { "name": "wallet", "type": "address" },
+                        { "name": "name", "type": "string" }
+                    ],
+                    "Message": [
+                        { "name": "count", "type": "uint256" },
+                        { "name": "person", "type": "Person" },
+                        { "name": "tags", "type": "string[2]" },
+                        { "name": "payload", "type": "bytes" },
+                        { "name": "digest", "type": "bytes32" }
+                    ]
+                },
+                "primaryType": "Message",
+                "domain": {
+                    "name": "RailOxide",
+                    "chainId": 1
+                },
+                "message": {
+                    "count": 128,
+                    "person": {
+                        "wallet": "0x1111111111111111111111111111111111111111",
+                        "name": "Alice"
+                    },
+                    "tags": ["permit", "test"],
+                    "payload": "0x010203",
+                    "digest": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }))
+            .expect("typed-data model")
+        }
+
+        fn reordered_domain_typed_data_model() -> HardwareEip712Model {
+            HardwareEip712Model::from_walletconnect_typed_data_json(json!({
+                "types": {
+                    "EIP712Domain": [
+                        { "name": "chainId", "type": "uint256" },
+                        { "name": "name", "type": "string" }
+                    ],
+                    "Message": [
+                        { "name": "contents", "type": "string" }
+                    ]
+                },
+                "primaryType": "Message",
+                "domain": {
+                    "name": "RailOxide",
+                    "chainId": 1
+                },
+                "message": {
+                    "contents": "hello"
+                }
+            }))
+            .expect("typed-data model")
+        }
+
+        fn trezor_descriptor() -> HardwarePublicAccountDescriptor {
+            HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Trezor,
+                0,
+                0,
+            )
+            .expect("trezor descriptor")
+        }
+
+        fn typed_data_signature() -> trezor_client::protos::EthereumTypedDataSignature {
+            let mut message = trezor_client::protos::EthereumTypedDataSignature::new();
+            let mut signature = Vec::new();
+            signature.extend_from_slice(&[1; 32]);
+            signature.extend_from_slice(&[2; 32]);
+            signature.push(27);
+            message.set_signature(signature);
+            message.set_address("0x1111111111111111111111111111111111111111".to_owned());
+            message
         }
 
         fn test_features(session_id: Option<Vec<u8>>) -> trezor_client::protos::Features {
@@ -2941,6 +4709,318 @@ pub mod trezor {
             let confirmed = trezor_ethereum_get_address_request(&path, true);
             assert_eq!(confirmed.address_n, path.to_vec());
             assert!(confirmed.show_display());
+        }
+
+        #[test]
+        fn trezor_typed_data_struct_ack_encodes_members() {
+            let model = typed_data_model();
+
+            let ack = trezor_typed_data_struct_ack(&model, "Message").expect("struct ack");
+
+            assert_eq!(ack.members.len(), 5);
+            assert_eq!(ack.members[0].name(), "count");
+            assert_eq!(
+                ack.members[0]
+                    .type_
+                    .as_ref()
+                    .expect("count type")
+                    .data_type(),
+                TrezorEthereumDataType::UINT
+            );
+            assert_eq!(
+                ack.members[0].type_.as_ref().expect("count type").size(),
+                32
+            );
+            assert_eq!(ack.members[1].name(), "person");
+            let person_type = ack.members[1].type_.as_ref().expect("person type");
+            assert_eq!(person_type.data_type(), TrezorEthereumDataType::STRUCT);
+            assert_eq!(person_type.size(), 2);
+            assert_eq!(person_type.struct_name(), "Person");
+            let tags_type = ack.members[2].type_.as_ref().expect("tags type");
+            assert_eq!(tags_type.data_type(), TrezorEthereumDataType::ARRAY);
+            assert_eq!(tags_type.size(), 2);
+            assert_eq!(
+                tags_type
+                    .entry_type
+                    .as_ref()
+                    .expect("tags entry type")
+                    .data_type(),
+                TrezorEthereumDataType::STRING
+            );
+        }
+
+        #[test]
+        fn trezor_typed_data_value_ack_resolves_member_paths() {
+            let model = typed_data_model();
+
+            assert_eq!(
+                trezor_typed_data_value(&model, &[0, 0]).expect("domain name"),
+                b"RailOxide"
+            );
+            let chain_id = trezor_typed_data_value(&model, &[0, 1]).expect("chain id");
+            assert_eq!(chain_id.len(), 32);
+            assert_eq!(chain_id[31], 1);
+            let count = trezor_typed_data_value(&model, &[1, 0]).expect("message count");
+            assert_eq!(count.len(), 32);
+            assert_eq!(count[31], 128);
+            assert_eq!(
+                trezor_typed_data_value(&model, &[1, 1, 0]).expect("nested address"),
+                [0x11; 20]
+            );
+            assert_eq!(
+                trezor_typed_data_value(&model, &[1, 2]).expect("array length"),
+                [0, 2]
+            );
+            assert_eq!(
+                trezor_typed_data_value(&model, &[1, 2, 1]).expect("array item"),
+                b"test"
+            );
+            assert_eq!(
+                trezor_typed_data_value(&model, &[1, 3]).expect("payload bytes"),
+                [1, 2, 3]
+            );
+            assert_eq!(
+                trezor_typed_data_value(&model, &[1, 4]).expect("fixed bytes"),
+                [0xaa; 32]
+            );
+        }
+
+        #[test]
+        fn trezor_typed_data_domain_values_follow_canonical_hash_order() {
+            let model = reordered_domain_typed_data_model();
+            let domain_ack =
+                trezor_typed_data_struct_ack(&model, "EIP712Domain").expect("domain ack");
+
+            assert_eq!(domain_ack.members[0].name(), "name");
+            assert_eq!(domain_ack.members[1].name(), "chainId");
+            assert_eq!(
+                trezor_typed_data_value(&model, &[0, 0]).expect("domain name"),
+                b"RailOxide"
+            );
+            let chain_id = trezor_typed_data_value(&model, &[0, 1]).expect("chain id");
+            assert_eq!(chain_id.len(), 32);
+            assert_eq!(chain_id[31], 1);
+        }
+
+        #[test]
+        fn trezor_clear_typed_data_flow_answers_struct_and_value_requests() {
+            let model = typed_data_model();
+            let descriptor = trezor_descriptor();
+            let mut domain_request = trezor_client::protos::EthereumTypedDataStructRequest::new();
+            domain_request.set_name("EIP712Domain".to_owned());
+            let mut message_request = trezor_client::protos::EthereumTypedDataStructRequest::new();
+            message_request.set_name("Message".to_owned());
+            let mut value_request = trezor_client::protos::EthereumTypedDataValueRequest::new();
+            value_request.member_path = vec![1, 0];
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let mut client = recording_client(
+                VecDeque::from([
+                    queued_message(&domain_request),
+                    queued_message(&message_request),
+                    queued_message(&value_request),
+                    queued_message(&typed_data_signature()),
+                ]),
+                Arc::clone(&writes),
+            );
+
+            let signature = client
+                .sign_typed_data_clear(&descriptor, &model)
+                .expect("clear typed-data signature");
+
+            assert_eq!(signature.r(), U256::from_be_slice(&[1; 32]));
+            assert_eq!(signature.s(), U256::from_be_slice(&[2; 32]));
+            let writes = writes.lock().expect("writes lock");
+            assert_eq!(
+                writes
+                    .iter()
+                    .map(|(message_type, _)| *message_type)
+                    .collect::<Vec<_>>(),
+                vec![
+                    MessageType::MessageType_EthereumSignTypedData,
+                    MessageType::MessageType_EthereumTypedDataStructAck,
+                    MessageType::MessageType_EthereumTypedDataStructAck,
+                    MessageType::MessageType_EthereumTypedDataValueAck,
+                ]
+            );
+            let request: trezor_client::protos::EthereumSignTypedData =
+                protobuf::Message::parse_from_bytes(&writes[0].1).expect("sign typed-data request");
+            assert_eq!(request.address_n, descriptor.path);
+            assert_eq!(request.primary_type(), model.primary_type());
+            assert!(request.metamask_v4_compat());
+            let value_ack: trezor_client::protos::EthereumTypedDataValueAck =
+                protobuf::Message::parse_from_bytes(&writes[3].1).expect("value ack");
+            assert_eq!(value_ack.value().len(), 32);
+            assert_eq!(value_ack.value()[31], 128);
+        }
+
+        #[test]
+        fn trezor_hash_typed_data_request_uses_local_hashes() {
+            let model = typed_data_model();
+            let descriptor = trezor_descriptor();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let mut client = recording_client(
+                VecDeque::from([queued_message(&typed_data_signature())]),
+                Arc::clone(&writes),
+            );
+
+            let signature = client
+                .sign_typed_data_hash(&descriptor, &model)
+                .expect("hash typed-data signature");
+
+            assert_eq!(signature.r(), U256::from_be_slice(&[1; 32]));
+            let writes = writes.lock().expect("writes lock");
+            assert_eq!(writes[0].0, MessageType::MessageType_EthereumSignTypedHash);
+            let request: trezor_client::protos::EthereumSignTypedHash =
+                protobuf::Message::parse_from_bytes(&writes[0].1).expect("hash request");
+            assert_eq!(request.address_n, descriptor.path);
+            assert_eq!(
+                request.domain_separator_hash(),
+                model.domain_separator_hash().as_slice()
+            );
+            assert_eq!(
+                request.message_hash(),
+                model.message_hash().expect("message hash").as_slice()
+            );
+        }
+
+        #[test]
+        fn trezor_typed_data_raw_loop_handles_passphrase_pin_and_button() {
+            let model = typed_data_model();
+            let descriptor = trezor_descriptor();
+            let mut passphrase_request = trezor_client::protos::PassphraseRequest::new();
+            passphrase_request.set__on_device(false);
+            let mut pin_request = trezor_client::protos::PinMatrixRequest::new();
+            pin_request.set_type(
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_Current,
+            );
+            let button_request = trezor_client::protos::ButtonRequest::new();
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let pin_requests = Arc::new(Mutex::new(Vec::new()));
+            let mut client = recording_client(
+                VecDeque::from([
+                    queued_message(&passphrase_request),
+                    queued_message(&pin_request),
+                    queued_message(&button_request),
+                    queued_message(&typed_data_signature()),
+                ]),
+                Arc::clone(&writes),
+            );
+            client.set_app_passphrase("app secret".to_owned());
+            let recorded_pin_requests = Arc::clone(&pin_requests);
+            client.set_pin_matrix_provider(Arc::new(move |kind| {
+                recorded_pin_requests
+                    .lock()
+                    .expect("pin requests lock")
+                    .push(kind);
+                Ok(Zeroizing::new("123".to_owned()))
+            }));
+
+            let signature = client
+                .sign_typed_data_hash(&descriptor, &model)
+                .expect("typed-data hash handles interactions");
+
+            assert_eq!(signature.r(), U256::from_be_slice(&[1; 32]));
+            assert_eq!(
+                pin_requests.lock().expect("pin requests lock").as_slice(),
+                &[TrezorPinMatrixRequestKind::Current]
+            );
+            assert!(client.passphrase.app_passphrase.is_none());
+            let writes = writes.lock().expect("writes lock");
+            assert_eq!(
+                writes
+                    .iter()
+                    .map(|(message_type, _)| *message_type)
+                    .collect::<Vec<_>>(),
+                vec![
+                    MessageType::MessageType_EthereumSignTypedHash,
+                    MessageType::MessageType_PassphraseAck,
+                    MessageType::MessageType_PinMatrixAck,
+                    MessageType::MessageType_ButtonAck,
+                ]
+            );
+        }
+
+        #[test]
+        fn trezor_typed_data_failure_response_is_preserved() {
+            let model = typed_data_model();
+            let descriptor = trezor_descriptor();
+            let mut failure = trezor_client::protos::Failure::new();
+            failure.set_code(trezor_client::protos::failure::FailureType::Failure_ActionCancelled);
+            failure.set_message("cancelled".to_owned());
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let mut client = recording_client(
+                VecDeque::from([queued_message(&failure)]),
+                Arc::clone(&writes),
+            );
+
+            let error = client
+                .sign_typed_data_hash(&descriptor, &model)
+                .expect_err("failure response should fail");
+
+            assert!(matches!(
+                error,
+                HardwareDerivationError::Trezor(trezor_client::Error::FailureResponse(_))
+            ));
+        }
+
+        fn test_device_info(model: &str, version: HardwareAppVersion) -> TrezorDeviceInfo {
+            TrezorDeviceInfo {
+                model: model.to_owned(),
+                vendor: "trezor.io".to_owned(),
+                version,
+                initialized: true,
+                unlocked: Some(true),
+                passphrase_protection: false,
+                passphrase_always_on_device: false,
+                bootloader_mode: false,
+            }
+        }
+
+        #[test]
+        fn trezor_typed_data_classification_is_conservative() {
+            let clear = test_device_info("T", HardwareAppVersion::new(2, 4, 3));
+            let safe = test_device_info("T3T1", HardwareAppVersion::new(2, 7, 0));
+            let fallback = test_device_info("1", HardwareAppVersion::new(1, 11, 2));
+            let old_model_one = test_device_info("1", HardwareAppVersion::new(1, 11, 1));
+            let unknown = test_device_info("unknown", HardwareAppVersion::new(2, 8, 0));
+
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&clear),
+                HardwareTypedDataSigningMode::ClearSign
+            );
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&safe),
+                HardwareTypedDataSigningMode::ClearSign
+            );
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&fallback),
+                HardwareTypedDataSigningMode::Eip712HashFallback
+            );
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&old_model_one),
+                HardwareTypedDataSigningMode::Unsupported
+            );
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&unknown),
+                HardwareTypedDataSigningMode::Unsupported
+            );
+        }
+
+        #[test]
+        fn trezor_typed_data_classification_rejects_bootloader_or_uninitialized() {
+            let mut info = test_device_info("T", HardwareAppVersion::new(2, 8, 0));
+            info.bootloader_mode = true;
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&info),
+                HardwareTypedDataSigningMode::Unsupported
+            );
+
+            info.bootloader_mode = false;
+            info.initialized = false;
+            assert_eq!(
+                classify_trezor_typed_data_signing_mode(&info),
+                HardwareTypedDataSigningMode::Unsupported
+            );
         }
     }
 }

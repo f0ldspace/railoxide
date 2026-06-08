@@ -22,14 +22,15 @@ pub use lifecycle::{
     build_walletconnect_disconnect_plan,
 };
 pub use namespace::{
-    WalletConnectNamespaceNegotiation, WalletConnectNamespaceProposal,
-    WalletConnectUnsupportedNamespaceItem, negotiate_walletconnect_namespaces,
+    WalletConnectNamespaceAccountSupport, WalletConnectNamespaceNegotiation,
+    WalletConnectNamespaceProposal, WalletConnectUnsupportedNamespaceItem,
+    negotiate_walletconnect_namespaces, negotiate_walletconnect_namespaces_with_account_support,
 };
 pub use pairing::{
     WalletConnectPairingStart, WalletConnectProposalRejectionReason, WalletConnectProposalSummary,
     WalletConnectSessionApproval, WalletConnectSessionProposal, approve_walletconnect_session,
-    decode_walletconnect_session_proposal, reject_walletconnect_session_proposal,
-    start_walletconnect_pairing,
+    approve_walletconnect_session_with_account_support, decode_walletconnect_session_proposal,
+    reject_walletconnect_session_proposal, start_walletconnect_pairing,
 };
 pub use relay::{
     WALLETCONNECT_DEFAULT_PROJECT_ID, WALLETCONNECT_RELAY_RPC_URL, WALLETCONNECT_RELAY_URL,
@@ -45,6 +46,7 @@ pub use request::{
     WalletConnectRequestValidation, build_walletconnect_jsonrpc_error,
     build_walletconnect_session_event, handle_walletconnect_lifecycle_request,
     parse_walletconnect_session_request, validate_walletconnect_session_request,
+    validate_walletconnect_session_request_with_account_support,
 };
 pub use session::{
     WC_SESSION_PROPOSE, WC_SESSION_PROPOSE_RESPONSE_TAG, WC_SESSION_SETTLE,

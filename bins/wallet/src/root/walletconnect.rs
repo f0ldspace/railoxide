@@ -32,30 +32,37 @@ use wallet_ops::{
     HardwareTrezorPinMatrixProvider, HttpContext, PublicActionGasFeeSelection,
     PublicActionSessionEvent, PublicActionSessionEventSender, PublicBalanceSnapshot,
     TokenAnchorRateCache, WALLETCONNECT_DEFAULT_PROJECT_ID, WalletConnectErc20CallSummary,
-    WalletConnectError, WalletConnectEvmTransaction, WalletConnectJsonRpcRequest,
+    WalletConnectError, WalletConnectEvmTransaction,
+    WalletConnectHardwareTypedDataCapabilityRequest, WalletConnectJsonRpcRequest,
     WalletConnectJsonRpcResponse, WalletConnectLifecycleRequestOutcome,
-    WalletConnectNamespaceNegotiation, WalletConnectPairingUri, WalletConnectParsedRequest,
-    WalletConnectPendingRequest, WalletConnectPersonalSignRequest,
-    WalletConnectProposalRejectionReason, WalletConnectRelayClient, WalletConnectRelayClientAuth,
-    WalletConnectRelayConfig, WalletConnectRelayRpc, WalletConnectRelaySocket,
-    WalletConnectRelayStep, WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
+    WalletConnectNamespaceAccountSupport, WalletConnectNamespaceNegotiation,
+    WalletConnectPairingUri, WalletConnectParsedRequest, WalletConnectPendingRequest,
+    WalletConnectPersonalSignRequest, WalletConnectProposalRejectionReason,
+    WalletConnectRelayClient, WalletConnectRelayClientAuth, WalletConnectRelayConfig,
+    WalletConnectRelayRpc, WalletConnectRelaySocket, WalletConnectRelayStep,
+    WalletConnectRelaySubscriptionPayload, WalletConnectRequestErrorKind,
     WalletConnectSendTransactionRequest, WalletConnectSessionProposal,
-    WalletConnectSupportedMethod, WalletConnectTypedDataSignRequest, approve_walletconnect_session,
-    build_walletconnect_disconnect_plan, build_walletconnect_jsonrpc_error,
-    build_walletconnect_session_event, decode_walletconnect_message,
-    decode_walletconnect_session_proposal, encode_walletconnect_message,
-    handle_walletconnect_lifecycle_request, negotiate_walletconnect_namespaces,
-    parse_walletconnect_session_request, reject_walletconnect_session_proposal,
+    WalletConnectSupportedMethod, WalletConnectTypedDataSignRequest,
+    approve_walletconnect_session_with_account_support, build_walletconnect_disconnect_plan,
+    build_walletconnect_jsonrpc_error, build_walletconnect_session_event,
+    decode_walletconnect_message, decode_walletconnect_session_proposal,
+    encode_walletconnect_message, handle_walletconnect_lifecycle_request,
+    hardware::HardwareTypedDataSigningMode,
+    is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required,
+    negotiate_walletconnect_namespaces_with_account_support, parse_walletconnect_session_request,
+    reject_walletconnect_session_proposal,
     settings::EffectiveChainConfig,
     start_walletconnect_pairing, submit_walletconnect_send_transaction,
-    validate_walletconnect_session_request,
+    validate_walletconnect_session_request_with_account_support,
     vault::{
-        DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountSource,
-        PublicAccountStatus, WalletConnectPeerMetadata, WalletConnectRelayIdentity,
-        WalletConnectSessionAccountResolution, WalletConnectSessionLifecycleState,
-        WalletConnectSessionRecord,
+        DesktopVaultStore, DesktopViewSession, HardwareProfileSession, PublicAccountMetadata,
+        PublicAccountSource, PublicAccountStatus, WalletConnectPeerMetadata,
+        WalletConnectRelayIdentity, WalletConnectSessionAccountResolution,
+        WalletConnectSessionLifecycleState, WalletConnectSessionRecord,
     },
-    walletconnect_sign_personal_message, walletconnect_sign_typed_data_v4,
+    walletconnect_hardware_typed_data_hash_fallback_confirmation_session,
+    walletconnect_probe_hardware_typed_data_signing_mode, walletconnect_sign_personal_message,
+    walletconnect_sign_typed_data_v4,
 };
 use zeroize::Zeroizing;
 
@@ -650,6 +657,9 @@ struct WalletConnectRequestApprovalOutcome {
     relay_error: Option<String>,
     request_error: Option<String>,
     expired: bool,
+    hash_fallback_confirmation_required: bool,
+    #[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+    refreshed_hardware_session: Option<HardwareProfileSession>,
 }
 
 impl WalletConnectRequestApprovalOutcome {
@@ -665,6 +675,52 @@ impl WalletConnectRequestApprovalOutcome {
             relay_error,
             request_error: None,
             expired: true,
+            hash_fallback_confirmation_required: false,
+            refreshed_hardware_session: None,
         }
+    }
+
+    fn hash_fallback_confirmation_required(
+        refreshed_hardware_session: Option<HardwareProfileSession>,
+    ) -> Self {
+        Self {
+            authorization_failed: false,
+            response_published: false,
+            submitted_tx_hash: None,
+            relay_error: None,
+            request_error: None,
+            expired: false,
+            hash_fallback_confirmation_required: true,
+            refreshed_hardware_session,
+        }
+    }
+}
+
+fn walletconnect_request_uses_hardware_typed_data_hash_fallback(
+    request: &WalletConnectRequestUi,
+    mode: HardwareTypedDataSigningMode,
+) -> bool {
+    request.account_source == PublicAccountSource::HardwareDerived
+        && request.item.method == WalletConnectSupportedMethod::EthSignTypedDataV4
+        && mode.requires_hash_fallback_warning()
+}
+
+const fn walletconnect_request_approve_label(
+    in_flight: bool,
+    hardware_request: bool,
+    hash_fallback: bool,
+) -> &'static str {
+    if in_flight {
+        if hardware_request {
+            "Waiting for device..."
+        } else {
+            "Approving..."
+        }
+    } else if hash_fallback {
+        "Continue with hash fallback"
+    } else if hardware_request {
+        "Approve on device"
+    } else {
+        "Approve"
     }
 }

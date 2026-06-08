@@ -5,6 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use wallet_ops::WalletConnectNamespaceProposal;
+use wallet_ops::hardware::{
+    HardwareDerivationDescriptor, HardwareDeviceKind, HardwarePublicAccountDescriptor,
+    HardwareViewAccessKey, HardwareWalletSyncIntent, parse_bip32_path,
+};
 use wallet_ops::vault::{
     KdfParams, PublicAccountScope, WalletConnectApprovedNamespace, WalletConnectSessionKeys,
     WalletSource,
@@ -447,6 +451,7 @@ async fn expired_pairing_relay_output_removes_pairing_without_decoding() {
     assert_eq!(result.removed_pairings, vec![expired_topic.to_owned()]);
     assert!(result.error.is_none());
 
+    drop(view_session);
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -576,6 +581,7 @@ fn unsupported_required_namespaces_reject_as_unsupported() {
     let reason = walletconnect_proposal_rejection_reason(
         &proposal,
         Some(&account),
+        None,
         &BTreeSet::from([1]),
         10,
     );
@@ -599,6 +605,30 @@ fn hardware_typed_data_error_maps_to_unsupported_method() {
         walletconnect_request_approval_error_kind(&request, &error),
         WalletConnectRequestErrorKind::UnsupportedMethod
     );
+}
+
+#[test]
+fn hardware_typed_data_recovery_mismatch_maps_to_error_response() {
+    let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
+    request.account_source = PublicAccountSource::HardwareDerived;
+    let error = eyre::eyre!(
+        "hardware public signer address mismatch: expected 0x1111111111111111111111111111111111111111, got 0x2222222222222222222222222222222222222222"
+    );
+
+    let response = build_walletconnect_jsonrpc_error(
+        request.item.id,
+        walletconnect_request_approval_error_kind(&request, &error),
+        format_report_chain(&error),
+    );
+
+    assert!(response.result.is_none());
+    let error = response.error.expect("error response");
+    assert_eq!(
+        error.code,
+        WalletConnectRequestErrorKind::UnsupportedMethod.code()
+    );
+    assert!(error.message.contains("address mismatch"));
 }
 
 #[test]
@@ -846,6 +876,153 @@ fn walletconnect_personal_sign_progress_starts_at_device_approval() {
 }
 
 #[test]
+fn walletconnect_typed_data_hardware_progress_starts_at_device_approval() {
+    let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+    request.account_source = PublicAccountSource::HardwareDerived;
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
+    request.parsed = WalletConnectParsedRequest::EthSignTypedDataV4 {
+        account: request.item.account,
+        typed_data: json!({}),
+        domain_chain_id: Some(U256::from(1_u64)),
+    };
+
+    let progress = WalletConnectApprovalProgress::new(4, &request);
+
+    assert_eq!(
+        progress
+            .steps
+            .iter()
+            .map(|step| step.step)
+            .collect::<Vec<_>>(),
+        vec![
+            WalletConnectApprovalProgressStep::ApproveOnDevice,
+            WalletConnectApprovalProgressStep::RespondToDapp,
+        ]
+    );
+    assert_eq!(progress.steps[0].status, PublicActionStepStatus::Pending);
+    assert_eq!(progress.steps[1].status, PublicActionStepStatus::NotStarted);
+}
+
+#[test]
+fn walletconnect_hash_fallback_warning_uses_explicit_continue_label() {
+    let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+    request.account_source = PublicAccountSource::HardwareDerived;
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
+
+    assert!(
+        !walletconnect_request_uses_hardware_typed_data_hash_fallback(
+            &request,
+            HardwareTypedDataSigningMode::ClearSign,
+        )
+    );
+    assert_eq!(
+        walletconnect_request_approve_label(false, true, false),
+        "Approve on device"
+    );
+    assert!(
+        walletconnect_request_uses_hardware_typed_data_hash_fallback(
+            &request,
+            HardwareTypedDataSigningMode::Eip712HashFallback,
+        )
+    );
+    assert_eq!(
+        walletconnect_request_approve_label(false, true, true),
+        "Continue with hash fallback"
+    );
+    assert_eq!(
+        walletconnect_request_approve_label(true, true, true),
+        "Waiting for device..."
+    );
+}
+
+#[test]
+fn walletconnect_hash_fallback_mode_uses_request_session_account() {
+    let (root_dir, store) = walletconnect_test_store();
+    let wallet_id = "wc-hardware-fallback-mode";
+    let profile_fingerprint = "ledger:evm:0x1111111111111111111111111111111111111111";
+    let descriptor = HardwareDerivationDescriptor::ledger_eip1024_v1(
+        parse_bip32_path("m/44'/60'/0'/0/0").expect("hardware path"),
+        0,
+        profile_fingerprint.to_owned(),
+        HardwareWalletSyncIntent::CreateNew,
+    );
+    let metadata = store
+        .new_hardware_wallet_metadata(TEST_PASSWORD, wallet_id, "Hardware wallet", descriptor)
+        .expect("hardware metadata");
+    let view_key = HardwareViewAccessKey::new([9u8; 32]);
+    store
+        .store_hardware_derived_wallet_from_entropy_with_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            0,
+            &[7u8; 32],
+            &metadata,
+            &view_key,
+        )
+        .expect("store hardware wallet");
+    let mut hardware_session = store
+        .hardware_profile_session_for_fingerprint(
+            TEST_PASSWORD,
+            HardwareDeviceKind::Ledger,
+            profile_fingerprint,
+            None,
+        )
+        .expect("hardware profile session");
+    let public_descriptor =
+        HardwarePublicAccountDescriptor::for_wallet_public_index(HardwareDeviceKind::Ledger, 0, 0)
+            .expect("hardware public descriptor");
+    hardware_session
+        .cache_typed_data_signing_mode(
+            &public_descriptor,
+            HardwareTypedDataSigningMode::Eip712HashFallback,
+        )
+        .expect("cache fallback mode");
+    let view_session = store
+        .load_hardware_view_session(TEST_PASSWORD, &hardware_session, wallet_id, &view_key)
+        .expect("hardware view session");
+    let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+    request.account_source = PublicAccountSource::HardwareDerived;
+    request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
+    request.session.selected_public_account_uuid = "hardware-account-a".to_owned();
+    request.session.selected_public_account_scope = PublicAccountScope::Global;
+    let other_account = PublicAccountMetadata {
+        public_account_uuid: "selected-account-b".to_owned(),
+        address: alloy::primitives::Address::from([0x22; 20]),
+        label: None,
+        source: PublicAccountSource::Imported,
+        scope: PublicAccountScope::Global,
+        derivation_index: None,
+        hardware_descriptor: None,
+        status: PublicAccountStatus::Active,
+        display_order: 0,
+    };
+    let request_account = PublicAccountMetadata {
+        public_account_uuid: "hardware-account-a".to_owned(),
+        address: request.item.account,
+        label: None,
+        source: PublicAccountSource::HardwareDerived,
+        scope: PublicAccountScope::Global,
+        derivation_index: Some(0),
+        hardware_descriptor: Some(public_descriptor),
+        status: PublicAccountStatus::Active,
+        display_order: 1,
+    };
+    let public_accounts = vec![other_account, request_account];
+
+    assert_eq!(
+        walletconnect_hardware_typed_data_mode_for_request(
+            &request,
+            &public_accounts,
+            Some(&view_session),
+        ),
+        HardwareTypedDataSigningMode::Eip712HashFallback
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
 fn walletconnect_personal_sign_progress_fails_response_after_device_approval() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
     request.parsed = WalletConnectParsedRequest::PersonalSign {
@@ -886,6 +1063,8 @@ fn walletconnect_completed_transaction_result_keeps_copyable_tx_hash() {
         relay_error: None,
         request_error: None,
         expired: false,
+        hash_fallback_confirmation_required: false,
+        refreshed_hardware_session: None,
     };
 
     let completed = WalletConnectCompletedRequestUi::from_outcome(request, &outcome);
@@ -911,6 +1090,8 @@ fn walletconnect_completed_transaction_result_warns_when_response_publish_fails(
         relay_error: Some("relay response timed out".to_owned()),
         request_error: None,
         expired: false,
+        hash_fallback_confirmation_required: false,
+        refreshed_hardware_session: None,
     };
 
     let completed = WalletConnectCompletedRequestUi::from_outcome(request, &outcome);
@@ -933,6 +1114,8 @@ fn walletconnect_completed_request_error_is_not_shown_as_approved() {
         relay_error: None,
         request_error: Some("Trezor ActionCancelled".to_owned()),
         expired: false,
+        hash_fallback_confirmation_required: false,
+        refreshed_hardware_session: None,
     };
 
     let completed = WalletConnectCompletedRequestUi::from_outcome(request, &outcome);
@@ -946,6 +1129,17 @@ fn walletconnect_completed_request_error_is_not_shown_as_approved() {
         completed.message.as_ref(),
         "Request was not approved; error response published to the dapp."
     );
+}
+
+#[test]
+fn walletconnect_hash_fallback_confirmation_outcome_is_local_retry() {
+    let outcome = WalletConnectRequestApprovalOutcome::hash_fallback_confirmation_required(None);
+
+    assert!(outcome.hash_fallback_confirmation_required);
+    assert!(!outcome.response_published);
+    assert!(outcome.submitted_tx_hash.is_none());
+    assert!(outcome.relay_error.is_none());
+    assert!(outcome.request_error.is_none());
 }
 
 #[test]
@@ -1756,6 +1950,7 @@ async fn expired_approval_task_publishes_expired_response() {
             None,
             context,
             http,
+            false,
             None,
         )
         .await

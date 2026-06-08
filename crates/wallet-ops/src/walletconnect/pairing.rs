@@ -16,8 +16,8 @@ use super::crypto::{
     derive_walletconnect_session_topic, generate_walletconnect_key_pair,
 };
 use super::namespace::{
-    WalletConnectNamespaceNegotiation, WalletConnectNamespaceProposal,
-    negotiate_walletconnect_namespaces,
+    WalletConnectNamespaceAccountSupport, WalletConnectNamespaceNegotiation,
+    WalletConnectNamespaceProposal, negotiate_walletconnect_namespaces_with_account_support,
 };
 use super::relay::{
     WalletConnectJsonRpcError, WalletConnectJsonRpcRequest, WalletConnectJsonRpcResponse,
@@ -169,6 +169,28 @@ pub fn approve_walletconnect_session(
     session_uuid: impl Into<String>,
     now_unix_seconds: u64,
 ) -> Result<WalletConnectSessionApproval> {
+    approve_walletconnect_session_with_account_support(
+        proposal,
+        pairing_sym_key,
+        relay_identity,
+        selected_account,
+        WalletConnectNamespaceAccountSupport::for_account_source(selected_account.source),
+        supported_chain_ids,
+        session_uuid,
+        now_unix_seconds,
+    )
+}
+
+pub fn approve_walletconnect_session_with_account_support(
+    proposal: &WalletConnectSessionProposal,
+    pairing_sym_key: &[u8; 32],
+    relay_identity: &WalletConnectRelayIdentity,
+    selected_account: &PublicAccountMetadata,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
+    supported_chain_ids: &BTreeSet<u64>,
+    session_uuid: impl Into<String>,
+    now_unix_seconds: u64,
+) -> Result<WalletConnectSessionApproval> {
     if proposal.is_expired(now_unix_seconds) {
         return Err(WalletConnectError::ExpiredUri);
     }
@@ -178,12 +200,12 @@ pub fn approve_walletconnect_session(
         ));
     }
 
-    let negotiation = negotiate_walletconnect_namespaces(
+    let negotiation = negotiate_walletconnect_namespaces_with_account_support(
         &proposal.required_namespaces,
         &proposal.optional_namespaces,
         supported_chain_ids,
         selected_account.address,
-        selected_account.source,
+        selected_account_support,
     )?;
 
     let proposer_public_key = parse_hex_32(&proposal.proposer_public_key)?;

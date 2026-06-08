@@ -182,12 +182,14 @@ impl WalletRoot {
         proposal: &WalletConnectSessionProposal,
         selected_account: &PublicAccountMetadata,
     ) -> Result<WalletConnectNamespaceNegotiation, WalletConnectError> {
-        negotiate_walletconnect_namespaces(
+        let account_support =
+            walletconnect_namespace_account_support(selected_account, self.view_session.as_deref());
+        negotiate_walletconnect_namespaces_with_account_support(
             &proposal.required_namespaces,
             &proposal.optional_namespaces,
             &self.supported_walletconnect_chain_ids(),
             selected_account.address,
-            selected_account.source,
+            account_support,
         )
     }
 
@@ -201,10 +203,38 @@ impl WalletRoot {
         let selected_account = self.selected_walletconnect_public_account();
         let negotiation = selected_account
             .map(|account| self.walletconnect_proposal_negotiation(&proposal.proposal, account));
+        let typed_data_probe_can_satisfy = selected_account.is_some_and(|account| {
+            #[cfg(feature = "hardware")]
+            {
+                account.source == PublicAccountSource::HardwareDerived
+                    && walletconnect_proposal_requests_hardware_typed_data(&proposal.proposal)
+                    && !walletconnect_namespace_account_support(
+                        account,
+                        self.view_session.as_deref(),
+                    )
+                    .hardware_typed_data_signing_mode
+                    .is_supported()
+                    && negotiate_walletconnect_namespaces_with_account_support(
+                        &proposal.proposal.required_namespaces,
+                        &proposal.proposal.optional_namespaces,
+                        &self.supported_walletconnect_chain_ids(),
+                        account.address,
+                        WalletConnectNamespaceAccountSupport::hardware(
+                            HardwareTypedDataSigningMode::ClearSign,
+                        ),
+                    )
+                    .is_ok()
+            }
+            #[cfg(not(feature = "hardware"))]
+            {
+                let _ = account;
+                false
+            }
+        });
         let can_approve = !expired
             && selected_account
                 .is_some_and(|account| account.status == PublicAccountStatus::Active)
-            && matches!(&negotiation, Some(Ok(_)))
+            && (matches!(&negotiation, Some(Ok(_))) || typed_data_probe_can_satisfy)
             && !self.walletconnect.approving_proposal;
         let approve_root = root.clone();
         let reject_root = root.clone();
@@ -221,7 +251,9 @@ impl WalletRoot {
                 selected_label,
             ))
             .child(walletconnect_privacy_notices());
-        if let Some(Err(error)) = &negotiation {
+        if let Some(Err(error)) = &negotiation
+            && !typed_data_probe_can_satisfy
+        {
             card = card.child(
                 Alert::warning(
                     "walletconnect-unsupported-required",
@@ -300,6 +332,47 @@ impl WalletRoot {
             cx.notify();
             return;
         };
+        if self.walletconnect_proposal_needs_hardware_typed_data_probe(
+            &proposal_ui.proposal,
+            &selected_account,
+            view_session.as_ref(),
+        ) {
+            self.probe_hardware_typed_data_for_proposal_then_approve(
+                proposal_ui,
+                selected_account,
+                store,
+                view_session,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.approve_walletconnect_proposal_with_current_support(window, cx);
+    }
+
+    fn approve_walletconnect_proposal_with_current_support(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.walletconnect.approving_proposal {
+            return;
+        }
+        let Some(proposal_ui) = self.walletconnect.pending_proposal.clone() else {
+            return;
+        };
+        let Some(selected_account) = self.selected_walletconnect_public_account().cloned() else {
+            self.walletconnect.error = Some(Arc::from("Select an active Public account first"));
+            cx.notify();
+            return;
+        };
+        let (Some(store), Some(view_session)) =
+            (self.vault_store.clone(), self.view_session.clone())
+        else {
+            self.walletconnect.error = Some(Arc::from("Unlock a wallet before connecting"));
+            cx.notify();
+            return;
+        };
         let context = match self.walletconnect_client_context(cx) {
             Ok(context) => context,
             Err(error) => {
@@ -320,11 +393,14 @@ impl WalletRoot {
                 }
             };
         let session_uuid = walletconnect_session_uuid(&proposal_ui.proposal);
-        let approval = match approve_walletconnect_session(
+        let selected_account_support =
+            walletconnect_namespace_account_support(&selected_account, Some(view_session.as_ref()));
+        let approval = match approve_walletconnect_session_with_account_support(
             &proposal_ui.proposal,
             &proposal_ui.pairing.sym_key,
             &relay_identity,
             &selected_account,
+            selected_account_support,
             &self.supported_walletconnect_chain_ids(),
             session_uuid,
             current_unix_seconds(),
@@ -448,6 +524,152 @@ impl WalletRoot {
         cx.notify();
     }
 
+    fn walletconnect_proposal_needs_hardware_typed_data_probe(
+        &self,
+        proposal: &WalletConnectSessionProposal,
+        selected_account: &PublicAccountMetadata,
+        view_session: &DesktopViewSession,
+    ) -> bool {
+        #[cfg(feature = "hardware")]
+        {
+            selected_account.source == PublicAccountSource::HardwareDerived
+                && walletconnect_proposal_requests_hardware_typed_data(proposal)
+                && !walletconnect_namespace_account_support(selected_account, Some(view_session))
+                    .hardware_typed_data_signing_mode
+                    .is_supported()
+        }
+        #[cfg(not(feature = "hardware"))]
+        {
+            let _ = (proposal, selected_account, view_session);
+            false
+        }
+    }
+
+    fn probe_hardware_typed_data_for_proposal_then_approve(
+        &mut self,
+        proposal_ui: WalletConnectProposalUi,
+        selected_account: PublicAccountMetadata,
+        vault_store: Arc<DesktopVaultStore>,
+        view_session: Arc<DesktopViewSession>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
+            self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
+        });
+        #[cfg(not(feature = "hardware"))]
+        let trezor_app_passphrase = None;
+        #[cfg(feature = "hardware")]
+        let trezor_pin_matrix_provider =
+            Some(self.trezor_pin_matrix_provider_for_operation(window, cx));
+        #[cfg(not(feature = "hardware"))]
+        let trezor_pin_matrix_provider = None;
+        self.walletconnect.approving_proposal = true;
+        self.walletconnect.error = None;
+        self.walletconnect.status = Some(Arc::from(
+            "Checking WalletConnect hardware typed-data support...",
+        ));
+        let typed_data_required =
+            walletconnect_proposal_requests_required_typed_data(&proposal_ui.proposal);
+        let selected_account_uuid = selected_account.public_account_uuid.clone();
+        let public_account_uuid = selected_account_uuid.clone();
+        let join = self.runtime.spawn(async move {
+            walletconnect_probe_hardware_typed_data_signing_mode(
+                WalletConnectHardwareTypedDataCapabilityRequest {
+                    view_session,
+                    vault_store,
+                    trezor_app_passphrase,
+                    trezor_pin_matrix_provider,
+                    public_account_uuid,
+                },
+            )
+            .await
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = join.await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                root.walletconnect.approving_proposal = false;
+                let pending_matches = root
+                    .walletconnect
+                    .pending_proposal
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.proposal.id == proposal_ui.proposal.id
+                            && pending.proposal.pairing_topic == proposal_ui.proposal.pairing_topic
+                    });
+                let account_matches = root
+                    .selected_walletconnect_public_account()
+                    .is_some_and(|account| {
+                        account.public_account_uuid.as_str() == selected_account_uuid.as_str()
+                    });
+                if !pending_matches || !account_matches {
+                    cx.notify();
+                    return;
+                }
+                let mut continue_approval = true;
+                match result {
+                    Ok(Ok(result)) if result.mode.is_supported() => {
+                        if let Some(session) = result.refreshed_hardware_session {
+                            #[cfg(feature = "hardware")]
+                            root.refresh_active_hardware_profile_session(session, cx);
+                            #[cfg(not(feature = "hardware"))]
+                            let _ = session;
+                        }
+                        root.walletconnect.status = Some(Arc::from(
+                            "WalletConnect hardware typed-data support verified.",
+                        ));
+                    }
+                    Ok(Ok(_)) => {
+                        if typed_data_required {
+                            root.walletconnect.error = Some(Arc::from(
+                                "The connected hardware session does not support WalletConnect typed-data signing.",
+                            ));
+                            continue_approval = false;
+                        } else {
+                            root.walletconnect.status = Some(Arc::from(
+                                "WalletConnect hardware typed-data support is unavailable; connecting without typed-data.",
+                            ));
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        root.discard_active_trezor_session_if_stale(&format_report_chain(&error), cx);
+                        if typed_data_required {
+                            root.walletconnect.error = Some(Arc::from(format!(
+                                "Could not check hardware typed-data support: {}",
+                                format_report_chain(&error)
+                            )));
+                            continue_approval = false;
+                        } else {
+                            root.walletconnect.status = Some(Arc::from(
+                                "WalletConnect hardware typed-data support could not be checked; connecting without typed-data.",
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if typed_data_required {
+                            root.walletconnect.error = Some(Arc::from(format!(
+                                "Hardware typed-data support check failed: {error}"
+                            )));
+                            continue_approval = false;
+                        } else {
+                            root.walletconnect.status = Some(Arc::from(
+                                "WalletConnect hardware typed-data support check failed; connecting without typed-data.",
+                            ));
+                        }
+                    }
+                }
+                if continue_approval {
+                    root.approve_walletconnect_proposal_with_current_support(window, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(in crate::root::walletconnect) fn reject_walletconnect_proposal(
         &mut self,
         cx: &mut Context<'_, Self>,
@@ -468,6 +690,9 @@ impl WalletRoot {
         let reason = walletconnect_proposal_rejection_reason(
             &proposal_ui.proposal,
             self.selected_walletconnect_public_account(),
+            self.selected_walletconnect_public_account().map(|account| {
+                walletconnect_namespace_account_support(account, self.view_session.as_deref())
+            }),
             &supported_chain_ids,
             now,
         );

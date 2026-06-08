@@ -1004,6 +1004,102 @@ fn hardware_profile_session_rejects_wrong_profile_and_discards_trezor_session() 
 }
 
 #[test]
+fn hardware_profile_session_typed_data_capability_is_runtime_scoped() {
+    let mut session = HardwareProfileSession::unmatched(
+        HardwareDeviceKind::Trezor,
+        HardwareProfileBinding::evm_address_fingerprint(
+            "trezor:evm:0x1111111111111111111111111111111111111111",
+        ),
+        Some(vec![1, 2, 3]),
+    );
+    let descriptor =
+        HardwarePublicAccountDescriptor::for_wallet_public_index(HardwareDeviceKind::Trezor, 0, 0)
+            .expect("trezor descriptor");
+    let other_account =
+        HardwarePublicAccountDescriptor::for_wallet_public_index(HardwareDeviceKind::Trezor, 0, 1)
+            .expect("other trezor descriptor");
+
+    assert_eq!(session.typed_data_signing_mode(&descriptor), None);
+    session
+        .cache_typed_data_signing_mode(
+            &descriptor,
+            crate::hardware::HardwareTypedDataSigningMode::ClearSign,
+        )
+        .expect("cache typed-data mode");
+
+    assert_eq!(
+        session.typed_data_signing_mode(&descriptor),
+        Some(crate::hardware::HardwareTypedDataSigningMode::ClearSign)
+    );
+    assert_eq!(session.typed_data_signing_mode(&other_account), None);
+
+    session.trezor_session_id = Some(vec![4, 5, 6]);
+    assert_eq!(session.typed_data_signing_mode(&descriptor), None);
+
+    session
+        .cache_typed_data_signing_mode(
+            &descriptor,
+            crate::hardware::HardwareTypedDataSigningMode::Eip712HashFallback,
+        )
+        .expect("cache refreshed typed-data mode");
+    assert_eq!(
+        session.typed_data_signing_mode(&descriptor),
+        Some(crate::hardware::HardwareTypedDataSigningMode::Eip712HashFallback)
+    );
+    session.discard_trezor_session();
+    assert_eq!(session.typed_data_signing_mode(&descriptor), None);
+}
+
+#[test]
+fn hardware_profile_session_downgrades_clear_typed_data_capability_to_hash_fallback() {
+    let mut session = HardwareProfileSession::unmatched(
+        HardwareDeviceKind::Ledger,
+        HardwareProfileBinding::evm_address_fingerprint(
+            "ledger:evm:0x1111111111111111111111111111111111111111",
+        ),
+        None,
+    );
+    let descriptor =
+        HardwarePublicAccountDescriptor::for_wallet_public_index(HardwareDeviceKind::Ledger, 0, 0)
+            .expect("ledger descriptor");
+    let other_account =
+        HardwarePublicAccountDescriptor::for_wallet_public_index(HardwareDeviceKind::Ledger, 0, 1)
+            .expect("other ledger descriptor");
+
+    assert!(
+        !session
+            .downgrade_typed_data_signing_mode_to_hash_fallback(&descriptor)
+            .expect("downgrade without cache")
+    );
+    session
+        .cache_typed_data_signing_mode(
+            &descriptor,
+            crate::hardware::HardwareTypedDataSigningMode::ClearSign,
+        )
+        .expect("cache clear mode");
+
+    assert!(
+        !session
+            .downgrade_typed_data_signing_mode_to_hash_fallback(&other_account)
+            .expect("downgrade mismatched cache")
+    );
+    assert!(
+        session
+            .downgrade_typed_data_signing_mode_to_hash_fallback(&descriptor)
+            .expect("downgrade clear mode")
+    );
+    assert_eq!(
+        session.typed_data_signing_mode(&descriptor),
+        Some(crate::hardware::HardwareTypedDataSigningMode::Eip712HashFallback)
+    );
+    assert!(
+        !session
+            .downgrade_typed_data_signing_mode_to_hash_fallback(&descriptor)
+            .expect("downgrade fallback mode")
+    );
+}
+
+#[test]
 fn view_session_clone_with_hardware_profile_session_refreshes_trezor_session() {
     let (root_dir, db, store) = desktop_store_with_vault();
     let wallet_id = "trezor-session-refresh-wallet";

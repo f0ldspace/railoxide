@@ -13,7 +13,9 @@ use crate::vault::{
 };
 
 use super::eip155::WalletConnectSupportedMethod;
-use super::namespace::walletconnect_method_supported_for_account_source;
+use super::namespace::{
+    WalletConnectNamespaceAccountSupport, walletconnect_method_supported_for_account_support,
+};
 use super::relay::{
     WalletConnectJsonRpcError, WalletConnectJsonRpcRequest, WalletConnectJsonRpcResponse,
 };
@@ -237,6 +239,41 @@ pub fn validate_walletconnect_session_request(
     expiry_timestamp: Option<u64>,
     now_unix_seconds: u64,
 ) -> Result<WalletConnectRequestValidation> {
+    let selected_account_support = match account_resolution {
+        WalletConnectSessionAccountResolution::Usable(account) => {
+            WalletConnectNamespaceAccountSupport::for_account_source(account.source)
+        }
+        WalletConnectSessionAccountResolution::TemporarilyPausedWrongPrivateWallet { .. }
+        | WalletConnectSessionAccountResolution::InvalidPublicAccount => {
+            WalletConnectNamespaceAccountSupport::for_account_source(
+                crate::vault::PublicAccountSource::Derived,
+            )
+        }
+    };
+    validate_walletconnect_session_request_with_account_support(
+        session,
+        account_resolution,
+        selected_account_support,
+        topic,
+        id,
+        chain_id,
+        request,
+        expiry_timestamp,
+        now_unix_seconds,
+    )
+}
+
+pub fn validate_walletconnect_session_request_with_account_support(
+    session: &WalletConnectSessionRecord,
+    account_resolution: &WalletConnectSessionAccountResolution,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
+    topic: &str,
+    id: u64,
+    chain_id: &str,
+    request: WalletConnectParsedRequest,
+    expiry_timestamp: Option<u64>,
+    now_unix_seconds: u64,
+) -> Result<WalletConnectRequestValidation> {
     if topic != session.session_topic {
         return Err(WalletConnectError::Relay(
             "request topic does not match session".to_owned(),
@@ -271,8 +308,10 @@ pub fn validate_walletconnect_session_request(
     let request_chain_id = parse_caip2_eip155_chain(chain_id)
         .ok_or_else(|| WalletConnectError::UnsupportedChain(chain_id.to_owned()))?;
     ensure_method_approved(session, chain_id, request.method())?;
-    if !walletconnect_method_supported_for_account_source(request.method(), selected_account.source)
-    {
+    if !walletconnect_approved_request_method_supported_for_account_support(
+        request.method(),
+        selected_account_support,
+    ) {
         return Err(WalletConnectError::UnsupportedMethod(
             request.method().as_str().to_owned(),
         ));
@@ -350,6 +389,27 @@ pub fn validate_walletconnect_session_request(
         account,
         approval_item,
     })
+}
+
+const fn walletconnect_approved_request_method_supported_for_account_support(
+    method: WalletConnectSupportedMethod,
+    selected_account_support: WalletConnectNamespaceAccountSupport,
+) -> bool {
+    if walletconnect_method_supported_for_account_support(method, selected_account_support) {
+        return true;
+    }
+    matches!(
+        (
+            method,
+            selected_account_support.account_source,
+            selected_account_support.hardware_typed_data_capability_known,
+        ),
+        (
+            WalletConnectSupportedMethod::EthSignTypedDataV4,
+            crate::vault::PublicAccountSource::HardwareDerived,
+            false,
+        )
+    )
 }
 
 pub fn build_walletconnect_session_event(

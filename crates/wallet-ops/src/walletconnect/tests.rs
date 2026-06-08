@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
+use crate::hardware::HardwareTypedDataSigningMode;
 use crate::vault::{
     PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
     WalletConnectPeerMetadata, WalletConnectRelayIdentity, WalletConnectSessionAccountResolution,
@@ -28,15 +29,18 @@ use super::session::{WC_SESSION_SETTLE, WalletConnectApprovalMessages, WalletCon
 use super::uri::WalletConnectPairingUri;
 use super::{
     WalletConnectErc20CallSummary, WalletConnectError, WalletConnectLifecycleRequestOutcome,
-    WalletConnectNamespaceProposal, WalletConnectParsedRequest, WalletConnectPendingRequestQueue,
+    WalletConnectNamespaceAccountSupport, WalletConnectNamespaceProposal,
+    WalletConnectParsedRequest, WalletConnectPendingRequestQueue,
     WalletConnectProposalRejectionReason, WalletConnectRelayLifecycle,
     WalletConnectRequestErrorKind, WalletConnectSessionProposal, WalletConnectTerminalLifecycleEnd,
-    approve_walletconnect_session, build_walletconnect_disconnect_plan,
-    build_walletconnect_jsonrpc_error, build_walletconnect_session_event,
-    decode_walletconnect_session_proposal, handle_walletconnect_lifecycle_request,
-    negotiate_walletconnect_namespaces, parse_walletconnect_session_request,
+    approve_walletconnect_session, approve_walletconnect_session_with_account_support,
+    build_walletconnect_disconnect_plan, build_walletconnect_jsonrpc_error,
+    build_walletconnect_session_event, decode_walletconnect_session_proposal,
+    handle_walletconnect_lifecycle_request, negotiate_walletconnect_namespaces,
+    negotiate_walletconnect_namespaces_with_account_support, parse_walletconnect_session_request,
     reject_walletconnect_session_proposal, start_walletconnect_pairing,
     validate_walletconnect_session_request,
+    validate_walletconnect_session_request_with_account_support,
 };
 
 const NOW: u64 = 1_700_000_000;
@@ -923,10 +927,224 @@ fn hardware_account_rejects_required_typed_data_namespace() {
     ));
 }
 
+#[test]
+fn hardware_account_accepts_required_typed_data_namespace_with_capability() {
+    let mut required = BTreeMap::new();
+    required.insert(
+        "eip155".to_owned(),
+        namespace(&["eip155:1"], &["eth_signTypedData_v4"], &[]),
+    );
+
+    let negotiated = negotiate_walletconnect_namespaces_with_account_support(
+        &required,
+        &BTreeMap::new(),
+        &supported_chains(&[1]),
+        address!("1111111111111111111111111111111111111111"),
+        WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::ClearSign),
+    )
+    .expect("hardware typed-data namespace");
+    let approved = negotiated
+        .approved_namespaces
+        .get("eip155")
+        .expect("approved namespace");
+
+    assert_eq!(approved.methods, vec!["eth_signTypedData_v4"]);
+}
+
+#[test]
+fn hardware_account_auto_includes_optional_typed_data_with_capability() {
+    let mut required = BTreeMap::new();
+    required.insert(
+        "eip155".to_owned(),
+        namespace(&["eip155:1"], &["eth_accounts"], &[]),
+    );
+    let mut optional = BTreeMap::new();
+    optional.insert(
+        "eip155:1".to_owned(),
+        namespace(&[], &["eth_signTypedData_v4"], &[]),
+    );
+
+    let negotiated = negotiate_walletconnect_namespaces_with_account_support(
+        &required,
+        &optional,
+        &supported_chains(&[1]),
+        address!("1111111111111111111111111111111111111111"),
+        WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::ClearSign),
+    )
+    .expect("hardware namespace");
+    let optional = negotiated
+        .approved_namespaces
+        .get("eip155:1")
+        .expect("approved optional namespace");
+
+    assert_eq!(optional.methods, vec!["eth_signTypedData_v4"]);
+    assert!(negotiated.excluded_optional.is_empty());
+}
+
+#[test]
+fn hardware_account_omits_optional_typed_data_without_capability() {
+    let mut required = BTreeMap::new();
+    required.insert(
+        "eip155".to_owned(),
+        namespace(&["eip155:1"], &["eth_accounts"], &[]),
+    );
+    let mut optional = BTreeMap::new();
+    optional.insert(
+        "eip155:1".to_owned(),
+        namespace(&[], &["eth_signTypedData_v4"], &[]),
+    );
+
+    let negotiated = negotiate_walletconnect_namespaces_with_account_support(
+        &required,
+        &optional,
+        &supported_chains(&[1]),
+        address!("1111111111111111111111111111111111111111"),
+        WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::Unsupported),
+    )
+    .expect("hardware namespace");
+
+    assert!(negotiated.approved_namespaces.values().all(|namespace| {
+        namespace
+            .methods
+            .iter()
+            .all(|method| method != "eth_signTypedData_v4")
+    }));
+    assert!(
+        negotiated
+            .excluded_optional
+            .iter()
+            .any(|item| item.item == "eth_signTypedData_v4")
+    );
+}
+
+#[test]
+fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
+    let mut required = BTreeMap::new();
+    required.insert(
+        "eip155".to_owned(),
+        namespace(&["eip155:1"], &["eth_accounts"], &[]),
+    );
+    let mut proposal = test_proposal(required);
+    proposal.optional_namespaces.insert(
+        "eip155:1".to_owned(),
+        namespace(&[], &["eth_signTypedData_v4"], &[]),
+    );
+    let relay_identity = WalletConnectRelayIdentity {
+        signing_key: [8u8; 32],
+        client_id: "relay-client".to_owned(),
+    };
+    let mut account = test_public_account(PublicAccountScope::Global);
+    account.source = PublicAccountSource::HardwareDerived;
+    let resolution = WalletConnectSessionAccountResolution::Usable(account.clone());
+    let request = parse_walletconnect_session_request(
+        31,
+        "eth_signTypedData_v4",
+        &json!([account.address.to_string(), typed_data_payload(json!(1))]),
+    )
+    .expect("typed-data request");
+
+    let excluded = approve_walletconnect_session_with_account_support(
+        &proposal,
+        &[1u8; 32],
+        &relay_identity,
+        &account,
+        WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::Unsupported),
+        &supported_chains(&[1]),
+        "hardware-optional-typed-data-excluded",
+        NOW,
+    )
+    .expect("approve without optional typed data");
+    assert!(
+        excluded
+            .session
+            .approved_namespaces
+            .values()
+            .all(|namespace| {
+                namespace
+                    .methods
+                    .iter()
+                    .all(|method| method != "eth_signTypedData_v4")
+            })
+    );
+    assert!(matches!(
+        validate_walletconnect_session_request_with_account_support(
+            &excluded.session,
+            &resolution,
+            WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::Unsupported),
+            &excluded.session.session_topic,
+            31,
+            "eip155:1",
+            request.clone(),
+            Some(NOW + 300),
+            NOW,
+        ),
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4"
+    ));
+
+    let included = approve_walletconnect_session_with_account_support(
+        &proposal,
+        &[1u8; 32],
+        &relay_identity,
+        &account,
+        WalletConnectNamespaceAccountSupport::hardware(
+            HardwareTypedDataSigningMode::Eip712HashFallback,
+        ),
+        &supported_chains(&[1]),
+        "hardware-optional-typed-data-included",
+        NOW,
+    )
+    .expect("approve with optional typed data");
+    assert!(
+        included
+            .session
+            .approved_namespaces
+            .values()
+            .any(|namespace| {
+                namespace
+                    .methods
+                    .iter()
+                    .any(|method| method == "eth_signTypedData_v4")
+            })
+    );
+    let validation = validate_walletconnect_session_request_with_account_support(
+        &included.session,
+        &resolution,
+        WalletConnectNamespaceAccountSupport::hardware(
+            HardwareTypedDataSigningMode::Eip712HashFallback,
+        ),
+        &included.session.session_topic,
+        31,
+        "eip155:1",
+        request.clone(),
+        Some(NOW + 300),
+        NOW,
+    )
+    .expect("validate included typed data");
+    assert!(validation.approval_item.is_some());
+    assert!(matches!(
+        validate_walletconnect_session_request_with_account_support(
+            &included.session,
+            &resolution,
+            WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::Unsupported),
+            &included.session.session_topic,
+            31,
+            "eip155:1",
+            request,
+            Some(NOW + 300),
+            NOW,
+        ),
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4"
+    ));
+}
+
 #[cfg(not(feature = "hardware"))]
 #[test]
 fn default_build_hardware_account_rejects_required_signing_namespaces() {
-    for method in ["personal_sign", "eth_sendTransaction"] {
+    for method in [
+        "personal_sign",
+        "eth_sendTransaction",
+        "eth_signTypedData_v4",
+    ] {
         let mut required = BTreeMap::new();
         required.insert(
             "eip155".to_owned(),
@@ -958,7 +1176,15 @@ fn default_build_hardware_account_excludes_optional_signing_methods() {
     let mut optional = BTreeMap::new();
     optional.insert(
         "eip155:1".to_owned(),
-        namespace(&[], &["personal_sign", "eth_sendTransaction"], &[]),
+        namespace(
+            &[],
+            &[
+                "personal_sign",
+                "eth_sendTransaction",
+                "eth_signTypedData_v4",
+            ],
+            &[],
+        ),
     );
 
     let negotiated = negotiate_walletconnect_namespaces(
@@ -971,10 +1197,11 @@ fn default_build_hardware_account_excludes_optional_signing_methods() {
     .unwrap();
 
     assert!(negotiated.approved_namespaces.values().all(|namespace| {
-        namespace
-            .methods
-            .iter()
-            .all(|method| method != "personal_sign" && method != "eth_sendTransaction")
+        namespace.methods.iter().all(|method| {
+            method != "personal_sign"
+                && method != "eth_sendTransaction"
+                && method != "eth_signTypedData_v4"
+        })
     }));
 }
 
@@ -1409,6 +1636,89 @@ fn default_build_hardware_session_request_rejects_signing_method() {
             NOW,
         ),
         Err(WalletConnectError::UnsupportedMethod(method)) if method == "personal_sign"
+    ));
+}
+
+#[test]
+fn hardware_typed_data_request_validation_allows_unknown_capability_probe() {
+    let mut required = BTreeMap::new();
+    required.insert(
+        "eip155".to_owned(),
+        namespace(&["eip155:1"], &["eth_signTypedData_v4"], &[]),
+    );
+    let proposal = test_proposal(required);
+    let relay_identity = WalletConnectRelayIdentity {
+        signing_key: [8u8; 32],
+        client_id: "relay-client".to_owned(),
+    };
+    let mut account = test_public_account(PublicAccountScope::Global);
+    account.source = PublicAccountSource::HardwareDerived;
+    let supported =
+        WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::ClearSign);
+    let approval = approve_walletconnect_session_with_account_support(
+        &proposal,
+        &[1u8; 32],
+        &relay_identity,
+        &account,
+        supported,
+        &supported_chains(&[1]),
+        "hardware-typed-data-session",
+        NOW,
+    )
+    .expect("approve typed-data session");
+    let resolution = WalletConnectSessionAccountResolution::Usable(account.clone());
+    let request = parse_walletconnect_session_request(
+        33,
+        "eth_signTypedData_v4",
+        &json!([account.address.to_string(), typed_data_payload(json!(1))]),
+    )
+    .expect("typed-data request");
+
+    let validation = validate_walletconnect_session_request_with_account_support(
+        &approval.session,
+        &resolution,
+        supported,
+        &approval.session.session_topic,
+        33,
+        "eip155:1",
+        request.clone(),
+        Some(NOW + 300),
+        NOW,
+    )
+    .expect("supported typed-data validation");
+    assert_eq!(validation.request.method().as_str(), "eth_signTypedData_v4");
+
+    let unknown_validation = validate_walletconnect_session_request_with_account_support(
+        &approval.session,
+        &resolution,
+        WalletConnectNamespaceAccountSupport::hardware_typed_data_capability_unknown(),
+        &approval.session.session_topic,
+        33,
+        "eip155:1",
+        request.clone(),
+        Some(NOW + 300),
+        NOW,
+    )
+    .expect("unknown hardware typed-data capability can be probed at approval time");
+    assert_eq!(
+        unknown_validation.request.method().as_str(),
+        "eth_signTypedData_v4"
+    );
+    assert!(unknown_validation.approval_item.is_some());
+
+    assert!(matches!(
+        validate_walletconnect_session_request_with_account_support(
+            &approval.session,
+            &resolution,
+            WalletConnectNamespaceAccountSupport::hardware(HardwareTypedDataSigningMode::Unsupported),
+            &approval.session.session_topic,
+            33,
+            "eip155:1",
+            request,
+            Some(NOW + 300),
+            NOW,
+        ),
+        Err(WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4"
     ));
 }
 

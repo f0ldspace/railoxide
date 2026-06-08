@@ -37,6 +37,77 @@ pub(super) fn ensure_walletconnect_chain_id_enabled(
     }
 }
 
+pub(super) fn walletconnect_namespace_account_support(
+    account: &PublicAccountMetadata,
+    view_session: Option<&DesktopViewSession>,
+) -> WalletConnectNamespaceAccountSupport {
+    if account.source != PublicAccountSource::HardwareDerived {
+        return WalletConnectNamespaceAccountSupport::for_account_source(account.source);
+    }
+    let mode = account.hardware_descriptor.as_ref().and_then(|descriptor| {
+        view_session
+            .and_then(DesktopViewSession::hardware_profile_session)
+            .and_then(|session| session.typed_data_signing_mode(descriptor))
+    });
+    match mode {
+        Some(mode) => WalletConnectNamespaceAccountSupport::hardware(mode),
+        None => WalletConnectNamespaceAccountSupport::hardware_typed_data_capability_unknown(),
+    }
+}
+
+pub(super) fn walletconnect_hardware_typed_data_mode_for_request(
+    request: &WalletConnectRequestUi,
+    public_accounts: &[PublicAccountMetadata],
+    view_session: Option<&DesktopViewSession>,
+) -> HardwareTypedDataSigningMode {
+    if request.account_source != PublicAccountSource::HardwareDerived {
+        return HardwareTypedDataSigningMode::Unsupported;
+    }
+    public_accounts
+        .iter()
+        .find(|account| {
+            account.public_account_uuid == request.session.selected_public_account_uuid
+                && account.status == PublicAccountStatus::Active
+                && account.scope == request.session.selected_public_account_scope
+        })
+        .map(|account| {
+            walletconnect_namespace_account_support(account, view_session)
+                .hardware_typed_data_signing_mode
+        })
+        .unwrap_or(HardwareTypedDataSigningMode::Unsupported)
+}
+
+pub(super) fn walletconnect_proposal_requests_required_typed_data(
+    proposal: &WalletConnectSessionProposal,
+) -> bool {
+    proposal.required_namespaces.values().any(|namespace| {
+        namespace
+            .methods
+            .iter()
+            .any(|method| method == WalletConnectSupportedMethod::EthSignTypedDataV4.as_str())
+    })
+}
+
+#[cfg(feature = "hardware")]
+pub(super) fn walletconnect_proposal_requests_optional_typed_data(
+    proposal: &WalletConnectSessionProposal,
+) -> bool {
+    proposal.optional_namespaces.values().any(|namespace| {
+        namespace
+            .methods
+            .iter()
+            .any(|method| method == WalletConnectSupportedMethod::EthSignTypedDataV4.as_str())
+    })
+}
+
+#[cfg(feature = "hardware")]
+pub(super) fn walletconnect_proposal_requests_hardware_typed_data(
+    proposal: &WalletConnectSessionProposal,
+) -> bool {
+    walletconnect_proposal_requests_required_typed_data(proposal)
+        || walletconnect_proposal_requests_optional_typed_data(proposal)
+}
+
 pub(super) const fn walletconnect_session_expired(
     session: &WalletConnectSessionRecord,
     now: u64,
@@ -143,6 +214,7 @@ pub(super) fn walletconnect_duration_until_expiry(expiry_timestamp: u64) -> Opti
 pub(super) fn walletconnect_proposal_rejection_reason(
     proposal: &WalletConnectSessionProposal,
     selected_account: Option<&PublicAccountMetadata>,
+    selected_account_support: Option<WalletConnectNamespaceAccountSupport>,
     supported_chain_ids: &BTreeSet<u64>,
     now: u64,
 ) -> WalletConnectProposalRejectionReason {
@@ -150,12 +222,14 @@ pub(super) fn walletconnect_proposal_rejection_reason(
         return WalletConnectProposalRejectionReason::Expired;
     }
     if let Some(account) = selected_account
-        && negotiate_walletconnect_namespaces(
+        && negotiate_walletconnect_namespaces_with_account_support(
             &proposal.required_namespaces,
             &proposal.optional_namespaces,
             supported_chain_ids,
             account.address,
-            account.source,
+            selected_account_support.unwrap_or_else(|| {
+                WalletConnectNamespaceAccountSupport::for_account_source(account.source)
+            }),
         )
         .is_err()
     {

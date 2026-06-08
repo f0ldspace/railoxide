@@ -10,6 +10,7 @@ pub(super) async fn approve_walletconnect_request_task(
     effective_chain: Option<EffectiveChainConfig>,
     context: WalletConnectClientContext,
     http: HttpContext,
+    hash_fallback_confirmed: bool,
     event_tx: Option<PublicActionSessionEventSender>,
 ) -> Result<WalletConnectRequestApprovalOutcome, String> {
     let expiry_timestamp = request.item.expiry_timestamp;
@@ -33,21 +34,19 @@ pub(super) async fn approve_walletconnect_request_task(
                 .map(Value::String)
             }
             WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
-                if request.account_source == PublicAccountSource::HardwareDerived {
-                    Err(eyre::eyre!(
-                        "WalletConnect eth_signTypedData_v4 is unsupported for hardware Public accounts"
-                    ))
-                } else {
-                    walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
-                        view_session,
-                        vault_store,
-                        vault_password,
-                        public_account_uuid: request.session.selected_public_account_uuid.clone(),
-                        typed_data,
-                    })
-                    .await
-                    .map(Value::String)
-                }
+                walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
+                    view_session,
+                    vault_store,
+                    vault_password,
+                    trezor_app_passphrase,
+                    trezor_pin_matrix_provider,
+                    public_account_uuid: request.session.selected_public_account_uuid.clone(),
+                    typed_data,
+                    hash_fallback_confirmed,
+                    event_tx,
+                })
+                .await
+                .map(Value::String)
             }
             WalletConnectParsedRequest::EthSendTransaction { transaction } => {
                 let Some(chain_id) = parse_caip2_chain_id(&request.item.chain_id) else {
@@ -129,6 +128,15 @@ pub(super) async fn approve_walletconnect_request_task(
             submitted_tx_hash,
         ));
     }
+    if let Err(error) = &result
+        && is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required(error)
+    {
+        return Ok(
+            WalletConnectRequestApprovalOutcome::hash_fallback_confirmation_required(
+                walletconnect_hardware_typed_data_hash_fallback_confirmation_session(error),
+            ),
+        );
+    }
     let authorization_failed = result
         .as_ref()
         .err()
@@ -160,6 +168,8 @@ pub(super) async fn approve_walletconnect_request_task(
                 relay_error: Some(error),
                 request_error,
                 expired: false,
+                hash_fallback_confirmation_required: false,
+                refreshed_hardware_session: None,
             });
         }
         return Err(error);
@@ -171,6 +181,8 @@ pub(super) async fn approve_walletconnect_request_task(
         relay_error: None,
         request_error,
         expired: false,
+        hash_fallback_confirmation_required: false,
+        refreshed_hardware_session: None,
     })
 }
 
@@ -450,7 +462,7 @@ pub(super) fn walletconnect_request_authorization_summary(
 pub(super) fn hardware_walletconnect_notice(method: WalletConnectSupportedMethod) -> &'static str {
     match method {
         WalletConnectSupportedMethod::EthSignTypedDataV4 => {
-            "Hardware typed-data signing is not supported in this version and will be rejected."
+            "Confirm this EIP-712 typed-data request on the connected hardware wallet."
         }
         WalletConnectSupportedMethod::PersonalSign
         | WalletConnectSupportedMethod::EthSendTransaction => {
