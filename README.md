@@ -31,7 +31,7 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 - Hardware-derived wallets:
   - public accounts have full hardware wallet support.
   - 0zk accounts are derived detirministically by signing a hash with a hardware device, private keys are **not** stored in app, but for signing they are briefly exposed in memory.
-  Full on-device 0zk signing support is to be added as soon as hardware wallet vendors add railgun-specific cryptography functions.
+    Full on-device 0zk signing support is to be added as soon as hardware wallet vendors add railgun-specific cryptography functions.
 - Aggressive batching to reduce rpc throttling
 - Resilient public broadcaster network connection management
 - Decenralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
@@ -83,7 +83,9 @@ cargo build --release -p wallet --features hardware
 ```
 
 For complete wallet build guides see
+
 - [`Ubuntu`](docs/build-wallet-ubuntu.md)
+- ['NixOS'](docs/nixos.md)
 - [`macOS`](docs/build-wallet-macos.md)
 - [`Windows`](docs/build-wallet-windows.md)
 
