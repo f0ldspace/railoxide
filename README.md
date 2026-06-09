@@ -101,11 +101,11 @@ Current hardware-wallet support is hardware-derived software custody, not native
 
 RailOxide is privacy-oriented, but metadata privacy depends on mode and infrastructure choices.
 
-By default, wallet HTTP/RPC traffic uses built-in Tor when no proxy or network mode is configured. Direct mode is explicit and sends outbound requests over the normal network. Proxy mode routes HTTP/RPC traffic through the configured proxy, but embedded Waku libp2p transports are disabled in proxy mode to avoid proxy bypass.
+The recommended default posture is built-in Tor with indexed POI artifacts. Built-in Tor routes wallet HTTP/RPC traffic through the bundled Tor client. Indexed POI artifacts avoid sending wallet blinded commitments for normal POI status and proof reads.
 
-RPC providers, POI services, artifact gateways, public broadcasters, Waku peers, and token/fee data providers can observe metadata for the requests they receive. Self-broadcast and public-account actions may preflight or submit against multiple configured RPC providers for reliability, so each selected provider can observe the public transaction metadata it receives. Indexed POI artifacts avoid sending wallet blind commitments for normal POI reads, but the configured POI RPC URL is still used to live-tail recent public POI events. POI proxy mode is less private because it sends blind commitment hashes associated with UTXOs being received or prepared for spend.
+Direct mode is explicit and privacy-degraded. Proxy mode routes wallet HTTP/RPC traffic through the configured proxy, but embedded Waku libp2p transports are disabled in proxy mode to avoid proxy bypass. POI proxy mode is less private because it sends blinded commitment hashes associated with UTXOs being received or prepared for spend.
 
-The encrypted wallet vault protects wallet secrets and encrypted wallet cache records. App settings are stored outside the encrypted vault and may include proxy URLs, RPC endpoints, POI RPC URLs, Waku endpoints, and custom infrastructure settings. UI logs redact URL credentials, paths, query strings, and fragments where possible. Logs are intended for non-sensitive diagnostics, and users should still avoid putting credentials or API tokens in URLs where possible.
+For details, see [`docs/privacy-model.md`](docs/privacy-model.md).
 
 ## Shared Crates
 
