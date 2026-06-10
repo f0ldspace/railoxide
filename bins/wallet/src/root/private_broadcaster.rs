@@ -31,7 +31,8 @@ use super::public_broadcaster_cost::{
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
-    dialog_content_max_height, dialog_max_height, format_native_token_amount_for_display,
+    app_panel, app_status_tag, app_step_row, app_stepper_container, dialog_content_max_height,
+    dialog_max_height, format_native_token_amount_for_display,
     format_recipient_amount_with_native_top_up, scrollable_dialog_content,
     secondary_dialog_content_width,
 };
@@ -1375,30 +1376,17 @@ fn public_broadcaster_progress_address(progress: &PrivateBroadcasterProgressStat
     )
 }
 
-fn render_broadcaster_preference_progress_chip(label: &'static str, color: u32) -> gpui::Div {
-    div()
-        .flex_none()
-        .px(px(8.0))
-        .py(px(2.0))
-        .rounded_full()
-        .bg(super::rgb_with_alpha(color, 0.12))
-        .text_color(rgb(color))
-        .text_size(px(11.0))
-        .child(label)
+fn render_broadcaster_preference_progress_chip(
+    label: &'static str,
+    color: u32,
+) -> impl IntoElement {
+    app_status_tag(label, color)
 }
 
 fn render_pending_public_broadcaster_progress_context(
     progress: &PrivateBroadcasterProgressState,
 ) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(12.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
+    app_panel(theme::SURFACE_ELEVATED, theme::BORDER)
         .child(app_strong_text("Transaction context"))
         .child(private_broadcaster_context_row(
             "Broadcaster",
@@ -1674,15 +1662,7 @@ pub(super) fn render_private_broadcaster_progress_stepper(
     progress: &PrivateBroadcasterProgressState,
 ) -> gpui::Div {
     let steps = &progress.steps;
-    let mut stepper = div()
-        .flex()
-        .flex_col()
-        .gap_0()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
-        .border_1()
-        .border_color(rgb(theme::BORDER_SUBTLE));
+    let mut stepper = app_stepper_container();
     let last_index = steps.len().saturating_sub(1);
     for (index, step) in steps.iter().enumerate() {
         stepper = stepper.child(render_private_broadcaster_progress_step(
@@ -1750,27 +1730,14 @@ fn render_private_broadcaster_progress_step(
         body = body.child(action);
     }
 
-    div()
-        .flex()
-        .items_start()
-        .gap_3()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .child(render_public_action_step_marker(step.status, color))
-                .children((!is_last).then(|| {
-                    div()
-                        .w(px(2.0))
-                        .flex_1()
-                        .min_h(px(32.0))
-                        .my(px(3.0))
-                        .rounded_full()
-                        .bg(rgb(color))
-                })),
-        )
-        .child(body)
+    app_step_row(
+        render_public_action_step_marker(step.status, color),
+        body,
+        is_last,
+        color,
+        px(32.0),
+        None,
+    )
 }
 
 fn render_self_broadcast_step_action(

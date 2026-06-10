@@ -117,15 +117,7 @@ pub(super) fn walletconnect_notice(
 pub(super) fn render_walletconnect_approval_stepper(
     progress: &WalletConnectApprovalProgress,
 ) -> gpui::Div {
-    let mut stepper = div()
-        .flex()
-        .flex_col()
-        .gap_0()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
-        .border_1()
-        .border_color(rgb(theme::BORDER_SUBTLE));
+    let mut stepper = app_stepper_container();
     let last_index = progress.steps.len().saturating_sub(1);
     for (index, step) in progress.steps.iter().enumerate() {
         stepper = stepper.child(render_walletconnect_approval_step(
@@ -171,27 +163,14 @@ pub(super) fn render_walletconnect_approval_step(
         );
     }
 
-    div()
-        .flex()
-        .items_start()
-        .gap_3()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .child(render_public_action_step_marker(step.status, color))
-                .children((!is_last).then(|| {
-                    div()
-                        .w(px(2.0))
-                        .flex_1()
-                        .min_h(px(32.0))
-                        .my(px(3.0))
-                        .rounded_full()
-                        .bg(rgb(color))
-                })),
-        )
-        .child(body)
+    app_step_row(
+        render_public_action_step_marker(step.status, color),
+        body,
+        is_last,
+        color,
+        px(32.0),
+        None,
+    )
 }
 
 pub(super) fn walletconnect_approval_progress_steps(

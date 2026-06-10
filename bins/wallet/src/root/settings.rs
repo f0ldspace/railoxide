@@ -13,6 +13,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Sizable, WindowExt,
+    alert::Alert,
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     group_box::GroupBoxVariant,

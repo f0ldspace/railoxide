@@ -7,7 +7,7 @@ use alloy::primitives::{FixedBytes, U256};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     App, Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div, img,
+    Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
@@ -45,8 +45,8 @@ use super::spend_authorization::{
 use super::tokens::parse_address;
 use super::{
     SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-    WalletRoot, centered_message, dialog_content_max_height, dialog_max_height, rgb_with_alpha,
-    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    WalletRoot, app_refresh_button, centered_message, dialog_content_max_height, dialog_max_height,
+    rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 
 use crate::assets::WalletIconSource;
@@ -1079,46 +1079,22 @@ impl TableDelegate for UtxoDelegate {
         let session = self.poi_refresh_session.clone();
         let refreshing = self.poi_refreshing;
         let can_refresh = session.is_some();
-        let action = div()
-            .id("wallet-poi-refresh")
-            .size(px(18.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .when(refreshing, |this| {
-                this.child(
-                    Spinner::new()
-                        .icon(IconName::LoaderCircle)
-                        .color(rgb(theme::TEXT_MUTED).into())
-                        .with_size(px(13.0)),
-                )
-            })
-            .when(!refreshing, |this| {
-                this.when(can_refresh, |this| {
-                    this.cursor_pointer()
-                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Refresh POI statuses").build(window, cx)
-                        })
-                        .on_click(move |_event, _window, cx| {
-                            cx.stop_propagation();
-                            let Some(session) = session.clone() else {
-                                return;
-                            };
-                            cx.spawn(async move |_cx| {
-                                session.refresh_poi_statuses().await;
-                            })
-                            .detach();
-                        })
+        let action = app_refresh_button(
+            "wallet-poi-refresh",
+            "Refresh POI statuses",
+            refreshing,
+            can_refresh,
+            move |_window, cx| {
+                let Some(session) = session.clone() else {
+                    return;
+                };
+                cx.spawn(async move |_cx| {
+                    session.refresh_poi_statuses().await;
                 })
-                .child(
-                    img(icons::refresh_ccw_icon_path())
-                        .size(px(13.0))
-                        .flex_none(),
-                )
-            })
-            .into_any_element();
+                .detach();
+            },
+        )
+        .into_any_element();
 
         div()
             .size_full()

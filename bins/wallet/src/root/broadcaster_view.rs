@@ -16,7 +16,7 @@ use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use crate::assets::{RailgunActionIcon, RailgunSidebarIcon};
 
 use super::utxo::short_hash;
-use super::{WalletRoot, rgb_with_alpha};
+use super::{WalletRoot, app_status_tag};
 
 const BROADCASTER_CONTENT_WIDTH: gpui::Pixels = px(980.0);
 
@@ -264,20 +264,13 @@ impl WalletRoot {
             .border_1()
             .border_color(rgb(theme::BORDER))
             .bg(rgb(theme::SURFACE))
-            .child(
-                div()
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .rounded_full()
-                    .bg(rgb_with_alpha(color, 0.12))
-                    .text_color(rgb(color))
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(match kind {
-                        BroadcasterPreferenceListKind::Favorite => "Favorite",
-                        BroadcasterPreferenceListKind::Banned => "Banned",
-                    }),
-            )
+            .child(app_status_tag(
+                match kind {
+                    BroadcasterPreferenceListKind::Favorite => "Favorite",
+                    BroadcasterPreferenceListKind::Banned => "Banned",
+                },
+                color,
+            ))
             .child(
                 div()
                     .flex_1()

@@ -25,7 +25,7 @@ use crate::assets::RailgunActionIcon;
 
 use super::utxo::short_hash;
 use super::{
-    WalletRoot, dialog_content_max_height, dialog_max_height, rgb_with_alpha,
+    WalletRoot, app_status_tag, dialog_content_max_height, dialog_max_height,
     scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
 };
 
@@ -861,16 +861,7 @@ fn address_book_section_shell(
                     .text_size(px(13.0))
                     .font_weight(FontWeight::SEMIBOLD),
             )
-            .child(
-                div()
-                    .px(px(6.0))
-                    .py(px(1.0))
-                    .rounded_full()
-                    .bg(rgb_with_alpha(theme::PRIMARY, 0.10))
-                    .text_color(rgb(theme::PRIMARY))
-                    .text_size(px(11.0))
-                    .child(count_label),
-            ),
+            .child(app_status_tag(count_label, theme::PRIMARY)),
     )
 }
 
@@ -940,16 +931,7 @@ fn render_address_book_type_status(
                 .items_center()
                 .gap_2()
                 .child(app_muted_text("Type"))
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .rounded_full()
-                        .bg(rgb_with_alpha(status_color, 0.10))
-                        .text_color(rgb(status_color))
-                        .text_size(px(12.0))
-                        .child(detected.label()),
-                ),
+                .child(app_status_tag(detected.label(), status_color)),
         )
         .children(validation.map(|status| app_muted_text(status).text_color(rgb(status_color))))
 }

@@ -5,13 +5,12 @@ use gpui::{
     Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::Icon;
-#[cfg(feature = "hardware")]
-use gpui_component::Sizable;
+use gpui_component::alert::Alert;
 use gpui_component::progress::Progress as UiProgress;
 #[cfg(feature = "hardware")]
 use gpui_component::spinner::Spinner;
 use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants, tooltip::Tooltip};
+use gpui_component::{Icon, Sizable};
 #[cfg(feature = "hardware")]
 use gpui_component::{
     Selectable,
@@ -1312,16 +1311,8 @@ impl WalletRoot {
 
     fn render_vault_error(&self) -> Option<gpui::AnyElement> {
         self.vault_error.as_ref().map(|message| {
-            div()
-                .w_full()
-                .p(px(10.0))
-                .rounded_md()
-                .bg(rgb(theme::DANGER_BG))
-                .border_1()
-                .border_color(rgb(theme::DANGER))
-                .text_color(rgb(theme::DANGER))
-                .text_size(APP_TEXT_SIZE)
-                .child(SharedString::from(message.to_string()))
+            Alert::error("wallet-vault-error", message.to_string())
+                .small()
                 .into_any_element()
         })
     }
@@ -1477,15 +1468,7 @@ fn render_hardware_profile_stepper(
     device_kind: HardwareDeviceKind,
     steps: &[HardwareProfileStepState],
 ) -> gpui::Div {
-    let mut stepper = div()
-        .w_full()
-        .p(px(10.0))
-        .flex()
-        .flex_col()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER_SUBTLE))
-        .bg(rgb(theme::SURFACE_HOVER_SUBTLE));
+    let mut stepper = super::app_stepper_container().w_full();
     let last_index = steps.len().saturating_sub(1);
     for (index, step) in steps.iter().enumerate() {
         stepper = stepper.child(render_hardware_profile_step(
@@ -1658,47 +1641,33 @@ fn render_hardware_profile_step(
     is_last: bool,
 ) -> gpui::Div {
     let color = hardware_profile_step_color(step.status);
-    div()
+    let body = div()
+        .flex_1()
+        .min_w(px(0.0))
         .flex()
-        .items_start()
-        .gap_3()
+        .flex_col()
+        .gap_1()
+        .pb(if is_last { px(0.0) } else { px(12.0) })
         .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .child(render_hardware_profile_step_marker(step.status, color))
-                .children((!is_last).then(|| {
-                    div()
-                        .w(px(2.0))
-                        .flex_1()
-                        .min_h(px(30.0))
-                        .my(px(3.0))
-                        .rounded_full()
-                        .bg(rgb(color))
-                        .opacity(0.34)
-                })),
+            app_strong_text(hardware_profile_step_label(device_kind, step.step))
+                .text_color(rgb(color))
+                .line_height(gpui::relative(1.0)),
         )
         .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .pb(if is_last { px(0.0) } else { px(12.0) })
-                .child(
-                    app_strong_text(hardware_profile_step_label(device_kind, step.step))
-                        .text_color(rgb(color))
-                        .line_height(gpui::relative(1.0)),
-                )
-                .child(
-                    app_muted_text(hardware_profile_step_detail(device_kind, step))
-                        .text_color(rgb(color))
-                        .line_height(gpui::relative(1.0))
-                        .whitespace_normal(),
-                ),
-        )
+            app_muted_text(hardware_profile_step_detail(device_kind, step))
+                .text_color(rgb(color))
+                .line_height(gpui::relative(1.0))
+                .whitespace_normal(),
+        );
+
+    super::app_step_row(
+        render_hardware_profile_step_marker(step.status, color),
+        body,
+        is_last,
+        color,
+        px(30.0),
+        Some(0.34),
+    )
 }
 
 #[cfg(feature = "hardware")]
@@ -1825,14 +1794,7 @@ fn hardware_profile_step_detail(
 fn hardware_profile_error(message: &str) -> gpui::Div {
     div()
         .w_full()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::DANGER_BG))
-        .border_1()
-        .border_color(rgb(theme::DANGER))
-        .text_color(rgb(theme::DANGER))
-        .text_size(APP_TEXT_SIZE)
-        .child(SharedString::from(message.to_owned()))
+        .child(Alert::error("wallet-hardware-profile-error", message.to_owned()).small())
 }
 
 #[cfg(feature = "hardware")]

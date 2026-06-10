@@ -1,25 +1,22 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    App, AppContext, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window,
+    div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Selectable, Sizable, Size, StyleSized,
+    Disableable, Icon, Selectable, Sizable, Size, StyleSized,
     button::{Button, ButtonGroup, ButtonVariants},
     input::{InputEvent, InputState},
-    spinner::Spinner,
-    tooltip::Tooltip,
 };
 use ui::controls::{app_input, app_muted_text};
-use ui::icons;
 use ui::theme;
 use wallet_ops::{SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection};
 
 use crate::assets::RailgunActionIcon;
 
 use super::{
-    DeliveryFormKind, UnshieldAssetKey, WalletRoot, labeled_field,
+    DeliveryFormKind, UnshieldAssetKey, WalletRoot, app_refresh_button, labeled_field,
     private_action::private_action_input, public_action::PublicActionMode,
 };
 
@@ -370,44 +367,19 @@ fn render_auto_refresh_button(
     refreshing: bool,
     enabled: bool,
 ) -> gpui::AnyElement {
-    div()
-        .id(id)
-        .size(px(18.0))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_sm()
-        .when(refreshing, |this| {
-            this.child(
-                Spinner::new()
-                    .icon(IconName::LoaderCircle)
-                    .color(rgb(theme::TEXT_MUTED).into())
-                    .with_size(px(13.0)),
-            )
-        })
-        .when(!refreshing, |this| {
-            this.opacity(if enabled { 1.0 } else { 0.45 })
-                .when(enabled, |this| {
-                    this.cursor_pointer()
-                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Refresh gas price hint").build(window, cx)
-                        })
-                        .on_click(move |_event, _window, cx| {
-                            cx.stop_propagation();
-                            root.update(cx, |root, cx| {
-                                root.refresh_eip1559_gas_fee_quote(target, cx);
-                            });
-                        })
-                })
-                .child(
-                    img(icons::refresh_ccw_icon_path())
-                        .size(px(13.0))
-                        .flex_none(),
-                )
-        })
-        .into_any_element()
+    app_refresh_button(
+        id,
+        "Refresh gas price hint",
+        refreshing,
+        enabled,
+        move |_window, cx| {
+            root.update(cx, |root, cx| {
+                root.refresh_eip1559_gas_fee_quote(target, cx);
+            });
+        },
+    )
+    .opacity(if enabled || refreshing { 1.0 } else { 0.45 })
+    .into_any_element()
 }
 
 fn render_gas_fee_inputs(

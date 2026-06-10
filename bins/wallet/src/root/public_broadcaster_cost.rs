@@ -3,16 +3,12 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use gpui::{
     AnyElement, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px, rgb,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{
-    Icon, IconName, Sizable, collapsible::Collapsible, spinner::Spinner, tooltip::Tooltip,
-};
+use gpui_component::{Icon, IconName, Sizable, collapsible::Collapsible, spinner::Spinner};
 use railgun_ui::{format_token_amount, lookup_token};
-use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_muted_text, app_strong_text};
-use ui::icons;
-use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
+use ui::theme;
 use wallet_ops::{
     DesktopSendPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
     FeeHandlingMode, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
@@ -32,10 +28,10 @@ use super::private_broadcaster::PrivateBroadcasterProgressState;
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     COST_ESTIMATE_DEBOUNCE, ChainUtxoState, DeliveryFormKind, DeliveryMode, UnshieldAsset,
-    UnshieldAssetKey, WalletRoot, broadcaster_candidate_anchor_rate, effective_fee_handling_mode,
-    format_exact_token_amount_for_display, format_native_token_amount_for_display,
-    format_native_top_up_recipient_suffix, format_report_chain, format_send_amount_input,
-    should_show_distinct_amount,
+    UnshieldAssetKey, WalletRoot, app_panel, app_refresh_button, broadcaster_candidate_anchor_rate,
+    copyable_mono_field, effective_fee_handling_mode, format_exact_token_amount_for_display,
+    format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
+    format_report_chain, format_send_amount_input, should_show_distinct_amount,
 };
 
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: gpui::Pixels = px(12.0);
@@ -957,27 +953,7 @@ pub(super) fn render_public_broadcaster_tx_hash_row(
     tx_hash: String,
     button_id: SharedString,
 ) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(72.0))
-                .flex_none()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child("Tx hash"),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .font_family(APP_FONT_FAMILY)
-                .text_size(APP_TEXT_SIZE)
-                .text_color(rgb(theme::TEXT))
-                .child(SharedString::from(tx_hash.clone())),
-        )
-        .child(clipboard_with_toast(button_id, tx_hash))
+    copyable_mono_field("Tx hash", tx_hash, button_id)
 }
 
 pub(super) fn render_public_broadcaster_cost_estimate(
@@ -994,15 +970,7 @@ pub(super) fn render_public_broadcaster_cost_estimate(
     let refresh_root = root.clone();
     let display =
         PublicBroadcasterCostDisplay::from_estimate(asset, estimate, fee_anchor_rate, registry);
-    let card = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(12.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
+    let card = app_panel(theme::SURFACE_ELEVATED, theme::BORDER_STRONG)
         .child(
             div()
                 .flex()
@@ -1058,37 +1026,17 @@ fn render_public_broadcaster_estimate_refresh_button(
     kind: DeliveryFormKind,
     refreshing: bool,
 ) -> impl IntoElement {
-    div()
-        .id(delivery_element_id(key, kind, "refresh-estimate"))
-        .size(px(18.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_sm()
-        .when(refreshing, |this| {
-            this.child(
-                Spinner::new()
-                    .icon(IconName::LoaderCircle)
-                    .color(rgb(theme::TEXT_MUTED).into())
-                    .with_size(px(13.0)),
-            )
-        })
-        .when(!refreshing, |this| {
-            this.cursor_pointer()
-                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                .tooltip(|window, cx| Tooltip::new("Refresh estimate").build(window, cx))
-                .on_click(move |_event, _window, cx| {
-                    cx.stop_propagation();
-                    root.update(cx, |root, cx| {
-                        root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
-                    });
-                })
-                .child(
-                    img(icons::refresh_ccw_icon_path())
-                        .size(px(13.0))
-                        .flex_none(),
-                )
-        })
+    app_refresh_button(
+        delivery_element_id(key, kind, "refresh-estimate"),
+        "Refresh estimate",
+        refreshing,
+        true,
+        move |_window, cx| {
+            root.update(cx, |root, cx| {
+                root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+            });
+        },
+    )
 }
 
 pub(super) const fn public_broadcaster_cost_status(
@@ -1203,15 +1151,7 @@ pub(super) fn render_private_broadcaster_progress_context(
     broadcaster_action: Option<AnyElement>,
 ) -> gpui::Div {
     let display = &context.display;
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(12.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
+    app_panel(theme::SURFACE_ELEVATED, theme::BORDER_STRONG)
         .child(app_strong_text("Transaction context"))
         .child(private_broadcaster_context_row_with_action(
             "Broadcaster",

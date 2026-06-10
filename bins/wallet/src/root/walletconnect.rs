@@ -77,8 +77,9 @@ use super::spend_authorization::{
 };
 use super::utxo::short_hash;
 use super::{
-    WalletRoot, dialog_content_max_height, format_report_chain, new_text_input, rgb_with_alpha,
-    scrollable_dialog_content, secondary_dialog_content_width,
+    WalletRoot, app_step_row, app_stepper_container, dialog_content_max_height,
+    format_report_chain, new_text_input, rgb_with_alpha, scrollable_dialog_content,
+    secondary_dialog_content_width,
 };
 
 mod account_select;

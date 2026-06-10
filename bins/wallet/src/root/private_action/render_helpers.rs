@@ -432,31 +432,7 @@ pub(in crate::root) fn render_unshield_copy_field(
     value: String,
     button_id: SharedString,
 ) -> gpui::Div {
-    div()
-        .flex()
-        .items_start()
-        .gap_2()
-        .child(
-            div()
-                .w(px(72.0))
-                .flex_none()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .p(px(8.0))
-                .rounded_sm()
-                .bg(rgb(theme::BACKGROUND))
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .font_family(APP_FONT_FAMILY)
-                .text_size(APP_TEXT_SIZE)
-                .child(SharedString::from(value.clone())),
-        )
-        .child(clipboard_with_toast(button_id, value))
+    copyable_mono_field(label, value, button_id)
 }
 
 pub(in crate::root) fn render_unshield_native_top_up_control(

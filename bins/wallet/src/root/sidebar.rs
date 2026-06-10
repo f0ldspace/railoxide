@@ -25,7 +25,9 @@ use super::shell::{
     COPY_URL_TOOLTIP, LINK_COPIED_MESSAGE, RAILOXIDE_REPOSITORY_URL, TELEGRAM_URL,
     wallet_build_label,
 };
-use super::{SIDEBAR_WIDTH, WalletRoot, WalletTab, rgb_with_alpha, should_focus_utxo_table};
+use super::{
+    SIDEBAR_WIDTH, WalletRoot, WalletTab, app_status_tag, rgb_with_alpha, should_focus_utxo_table,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Activity {
@@ -197,39 +199,18 @@ impl WalletRoot {
     }
 
     fn render_public_broadcaster_count_badge(count: usize) -> impl IntoElement {
-        let color = theme::SUCCESS;
-        div()
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded_full()
-            .border_1()
-            .border_color(rgb(color))
-            .bg(rgb_with_alpha(color, 0.10))
-            .text_color(rgb(color))
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .line_height(gpui::relative(1.0))
-            .child(count.to_string())
+        app_status_tag(count.to_string(), theme::SUCCESS)
     }
 
     fn render_walletconnect_attention_badge(count: usize) -> impl IntoElement {
-        let color = theme::WARNING;
-        div()
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded_full()
-            .border_1()
-            .border_color(rgb(color))
-            .bg(rgb_with_alpha(color, 0.12))
-            .text_color(rgb(color))
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .line_height(gpui::relative(1.0))
-            .child(if count > 99 {
+        app_status_tag(
+            if count > 99 {
                 "99+".to_owned()
             } else {
                 count.to_string()
-            })
+            },
+            theme::WARNING,
+        )
     }
 
     fn render_network_status_pill(&self, root: &Entity<Self>, collapsed: bool) -> impl IntoElement {

@@ -33,8 +33,8 @@ use super::utxo::should_focus_utxo_table;
 use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
     HERO_WIDE_BREAKPOINT, LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT,
-    SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, chain_load_overrides,
-    rgb_with_alpha,
+    SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, app_status_tag,
+    chain_load_overrides, rgb_with_alpha,
 };
 
 pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
@@ -742,19 +742,8 @@ impl WalletRoot {
     }
 }
 
-fn walletconnect_tab_attention_badge(count: usize) -> gpui::Div {
-    div()
-        .px(px(6.0))
-        .py(px(1.0))
-        .rounded_full()
-        .border_1()
-        .border_color(rgb(theme::WARNING))
-        .bg(rgb_with_alpha(theme::WARNING, 0.12))
-        .text_color(rgb(theme::WARNING))
-        .text_size(px(11.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .line_height(gpui::relative(1.0))
-        .child(attention_count_label(count))
+fn walletconnect_tab_attention_badge(count: usize) -> impl IntoElement {
+    app_status_tag(attention_count_label(count), theme::WARNING)
 }
 
 fn attention_count_label(count: usize) -> String {

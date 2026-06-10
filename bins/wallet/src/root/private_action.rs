@@ -24,7 +24,6 @@ use gpui_component::{
 use railgun_ui::{format_token_amount, short_address};
 use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
-use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
 };
@@ -88,7 +87,7 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     ChainUtxoState, PRIVATE_ASSET_LIST_WIDTH, PublicBroadcasterFeeTokenOption, WalletRoot,
-    dialog_content_max_height, dialog_max_height, effective_fee_handling_mode,
+    copyable_mono_field, dialog_content_max_height, dialog_max_height, effective_fee_handling_mode,
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
     format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
     format_report_chain, format_send_amount_input, format_unshield_amount_input,

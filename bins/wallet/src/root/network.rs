@@ -6,7 +6,7 @@ use gpui::{
     Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, div,
     prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Disableable, Icon, Sizable, button::ButtonVariants};
+use gpui_component::{Disableable, Icon, Sizable, alert::Alert, button::ButtonVariants};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use ui::controls::{app_button, app_strong_text};
@@ -261,18 +261,7 @@ pub(super) fn render_network_status_popover_content(
                 .child(health.detail.to_string()),
         )
         .when_some(error, |this, error| {
-            this.child(
-                div()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme::DANGER))
-                    .bg(rgb_with_alpha(theme::DANGER, 0.08))
-                    .p(px(10.0))
-                    .text_size(px(12.0))
-                    .line_height(px(17.0))
-                    .text_color(rgb(theme::DANGER))
-                    .child(error.to_string()),
-            )
+            this.child(Alert::error("wallet-network-status-error", error.to_string()).small())
         })
         .when(health.mode == WalletNetworkMode::Tor, |this| {
             this.child(

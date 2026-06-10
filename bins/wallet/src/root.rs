@@ -110,8 +110,10 @@ use tokens::{
     token_display_metadata,
 };
 use ui_helpers::{
-    centered_message, dialog_content_max_height, dialog_max_height, labeled_field, rgb_with_alpha,
-    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    app_panel, app_refresh_button, app_status_tag, app_step_row, app_stepper_container,
+    centered_message, copyable_mono_field, dialog_content_max_height, dialog_max_height,
+    labeled_field, rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width,
+    token_label_row,
 };
 use utxo::{BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table};
 use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};

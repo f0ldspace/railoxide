@@ -62,43 +62,21 @@ pub(in crate::root) fn settings_section_header_element(
 }
 
 pub(in crate::root) fn settings_danger_banner(message: impl Into<SharedString>) -> gpui::Div {
-    settings_banner(message, theme::DANGER, theme::DANGER_BG)
+    div()
+        .w_full()
+        .child(Alert::error("wallet-settings-danger-banner", message.into().to_string()).small())
 }
 
 pub(in crate::root) fn settings_info_banner(message: impl Into<SharedString>) -> gpui::Div {
-    settings_banner(message, theme::BORDER, theme::SURFACE_HOVER_SUBTLE)
+    div()
+        .w_full()
+        .child(Alert::info("wallet-settings-info-banner", message.into().to_string()).small())
 }
 
 pub(in crate::root) fn settings_warning_banner(message: impl Into<SharedString>) -> gpui::Div {
-    settings_banner(message, theme::WARNING, theme::WARNING_BG)
-}
-
-pub(in crate::root) fn settings_banner(
-    message: impl Into<SharedString>,
-    border: u32,
-    bg: u32,
-) -> gpui::Div {
     div()
         .w_full()
-        .flex()
-        .items_start()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(border))
-        .bg(rgb(bg))
-        .px(px(10.0))
-        .py(px(7.0))
-        .text_size(px(12.0))
-        .line_height(px(16.0))
-        .text_color(rgb(theme::TEXT))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .whitespace_normal()
-                .child(message.into()),
-        )
+        .child(Alert::warning("wallet-settings-warning-banner", message.into().to_string()).small())
 }
 
 pub(in crate::root) fn settings_text_input(input: &Entity<InputState>) -> Input {
