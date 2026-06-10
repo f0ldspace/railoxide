@@ -28,6 +28,8 @@
         isLinux = pkgs.stdenv.isLinux;
         isDarwin = pkgs.stdenv.isDarwin;
 
+        walletCargoToml = builtins.fromTOML (builtins.readFile ./bins/wallet/Cargo.toml);
+
         linuxBuildInputs = with pkgs; [
           openssl
           sqlite
@@ -76,7 +78,7 @@
       {
         packages.default = rustPlatform.buildRustPackage {
           pname = "railoxide";
-          version = "0.1.0-alpha.2";
+          version = walletCargoToml.package.version;
 
           src = ./.;
 
@@ -86,7 +88,6 @@
           };
 
           cargoBuildFlags = [ "-p" "wallet" ];
-          cargoTestFlags = [ "-p" "wallet" ];
 
           buildFeatures = [ "hardware" ];
 

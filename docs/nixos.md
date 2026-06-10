@@ -4,11 +4,13 @@ The flake supports x86_64-linux, aarch64-linux, x86_64-darwin, and aarch64-darwi
 
 ## Imperative Install
 
-Install the wallet binary directly into your user profile:
+For release installs, pin the flake input to a release tag or commit. Replace `<tag-or-commit>` with the source revision you want to build:
 
 ```bash
-nix profile install github:triamazikamno/railoxide
+nix profile install github:triamazikamno/railoxide/<tag-or-commit>
 ```
+
+Using `github:triamazikamno/railoxide` without a ref tracks the repository default branch and is only recommended when you intentionally want the latest `main`.
 
 The `railoxide` binary will be available on your `PATH`. Run it with:
 
@@ -18,11 +20,11 @@ railoxide
 
 ## Declarative Install (NixOS / home-manager)
 
-Add RailOxide as a flake input in your system or home-manager configuration:
+Add RailOxide as a pinned flake input in your system or home-manager configuration:
 
 ```nix
 {
-  inputs.railoxide.url = "github:triamazikamno/railoxide";
+  inputs.railoxide.url = "github:triamazikamno/railoxide/<tag-or-commit>";
   # ...
 }
 ```

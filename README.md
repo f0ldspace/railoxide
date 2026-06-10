@@ -85,7 +85,7 @@ cargo build --release -p wallet --features hardware
 For complete wallet build guides see
 
 - [`Ubuntu`](docs/build-wallet-ubuntu.md)
-- ['NixOS'](docs/nixos.md)
+- [`NixOS`](docs/nixos.md)
 - [`macOS`](docs/build-wallet-macos.md)
 - [`Windows`](docs/build-wallet-windows.md)
 
