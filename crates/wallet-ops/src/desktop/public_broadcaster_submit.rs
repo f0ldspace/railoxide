@@ -4,7 +4,7 @@ use eyre::eyre;
 pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     request: DesktopUnshieldPublicBroadcasterRequest,
     http: &HttpContext,
-) -> Result<PreparedPublicBroadcasterPlan<UnshieldPlan>> {
+) -> Result<PreparedPublicBroadcasterPlan<DesktopUnshieldPreparedPlan>> {
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
             "selected wallet session is for chain {}, not {}",
@@ -33,7 +33,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.fee_token,
         &request.fee_rows,
         &request.selection,
-        request.unwrap,
+        request.unwrap || request.native_top_up.is_some(),
         request.fee_policy,
         &request.trust_filter,
         request.anchor_cache.as_ref(),
@@ -43,31 +43,61 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     let bound_min_gas_price =
         public_broadcaster_bound_min_gas_price(request.chain_id, min_gas_price);
     let same_token_fee = request.fee_token == request.token;
+    let initial_split = public_broadcaster_amount_split_for_tokens_and_protocol(
+        request.amount,
+        U256::ZERO,
+        request.fee_mode,
+        same_token_fee,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    )?;
+    let initial_native_top_up = request
+        .native_top_up
+        .as_ref()
+        .map(|top_up| {
+            desktop_native_top_up_plan_from_unshield_fields(
+                request.chain_id,
+                &chain,
+                request.view_session.as_ref(),
+                request.vault_store.as_ref(),
+                request.token,
+                request.recipient,
+                request.unwrap,
+                top_up,
+                initial_split.receiver_amount,
+                Some(request.fee_token),
+                U256::ZERO,
+                &utxos,
+            )
+        })
+        .transpose()?;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
     );
     let seeded_fee_amount =
         initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
-            let seed_split = public_broadcaster_amount_split_for_tokens_and_protocol(
-                request.amount,
-                U256::ZERO,
-                request.fee_mode,
-                same_token_fee,
-                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-            )?;
+            if let Some(native_top_up) = &initial_native_top_up {
+                return native_top_up_approximate_shape(
+                    &utxos,
+                    request.token,
+                    request.fee_token,
+                    initial_split.receiver_amount,
+                    U256::ZERO,
+                    native_top_up,
+                );
+            }
             let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
                 request.token,
                 request.fee_token,
-                seed_split.receiver_amount,
+                initial_split.receiver_amount,
                 false,
             )
             .map_err(|error| {
                 public_broadcaster_build_error(
                     error,
                     U256::ZERO,
-                    seed_split.fee_mode,
+                    initial_split.fee_mode,
                     same_token_fee,
                     RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
                 )
@@ -88,6 +118,16 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         min_gas_price,
         seeded_fee_amount,
         |split| {
+            if let Some(native_top_up) = &initial_native_top_up {
+                return native_top_up_approximate_shape(
+                    &utxos,
+                    request.token,
+                    request.fee_token,
+                    split.receiver_amount,
+                    split.fee_amount,
+                    native_top_up,
+                );
+            }
             let selection = unshield_selection_info_with_broadcaster_fee_token(
                 &utxos,
                 request.token,
@@ -172,45 +212,106 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             same_token_fee,
             RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
         )?;
-        let unshield_request = RailgunUnshieldRequest {
-            token_address: request.token,
-            amount: split.receiver_amount,
-            recipient: request.recipient,
-            mode,
-            verify_proof: request.verify_proof,
-            spend_up_to: false,
-            broadcaster_fee: Some(BroadcasterFeeOutput {
-                recipient: broadcaster.address_data,
-                token_address: request.fee_token,
-                amount: fee_amount,
-            }),
-            min_gas_price: bound_min_gas_price,
-        };
+        let native_top_up = request
+            .native_top_up
+            .as_ref()
+            .map(|top_up| {
+                desktop_native_top_up_plan_from_unshield_fields(
+                    request.chain_id,
+                    &chain,
+                    request.view_session.as_ref(),
+                    request.vault_store.as_ref(),
+                    request.token,
+                    request.recipient,
+                    request.unwrap,
+                    top_up,
+                    split.receiver_amount,
+                    Some(request.fee_token),
+                    fee_amount,
+                    &utxos,
+                )
+            })
+            .transpose()?;
         update_transaction_generation_stage(
             request.progress_tx.as_ref(),
             TransactionGenerationStage::ProvingTransaction,
         );
         let proof_started = Instant::now();
-        let plan = tx_builder
-            .build_unshield_plan_with_signer(
-                &request.view_session.scan_keys(),
-                &signer,
-                &forest,
-                &utxos,
-                unshield_request,
-                &prover,
+        let plan = if let Some(native_top_up) = &native_top_up {
+            let mut composite_request = native_top_up_composite_unshield_request(
+                request.token,
+                split.receiver_amount,
+                request.recipient,
+                request.unwrap,
+                request.verify_proof,
+                native_top_up,
+            )?;
+            composite_request.broadcaster_fee = Some(BroadcasterFeeOutput {
+                recipient: broadcaster.address_data,
+                token_address: request.fee_token,
+                amount: fee_amount,
+            });
+            composite_request.min_gas_price = bound_min_gas_price;
+            DesktopUnshieldPreparedPlan::Composite(
+                tx_builder
+                    .build_composite_unshield_plan_with_signer(
+                        &request.view_session.scan_keys(),
+                        &signer,
+                        &forest,
+                        &utxos,
+                        composite_request,
+                        &prover,
+                    )
+                    .await
+                    .map_err(|error| {
+                        public_broadcaster_build_error(
+                            error,
+                            fee_amount,
+                            split.fee_mode,
+                            same_token_fee,
+                            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                        )
+                    })
+                    .wrap_err("build public broadcaster composite unshield proof")?,
             )
-            .await
-            .map_err(|error| {
-                public_broadcaster_build_error(
-                    error,
-                    fee_amount,
-                    split.fee_mode,
-                    same_token_fee,
-                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-                )
-            })
-            .wrap_err("build public broadcaster unshield proof")?;
+        } else {
+            let unshield_request = RailgunUnshieldRequest {
+                token_address: request.token,
+                amount: split.receiver_amount,
+                recipient: request.recipient,
+                mode,
+                verify_proof: request.verify_proof,
+                spend_up_to: false,
+                broadcaster_fee: Some(BroadcasterFeeOutput {
+                    recipient: broadcaster.address_data,
+                    token_address: request.fee_token,
+                    amount: fee_amount,
+                }),
+                min_gas_price: bound_min_gas_price,
+            };
+            DesktopUnshieldPreparedPlan::Single(
+                tx_builder
+                    .build_unshield_plan_with_signer(
+                        &request.view_session.scan_keys(),
+                        &signer,
+                        &forest,
+                        &utxos,
+                        unshield_request,
+                        &prover,
+                    )
+                    .await
+                    .map_err(|error| {
+                        public_broadcaster_build_error(
+                            error,
+                            fee_amount,
+                            split.fee_mode,
+                            same_token_fee,
+                            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                        )
+                    })
+                    .wrap_err("build public broadcaster unshield proof")?,
+            )
+        };
         tracing::info!(
             attempt,
             fee_amount = %fee_amount,
@@ -219,6 +320,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             input_count = plan.input_count(),
             private_output_count = plan.private_output_count(),
             public_output_count = plan.public_output_count(),
+            native_top_up = native_top_up.is_some(),
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
             "built public broadcaster unshield proof"
@@ -228,11 +330,13 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             TransactionGenerationStage::EstimatingBroadcasterFee,
         );
         let gas_started = Instant::now();
+        let call_to = plan.call_to();
+        let call_data = plan.call_data();
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee_from_rpc_pool(
             &query_rpc_pool,
             request.chain_id,
-            plan.call.to,
-            &plan.call.data,
+            call_to,
+            &call_data,
             broadcaster.fee,
             min_gas_price,
             chain.gas.gas_limit_buffer,
@@ -252,9 +356,12 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             "estimated public broadcaster unshield fee"
         );
         if broadcaster_fee_covers(fee_amount, computed_fee) {
-            let protocol_fee_amount = railgun_protocol_fee_amount(
-                split.receiver_amount,
+            let reported_amounts = public_broadcaster_reported_amounts(
+                request.token,
+                request.fee_token,
+                split,
                 RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                native_top_up.as_ref(),
             );
             tracing::info!(
                 attempt,
@@ -270,7 +377,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 TransactionGenerationStage::GeneratingPoiProofs,
             );
             let pre_transaction_pois = public_broadcaster_pre_transaction_pois(
-                &plan.chunks,
+                plan.chunks(),
                 &broadcaster,
                 request.session.as_ref(),
                 request.chain_id,
@@ -280,23 +387,52 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             )
             .await?;
             let pending_persist_started = Instant::now();
-            let pending_contexts = persist_pending_unshield_output_poi_contexts(
-                request.session.db.as_ref(),
-                request.chain_id,
-                request.view_session.wallet_id(),
-                &plan.chunks,
-                &pre_transaction_pois.pending_pois,
-                &pre_transaction_pois.pending_poi_list_keys,
-                true,
-                !same_token_fee,
-            )?;
+            let pending_contexts = match &plan {
+                DesktopUnshieldPreparedPlan::Single(plan) => {
+                    persist_pending_unshield_output_poi_contexts(
+                        request.session.db.as_ref(),
+                        request.chain_id,
+                        request.view_session.wallet_id(),
+                        &plan.chunks,
+                        &pre_transaction_pois.pending_pois,
+                        &pre_transaction_pois.pending_poi_list_keys,
+                        true,
+                        !same_token_fee,
+                    )?
+                }
+                DesktopUnshieldPreparedPlan::Composite(plan) => {
+                    persist_pending_composite_unshield_output_poi_contexts(
+                        request.session.db.as_ref(),
+                        request.chain_id,
+                        request.view_session.wallet_id(),
+                        &plan.chunks,
+                        &plan.private_output_roles,
+                        &pre_transaction_pois.pending_pois,
+                        &pre_transaction_pois.pending_poi_list_keys,
+                    )?
+                }
+            };
             tracing::info!(
                 chain_id = request.chain_id,
                 pending_contexts,
                 elapsed_ms = pending_persist_started.elapsed().as_millis(),
                 "persisted public broadcaster unshield pending output POI contexts"
             );
+            let relay_call_count = match &plan {
+                DesktopUnshieldPreparedPlan::Single(_) => usize::from(request.unwrap),
+                DesktopUnshieldPreparedPlan::Composite(plan) => plan.shape.relay_call_count,
+            };
+            let uses_relay_adapt = match &plan {
+                DesktopUnshieldPreparedPlan::Single(_) => request.unwrap,
+                DesktopUnshieldPreparedPlan::Composite(plan) => plan.shape.uses_relay_adapt,
+            };
             return Ok(PreparedPublicBroadcasterPlan {
+                transaction_count: plan.transaction_count(),
+                input_count: plan.input_count(),
+                private_output_count: plan.private_output_count(),
+                public_output_count: plan.public_output_count(),
+                relay_call_count,
+                uses_relay_adapt,
                 plan,
                 pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois.request_pois,
                 broadcaster,
@@ -304,18 +440,16 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 fee_token: request.fee_token,
                 entered_amount: split.entered_amount,
                 receiver_amount: split.receiver_amount,
-                recipient_amount: recipient_amount_after_protocol_fee(
-                    split.receiver_amount,
-                    protocol_fee_amount,
-                ),
-                total_private_spend: split.total_private_spend,
+                recipient_amount: reported_amounts.recipient_amount,
+                total_private_spend: reported_amounts.total_private_spend,
                 fee_amount,
-                protocol_fee_amount,
+                protocol_fee_amount: reported_amounts.protocol_fee_amount,
                 protocol_fee_bps: RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
                 fee_mode: split.fee_mode,
                 gas_limit,
                 min_gas_price,
                 bound_min_gas_price,
+                native_top_up,
             });
         }
         let next_fee = buffered_public_broadcaster_fee(computed_fee);
@@ -633,6 +767,12 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 "persisted public broadcaster send pending output POI contexts"
             );
             return Ok(PreparedPublicBroadcasterPlan {
+                transaction_count: plan.transaction_count(),
+                input_count: plan.input_count(),
+                private_output_count: plan.private_output_count(),
+                public_output_count: plan.public_output_count(),
+                relay_call_count: 0,
+                uses_relay_adapt: false,
                 plan,
                 pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois.request_pois,
                 broadcaster,
@@ -652,6 +792,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 gas_limit,
                 min_gas_price,
                 bound_min_gas_price,
+                native_top_up: None,
             });
         }
         let next_fee = buffered_public_broadcaster_fee(computed_fee);
@@ -846,6 +987,13 @@ pub(super) async fn submit_public_broadcaster_plan(
     gas_limit: u64,
     min_gas_price: u128,
     bound_min_gas_price: u128,
+    transaction_count: usize,
+    input_count: usize,
+    private_output_count: usize,
+    public_output_count: usize,
+    relay_call_count: usize,
+    uses_relay_adapt: bool,
+    native_top_up: Option<DesktopNativeTopUpPlan>,
     progress_tx: Option<TransactionGenerationProgressSender>,
     timeout: Duration,
     republish_interval: Duration,
@@ -996,6 +1144,13 @@ pub(super) async fn submit_public_broadcaster_plan(
         fee_mode,
         gas_limit,
         min_gas_price,
+        transaction_count,
+        input_count,
+        private_output_count,
+        public_output_count,
+        relay_call_count,
+        uses_relay_adapt,
         result,
+        native_top_up,
     })
 }

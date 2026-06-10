@@ -5,10 +5,10 @@ use crate::assets::{RailgunActionIcon, WalletIconSource};
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::FeeRow;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Context, ElementId, Entity, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, deferred, div,
-    prelude::FluentBuilder as _, px, rgb,
+    Animation, AnimationExt as _, App, AppContext, Bounds, Context, ElementId, Entity, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels, RenderOnce,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, anchored, canvas,
+    deferred, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
@@ -30,17 +30,20 @@ use ui::controls::{
 };
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    BroadcasterFeePolicy, DesktopPrivateSpendAuthorization, DesktopSelfBroadcastResult,
-    DesktopSendCalldataRequest, DesktopSendPublicBroadcasterRequest,
-    DesktopSendSelfBroadcastRequest, DesktopUnshieldCalldataRequest,
-    DesktopUnshieldPublicBroadcasterRequest, DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode,
-    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
-    PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
-    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
-    TokenAnchorRateCache, TransactionGenerationStage, WalletSession,
-    fee_policy_eligible_public_broadcasters, parse_railgun_recipient, parse_send_amount,
-    parse_unshield_amount, prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
+    BroadcasterFeePolicy, DesktopNativeTopUpPlan, DesktopNativeTopUpRequest,
+    DesktopPrivateSpendAuthorization, DesktopSelfBroadcastResult, DesktopSendCalldataRequest,
+    DesktopSendPublicBroadcasterRequest, DesktopSendSelfBroadcastRequest,
+    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest,
+    DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode, ListUtxosOutput, PreparedSendCall,
+    PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
+    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
+    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TokenAnchorRateCache,
+    TransactionGenerationStage, WalletSession, fee_policy_eligible_public_broadcasters,
+    native_top_up_policy_for_chain, native_top_up_primary_recipient_amount_for_fee_mode,
+    native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,
+    parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
+    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
     quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy_and_trust,
     settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
@@ -64,7 +67,7 @@ use super::gas_fee::{
 };
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
-    refresh_form_asset_from_snapshot,
+    max_unshield_amount_from_snapshot, refresh_form_asset_from_snapshot,
 };
 use super::private_broadcaster::{
     private_broadcaster_closed_active_progress, render_private_broadcaster_status_notice,
@@ -84,16 +87,18 @@ use super::spend_authorization::{
 };
 use super::utxo::short_hash;
 use super::{
-    ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
-    PublicBroadcasterFeeTokenOption, WalletRoot, dialog_content_max_height, dialog_max_height,
-    effective_fee_handling_mode, format_exact_token_amount_for_display, format_report_chain,
-    format_send_amount_input, format_unshield_amount_input, is_effective_wrapped_native_token,
-    labeled_field, native_token_display_label, native_wrapped_output_labels, new_prefilled_input,
-    new_text_input, parse_address, public_balance_amount_label,
-    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    scrollable_dialog_content, secondary_dialog_content_width, send_form_max_entered_amount,
-    should_show_fee_mode_toggle, token_label_row, unshield_form_max_entered_amount,
-    unshield_max_entered_amount_for_mode, vault_error_kind,
+    ChainUtxoState, PRIVATE_ASSET_LIST_WIDTH, PublicBroadcasterFeeTokenOption, WalletRoot,
+    dialog_content_max_height, dialog_max_height, effective_fee_handling_mode,
+    format_exact_token_amount_for_display, format_native_token_amount_for_display,
+    format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
+    format_report_chain, format_send_amount_input, format_unshield_amount_input,
+    is_effective_wrapped_native_token, labeled_field, native_token_display_label,
+    native_wrapped_output_labels, new_prefilled_input, new_text_input, parse_address,
+    public_balance_amount_label, public_broadcaster_fee_token_warning,
+    public_broadcaster_submit_disabled_for_fee_token_options, scrollable_dialog_content,
+    secondary_dialog_content_width, send_form_max_entered_amount, should_show_fee_mode_toggle,
+    token_label_row, unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
+    vault_error_kind,
 };
 
 mod delivery;

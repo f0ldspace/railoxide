@@ -1,14 +1,16 @@
 use super::{
-    Address, App, Arc, BroadcasterChoice, BroadcasterFeePolicy, DesktopSelfBroadcastResult,
-    DesktopVaultStore, DesktopViewSession, Eip1559GasFeeEditorState, Entity, FeeHandlingMode,
-    FeeRow, InputState, IntoElement, PreparedSendCall, PreparedUnshieldCall, PublicAccountSource,
-    PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
-    ScrollHandle, SearchableVec, SelectItem, SelectState, SelfBroadcastGasFeeSelection,
-    SharedString, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
-    TransactionGenerationStage, U256, WalletIconSource, WalletSession, Window,
-    format_send_amount_input, format_unshield_amount_input, private_action_asset_select_row,
-    self_broadcast_gas_payer_fields_match, self_broadcast_gas_payer_select_menu_row,
-    self_broadcast_gas_payer_select_trigger_row, short_address,
+    Address, App, Arc, BroadcasterChoice, BroadcasterFeePolicy, DesktopNativeTopUpPlan,
+    DesktopSelfBroadcastResult, DesktopVaultStore, DesktopViewSession, Eip1559GasFeeEditorState,
+    Entity, FeeHandlingMode, FeeRow, InputState, IntoElement, PreparedSendCall,
+    PreparedUnshieldCall, PublicAccountSource, PublicBroadcasterCostEstimate,
+    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, ScrollHandle, SearchableVec,
+    SelectItem, SelectState, SelfBroadcastGasFeeSelection, SharedString, SpendAuthorizationSummary,
+    SpendAuthorizationSummaryRow, TransactionGenerationStage, U256, WalletIconSource,
+    WalletSession, Window, format_send_amount_input, format_unshield_amount_input,
+    native_token_display_label, native_top_up_primary_recipient_amount_for_fee_mode,
+    private_action_asset_select_row, self_broadcast_gas_payer_fields_match,
+    self_broadcast_gas_payer_select_menu_row, self_broadcast_gas_payer_select_trigger_row,
+    short_address,
 };
 
 #[cfg(test)]
@@ -19,6 +21,13 @@ pub(in crate::root) const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster unshield spend: unlock failed";
 pub(in crate::root) const SELF_BROADCAST_PRIVACY_WARNING: &str = "Self-broadcast links the selected Public account, RPC metadata, and transaction timing to this private action.";
 pub(in crate::root) const SELF_BROADCAST_ZERO_GAS_PAYER_WARNING: &str = "Selected gas payer has 0 native balance on this chain. Choose another Public account or fund this account before self-broadcasting.";
+
+pub(in crate::root) fn native_top_up_privacy_warning(chain_id: u64) -> String {
+    format!(
+        "Sending two currencies together can reveal a stronger linkage signal and demonstrates spendable private balances in both assets. The {} top-up goes to the recipient wallet. It does not pay the transaction or broadcaster fee.",
+        native_token_display_label(chain_id)
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::root) enum DeliveryMode {
@@ -231,6 +240,7 @@ pub(in crate::root) struct UnshieldSpendDraft {
     pub(in crate::root) session: Arc<WalletSession>,
     pub(in crate::root) recipient: Address,
     pub(in crate::root) amount: U256,
+    pub(in crate::root) native_top_up: Option<DesktopNativeTopUpPlan>,
     pub(in crate::root) self_broadcast_public_account_uuid: Option<String>,
     pub(in crate::root) self_broadcast_gas_payer_display: Option<String>,
     pub(in crate::root) self_broadcast_gas_payer_source: Option<PublicAccountSource>,
@@ -284,43 +294,87 @@ pub(in crate::root) fn private_send_gas_payer_authorization_summary(
 pub(in crate::root) fn private_unshield_authorization_summary(
     draft: &UnshieldSpendDraft,
 ) -> SpendAuthorizationSummary {
+    let mut rows = vec![
+        SpendAuthorizationSummaryRow::new(
+            if draft.native_top_up.is_some() {
+                "Recipient receives"
+            } else {
+                "Amount"
+            },
+            private_unshield_recipient_amount_label(draft),
+        )
+        .with_icon(draft.asset.icon_path.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+    ];
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Delivery",
+        draft.delivery_mode.label(),
+    ));
     SpendAuthorizationSummary::new(
         "Private unshield",
         "Enter your vault password to authorize this unshield.",
-        vec![
-            SpendAuthorizationSummaryRow::new(
-                "Amount",
-                private_amount_label(draft.amount, &draft.asset, false),
-            )
-            .with_icon(draft.asset.icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
-            SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
-        ],
+        rows,
     )
 }
 
 pub(in crate::root) fn private_unshield_gas_payer_authorization_summary(
     draft: &UnshieldSpendDraft,
 ) -> SpendAuthorizationSummary {
+    let mut rows = vec![
+        SpendAuthorizationSummaryRow::new(
+            if draft.native_top_up.is_some() {
+                "Recipient receives"
+            } else {
+                "Amount"
+            },
+            private_unshield_recipient_amount_label(draft),
+        )
+        .with_icon(draft.asset.icon_path.clone()),
+        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+    ];
+    rows.push(SpendAuthorizationSummaryRow::new(
+        "Gas payer",
+        draft
+            .self_broadcast_gas_payer_display
+            .clone()
+            .unwrap_or_else(|| "Selected Public account".to_owned()),
+    ));
     SpendAuthorizationSummary::new(
         "Self-broadcast gas payer",
         "Enter the vault password to unlock the selected software Public gas-payer account. Hardware approval is still required for the private spend.",
-        vec![
-            SpendAuthorizationSummaryRow::new(
-                "Amount",
-                private_amount_label(draft.amount, &draft.asset, false),
-            )
-            .with_icon(draft.asset.icon_path.clone()),
-            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
-            SpendAuthorizationSummaryRow::new(
-                "Gas payer",
-                draft
-                    .self_broadcast_gas_payer_display
-                    .clone()
-                    .unwrap_or_else(|| "Selected Public account".to_owned()),
-            ),
-        ],
+        rows,
     )
+}
+
+fn private_unshield_recipient_amount_label(draft: &UnshieldSpendDraft) -> String {
+    if let Some(top_up) = draft.native_top_up.as_ref() {
+        let recipient_amount = draft
+            .cost_estimate
+            .as_ref()
+            .filter(|estimate| {
+                draft.delivery_mode == DeliveryMode::PublicBroadcaster
+                    && estimate.native_top_up.as_ref() == Some(top_up)
+            })
+            .map_or_else(
+                || {
+                    native_top_up_primary_recipient_amount_for_fee_mode(
+                        draft.asset.token,
+                        top_up.wrapped_native_token,
+                        draft.amount,
+                        draft.fee_mode,
+                        top_up.native_amount,
+                    )
+                },
+                |estimate| estimate.recipient_amount,
+            );
+        let amount = private_amount_label(recipient_amount, &draft.asset, false);
+        return super::format_recipient_amount_with_native_top_up(
+            amount,
+            draft.asset.chain_id,
+            top_up.native_amount,
+        );
+    }
+    private_amount_label(draft.amount, &draft.asset, false)
 }
 
 pub(in crate::root) fn private_amount_label(
@@ -348,6 +402,8 @@ pub(in crate::root) struct UnshieldFormState {
         Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
     pub(in crate::root) asset_select_items: Vec<PrivateActionAssetSelectItem>,
     pub(in crate::root) unwrap: bool,
+    pub(in crate::root) native_top_up: Option<DesktopNativeTopUpPlan>,
+    pub(in crate::root) native_top_up_enabled: bool,
     pub(in crate::root) delivery_mode: DeliveryMode,
     pub(in crate::root) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
     pub(in crate::root) self_broadcast_gas_payer_select:

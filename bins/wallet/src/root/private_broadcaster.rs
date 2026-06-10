@@ -32,7 +32,8 @@ use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
     dialog_content_max_height, dialog_max_height, format_native_token_amount_for_display,
-    scrollable_dialog_content, secondary_dialog_content_width,
+    format_recipient_amount_with_native_top_up, scrollable_dialog_content,
+    secondary_dialog_content_width,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
@@ -92,6 +93,7 @@ pub(super) struct PrivateBroadcasterProgressState {
     pub(super) asset_label: Arc<str>,
     pub(super) icon_path: Option<WalletIconSource>,
     pub(super) recipient: Arc<str>,
+    pub(super) recipient_output: Option<Arc<str>>,
     pub(super) gas_payer: Option<Arc<str>>,
     pub(super) steps: Vec<PrivateBroadcasterProgressStepState>,
     pub(super) estimate: Option<PublicBroadcasterCostEstimate>,
@@ -563,6 +565,7 @@ impl WalletRoot {
             asset_label: Arc::clone(&asset_label),
             icon_path,
             recipient: Arc::from(recipient),
+            recipient_output: None,
             gas_payer: None,
             steps: private_broadcaster_progress_steps(),
             estimate,
@@ -592,6 +595,7 @@ impl WalletRoot {
         asset_label: String,
         icon_path: Option<WalletIconSource>,
         recipient: String,
+        recipient_output: Option<String>,
         gas_payer: String,
         command_tx: Option<SelfBroadcastCommandSender>,
         current_gas_fee: Option<(u128, u128)>,
@@ -609,6 +613,7 @@ impl WalletRoot {
             asset_label: Arc::clone(&asset_label),
             icon_path,
             recipient: Arc::from(recipient),
+            recipient_output: recipient_output.map(Arc::from),
             gas_payer: Some(Arc::from(gas_payer)),
             steps: self_broadcast_progress_steps(kind),
             estimate: None,
@@ -1432,6 +1437,9 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
             spend_authorization_recipient_display(progress.recipient.as_ref()),
         ));
     if let Some(result) = progress.self_broadcast_result.as_ref() {
+        for (label, value) in self_broadcast_composite_output_rows(progress, result) {
+            context = context.child(private_broadcaster_context_row(label, value));
+        }
         context = context
             .child(private_broadcaster_context_row(
                 "Max fee",
@@ -1463,6 +1471,35 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
             ));
     }
     context
+}
+
+pub(in crate::root) fn self_broadcast_composite_output_rows(
+    progress: &PrivateBroadcasterProgressState,
+    result: &DesktopSelfBroadcastResult,
+) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    if let Some(output) = progress.recipient_output.as_ref() {
+        let output = result.native_top_up.as_ref().map_or_else(
+            || output.to_string(),
+            |top_up| {
+                format_recipient_amount_with_native_top_up(
+                    output.to_string(),
+                    result.chain_id,
+                    top_up.native_amount,
+                )
+            },
+        );
+        rows.push(("Recipient receives", output));
+    } else if let Some(top_up) = result.native_top_up.as_ref() {
+        rows.push((
+            "Recipient receives",
+            format!(
+                "{} (gas top-up)",
+                format_native_token_amount_for_display(result.chain_id, top_up.native_amount)
+            ),
+        ));
+    }
+    rows
 }
 
 fn render_private_broadcaster_progress_footer(

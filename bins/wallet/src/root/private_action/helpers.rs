@@ -181,6 +181,35 @@ pub(in crate::root) fn private_action_amount_input_error(
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::root) struct UnshieldNativeTopUpState {
+    pub(in crate::root) plan: Option<DesktopNativeTopUpPlan>,
+}
+
+pub(in crate::root) fn native_top_up_request_from_plan(
+    plan: Option<&DesktopNativeTopUpPlan>,
+) -> Option<DesktopNativeTopUpRequest> {
+    plan.map(|plan| DesktopNativeTopUpRequest {
+        public_account_uuid: plan.public_account_uuid.clone(),
+        native_balance: plan.native_balance_before,
+    })
+}
+
+pub(in crate::root) fn enabled_native_top_up_plan(
+    enabled: bool,
+    plan: Option<&DesktopNativeTopUpPlan>,
+) -> Option<DesktopNativeTopUpPlan> {
+    enabled.then(|| plan.cloned()).flatten()
+}
+
+pub(in crate::root) const fn native_top_up_refresh_invalidates_estimate(
+    was_enabled: bool,
+    enabled_after_refresh: bool,
+    changed: bool,
+) -> bool {
+    was_enabled && (changed || !enabled_after_refresh)
+}
+
 pub(in crate::root) fn form_error_public_broadcaster_max_entered_amount(
     error: &str,
 ) -> Option<U256> {
@@ -344,6 +373,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let mut reschedule_estimates = Vec::new();
+        let mut refresh_native_top_up = Vec::new();
         for (key, form) in &mut self.send_forms {
             if key.chain_id != snapshot.chain_id {
                 continue;
@@ -370,6 +400,7 @@ impl WalletRoot {
             if key.chain_id != snapshot.chain_id {
                 continue;
             }
+            refresh_native_top_up.push(*key);
             let updated = refresh_form_asset_from_snapshot(
                 snapshot,
                 &form.asset,
@@ -388,6 +419,9 @@ impl WalletRoot {
                 reschedule_estimates.push((DeliveryFormKind::Unshield, *key));
             }
         }
+        for key in refresh_native_top_up {
+            self.refresh_unshield_native_top_up_state(key, cx);
+        }
         for (kind, key) in reschedule_estimates {
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
         }
@@ -403,6 +437,196 @@ impl WalletRoot {
             ) => Some(snapshot),
             _ => None,
         }
+    }
+
+    pub(in crate::root) fn refresh_unshield_native_top_up_state(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((chain_id, token, unwrap, recipient, amount, fee_mode, generating)) =
+            self.unshield_forms.get(&key).map(|form| {
+                let recipient = parse_address(form.recipient_value.trim());
+                let amount = parse_unshield_amount(
+                    form.amount_input.read(cx).value().as_ref(),
+                    form.asset.decimals,
+                )
+                .ok();
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    form.unwrap,
+                    recipient,
+                    amount,
+                    form.fee_mode,
+                    form.generating,
+                )
+            })
+        else {
+            return;
+        };
+        if generating {
+            return;
+        }
+        let state = recipient.zip(amount).map_or_else(
+            UnshieldNativeTopUpState::default,
+            |(recipient, amount)| {
+                self.unshield_native_top_up_state(
+                    chain_id, recipient, token, unwrap, amount, fee_mode,
+                )
+            },
+        );
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        let was_enabled = form.native_top_up_enabled;
+        let changed = form.native_top_up != state.plan;
+        form.native_top_up = state.plan;
+        if form.native_top_up.is_none() {
+            form.native_top_up_enabled = false;
+        }
+        let active_shape_changed = native_top_up_refresh_invalidates_estimate(
+            was_enabled,
+            form.native_top_up_enabled,
+            changed,
+        );
+        let should_reschedule =
+            form.delivery_mode == DeliveryMode::PublicBroadcaster && active_shape_changed;
+        if active_shape_changed {
+            form.result = None;
+            form.cost_estimate = None;
+            form.estimate_id = 0;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+        }
+        if changed || active_shape_changed {
+            cx.notify();
+        }
+        if should_reschedule {
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        }
+    }
+
+    pub(in crate::root) fn maybe_schedule_unshield_native_top_up_balance_refresh(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_balance_refreshing {
+            return;
+        }
+        let Some((chain_id, recipient, generating)) = self.unshield_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                parse_address(form.recipient_value.trim()),
+                form.generating,
+            )
+        }) else {
+            return;
+        };
+        let Some(recipient) = recipient else {
+            return;
+        };
+        if generating
+            || native_top_up_policy_for_chain(chain_id).is_none()
+            || self.effective_wrapped_native_token(chain_id).is_none()
+        {
+            return;
+        }
+        if unshield_native_top_up_needs_public_balance_refresh(
+            chain_id,
+            recipient,
+            &self.public_accounts,
+            self.public_balance_snapshot.as_deref(),
+        ) {
+            self.schedule_public_balance_refresh(cx);
+        }
+    }
+
+    fn unshield_native_top_up_state(
+        &self,
+        chain_id: u64,
+        recipient: Address,
+        token: Address,
+        unwrap: bool,
+        amount: U256,
+        fee_mode: FeeHandlingMode,
+    ) -> UnshieldNativeTopUpState {
+        unshield_native_top_up_state_from_inputs(
+            chain_id,
+            token,
+            unwrap,
+            recipient,
+            amount,
+            fee_mode,
+            &self.public_accounts,
+            self.public_balance_snapshot.as_deref(),
+            self.private_action_snapshot(chain_id),
+            self.effective_wrapped_native_token(chain_id),
+        )
+    }
+
+    fn effective_wrapped_native_token(&self, chain_id: u64) -> Option<Address> {
+        self.effective_chain_configs
+            .get(&chain_id)
+            .and_then(|chain| chain.wrapped_native_token.as_deref())
+            .and_then(parse_address)
+    }
+
+    pub(in crate::root) fn set_unshield_native_top_up_enabled(
+        &mut self,
+        key: UnshieldAssetKey,
+        enabled: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.refresh_unshield_native_top_up_state(key, cx);
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating
+            || form.native_top_up_enabled == enabled
+            || (enabled && form.native_top_up.is_none())
+        {
+            return;
+        }
+        form.native_top_up_enabled = enabled;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        let delivery_mode = form.delivery_mode;
+        cx.notify();
+        if delivery_mode == DeliveryMode::PublicBroadcaster {
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        }
+    }
+
+    pub(in crate::root) fn refresh_unshield_native_top_up_states_for_chain(
+        &mut self,
+        chain_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let keys = self
+            .unshield_forms
+            .iter()
+            .filter_map(|(key, form)| (form.asset.chain_id == chain_id).then_some(*key))
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.refresh_unshield_native_top_up_state(key, cx);
+        }
+    }
+
+    pub(in crate::root) fn unshield_delivery_affects_visible_public_account(
+        &self,
+        chain_id: u64,
+        recipient: Address,
+    ) -> bool {
+        self.selected_chain == chain_id
+            && self.public_accounts.iter().any(|account| {
+                account.status == PublicAccountStatus::Active && account.address == recipient
+            })
     }
 
     pub(in crate::root) fn private_action_asset_options(
@@ -468,6 +692,114 @@ impl WalletRoot {
         }
         sync_private_action_asset_select_entity(&select, &assets, selected_token, window, cx);
     }
+}
+
+pub(in crate::root) fn unshield_native_top_up_state_from_inputs(
+    chain_id: u64,
+    token: Address,
+    unwrap: bool,
+    recipient: Address,
+    amount: U256,
+    fee_mode: FeeHandlingMode,
+    public_accounts: &[PublicAccountMetadata],
+    public_balance_snapshot: Option<&PublicBalanceSnapshot>,
+    private_action_snapshot: Option<&ListUtxosOutput>,
+    wrapped_native_token: Option<Address>,
+) -> UnshieldNativeTopUpState {
+    let Some(policy) = native_top_up_policy_for_chain(chain_id) else {
+        return UnshieldNativeTopUpState::default();
+    };
+    let Some(wrapped_native_token) = wrapped_native_token else {
+        return UnshieldNativeTopUpState::default();
+    };
+    let Some(account) = public_accounts.iter().find(|account| {
+        account.status == PublicAccountStatus::Active && account.address == recipient
+    }) else {
+        return UnshieldNativeTopUpState::default();
+    };
+    let Some(snapshot) = public_balance_snapshot else {
+        return UnshieldNativeTopUpState::default();
+    };
+    if snapshot.chain_id != chain_id {
+        return UnshieldNativeTopUpState::default();
+    }
+    let Some(native_balance) = snapshot.accounts.iter().find_map(|entry| {
+        (entry.account.public_account_uuid == account.public_account_uuid).then(|| {
+            entry
+                .balances
+                .iter()
+                .find(|balance| balance.asset.id == PublicAssetId::Native)
+        })?
+    }) else {
+        return UnshieldNativeTopUpState::default();
+    };
+    let PublicBalanceAmount::Available(native_balance) = native_balance.amount else {
+        return UnshieldNativeTopUpState::default();
+    };
+    if native_balance >= policy.offer_threshold {
+        return UnshieldNativeTopUpState::default();
+    }
+    if unwrap {
+        return UnshieldNativeTopUpState::default();
+    }
+    let wrapped_native_amount = native_top_up_wrapped_native_amount(policy.top_up_amount);
+    let required_wrapped_native = native_top_up_required_wrapped_native_amount_for_fee_mode(
+        token,
+        wrapped_native_token,
+        amount,
+        fee_mode,
+        policy.top_up_amount,
+    );
+    let max_wrapped_native = private_action_snapshot.map_or(U256::ZERO, |snapshot| {
+        max_unshield_amount_from_snapshot(snapshot, wrapped_native_token)
+    });
+    if max_wrapped_native < required_wrapped_native {
+        return UnshieldNativeTopUpState::default();
+    }
+
+    UnshieldNativeTopUpState {
+        plan: Some(DesktopNativeTopUpPlan {
+            public_account_uuid: account.public_account_uuid.clone(),
+            recipient,
+            wrapped_native_token,
+            native_amount: policy.top_up_amount,
+            wrapped_native_amount,
+            native_balance_before: native_balance,
+        }),
+    }
+}
+
+pub(in crate::root) fn unshield_native_top_up_needs_public_balance_refresh(
+    chain_id: u64,
+    recipient: Address,
+    public_accounts: &[PublicAccountMetadata],
+    public_balance_snapshot: Option<&PublicBalanceSnapshot>,
+) -> bool {
+    if native_top_up_policy_for_chain(chain_id).is_none() {
+        return false;
+    }
+    let Some(account) = public_accounts.iter().find(|account| {
+        account.status == PublicAccountStatus::Active && account.address == recipient
+    }) else {
+        return false;
+    };
+    let Some(snapshot) = public_balance_snapshot else {
+        return true;
+    };
+    if snapshot.chain_id != chain_id {
+        return true;
+    }
+    let Some(account_balances) = snapshot
+        .accounts
+        .iter()
+        .find(|entry| entry.account.public_account_uuid == account.public_account_uuid)
+    else {
+        return true;
+    };
+    !account_balances
+        .balances
+        .iter()
+        .any(|balance| balance.asset.id == PublicAssetId::Native)
 }
 
 pub(in crate::root) fn adjusted_amount_for_max_change(

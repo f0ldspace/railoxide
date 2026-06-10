@@ -651,6 +651,7 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         asset_label: Arc::from("ETH"),
         icon_path: None,
         recipient: Arc::from("0zk"),
+        recipient_output: None,
         gas_payer: None,
         steps: private_broadcaster_progress_steps(),
         estimate: None,
@@ -781,6 +782,33 @@ fn private_self_broadcast_success_requires_successful_receipt() {
     assert!(!private_broadcaster_progress_is_successful(&progress));
 }
 
+#[test]
+fn self_broadcast_composite_output_rows_show_primary_and_top_up_outputs() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    progress.kind = DeliveryFormKind::Unshield;
+    progress.recipient_output = Some(Arc::from("100 USDC"));
+    let mut result = test_self_broadcast_result(true);
+    result.native_top_up = Some(DesktopNativeTopUpPlan {
+        public_account_uuid: "public-account".to_string(),
+        recipient: Address::from([0x42; 20]),
+        wrapped_native_token: Address::from([0x43; 20]),
+        native_amount: uint!(3_000_000_000_000_000_U256),
+        wrapped_native_amount: wallet_ops::native_top_up_wrapped_native_amount(uint!(
+            3_000_000_000_000_000_U256
+        )),
+        native_balance_before: U256::ZERO,
+    });
+
+    assert_eq!(
+        self_broadcast_composite_output_rows(&progress, &result),
+        vec![(
+            "Recipient receives",
+            "100 USDC + 0.003 ETH (gas top-up)".to_string()
+        )]
+    );
+}
+
 fn test_self_broadcast_result(status: bool) -> DesktopSelfBroadcastResult {
     DesktopSelfBroadcastResult {
         chain_id: 1,
@@ -799,5 +827,6 @@ fn test_self_broadcast_result(status: bool) -> DesktopSelfBroadcastResult {
             gas_used: 21_000,
         },
         attempts: Vec::new(),
+        native_top_up: None,
     }
 }

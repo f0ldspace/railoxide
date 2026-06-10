@@ -240,6 +240,7 @@ impl WalletRoot {
             chain_id,
             fee_token,
             false,
+            false,
             favorites_only,
             policy,
         );
@@ -257,7 +258,15 @@ impl WalletRoot {
         &mut self,
         key: UnshieldAssetKey,
     ) {
-        let Some((chain_id, fee_token, unwrap, choice, allow_suspicious, favorites_only)) = self
+        let Some((
+            chain_id,
+            fee_token,
+            unwrap,
+            native_top_up,
+            choice,
+            allow_suspicious,
+            favorites_only,
+        )) = self
             .unshield_forms
             .get(&key)
             .filter(|form| matches!(form.broadcaster_choice, BroadcasterChoice::Specific { .. }))
@@ -266,6 +275,7 @@ impl WalletRoot {
                     form.asset.chain_id,
                     form.selected_fee_token,
                     form.unwrap,
+                    form.native_top_up_enabled && form.native_top_up.is_some(),
                     form.broadcaster_choice.clone(),
                     form.allow_suspicious_broadcasters,
                     form.favorites_only_broadcasters,
@@ -279,6 +289,7 @@ impl WalletRoot {
             chain_id,
             fee_token,
             unwrap,
+            native_top_up,
             favorites_only,
             policy,
         );

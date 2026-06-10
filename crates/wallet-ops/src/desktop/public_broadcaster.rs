@@ -226,6 +226,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub amount: U256,
     pub recipient: Address,
     pub unwrap: bool,
+    pub native_top_up: Option<DesktopNativeTopUpRequest>,
     pub verify_proof: bool,
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
@@ -272,6 +273,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub amount: U256,
     pub recipient: Address,
     pub unwrap: bool,
+    pub native_top_up: Option<DesktopNativeTopUpRequest>,
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: FeeHandlingMode,
@@ -318,6 +320,9 @@ pub struct PublicBroadcasterCostEstimate {
     pub input_count: usize,
     pub private_output_count: usize,
     pub public_output_count: usize,
+    pub relay_call_count: usize,
+    pub uses_relay_adapt: bool,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,7 +347,14 @@ pub struct PublicBroadcasterSubmissionResult {
     pub fee_mode: FeeHandlingMode,
     pub gas_limit: u64,
     pub min_gas_price: u128,
+    pub transaction_count: usize,
+    pub input_count: usize,
+    pub private_output_count: usize,
+    pub public_output_count: usize,
+    pub relay_call_count: usize,
+    pub uses_relay_adapt: bool,
     pub result: PublicBroadcasterResultKind,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +375,13 @@ pub(super) struct PreparedPublicBroadcasterPlan<P> {
     pub(super) gas_limit: u64,
     pub(super) min_gas_price: u128,
     pub(super) bound_min_gas_price: u128,
+    pub(super) transaction_count: usize,
+    pub(super) input_count: usize,
+    pub(super) private_output_count: usize,
+    pub(super) public_output_count: usize,
+    pub(super) relay_call_count: usize,
+    pub(super) uses_relay_adapt: bool,
+    pub(super) native_top_up: Option<DesktopNativeTopUpPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +389,7 @@ pub struct PreparedUnshieldCall {
     pub chain_id: u64,
     pub token: Address,
     pub amount: U256,
+    pub fee_mode: FeeHandlingMode,
     pub recipient: Address,
     pub unwrap: bool,
     pub max_spendable: U256,
@@ -379,6 +399,7 @@ pub struct PreparedUnshieldCall {
     pub public_output_count: usize,
     pub to: Address,
     pub data: String,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,12 +430,84 @@ pub struct DesktopSelfBroadcastResult {
     pub live_native_balance: U256,
     pub tx: TxReceiptOutput,
     pub attempts: Vec<SelfBroadcastAttemptInfo>,
+    pub native_top_up: Option<DesktopNativeTopUpPlan>,
 }
 
 pub(super) struct PreparedPrivatePlan<P> {
     pub(super) plan: P,
     pub(super) max_spendable: U256,
     pub(super) prover: ProverService,
+}
+
+pub(super) struct PreparedDesktopUnshieldPlan {
+    pub(super) plan: DesktopUnshieldPreparedPlan,
+    pub(super) max_spendable: U256,
+    pub(super) prover: ProverService,
+    pub(super) native_top_up: Option<DesktopNativeTopUpPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum DesktopUnshieldPreparedPlan {
+    Single(UnshieldPlan),
+    Composite(CompositeUnshieldPlan),
+}
+
+impl DesktopUnshieldPreparedPlan {
+    pub(super) fn chunks(&self) -> &[TransactionPlanChunk] {
+        match self {
+            Self::Single(plan) => &plan.chunks,
+            Self::Composite(plan) => &plan.chunks,
+        }
+    }
+
+    pub(super) fn input_utxos(&self) -> Vec<Utxo> {
+        match self {
+            Self::Single(plan) => plan.inputs.iter().map(|input| input.utxo.clone()).collect(),
+            Self::Composite(plan) => plan.inputs.iter().map(|input| input.utxo.clone()).collect(),
+        }
+    }
+
+    pub(super) fn call_to(&self) -> Address {
+        match self {
+            Self::Single(plan) => plan.call.to,
+            Self::Composite(plan) => plan.call.to,
+        }
+    }
+
+    pub(super) fn call_data(&self) -> Bytes {
+        match self {
+            Self::Single(plan) => plan.call.data.clone(),
+            Self::Composite(plan) => plan.call.data.clone(),
+        }
+    }
+
+    pub(super) fn transaction_count(&self) -> usize {
+        match self {
+            Self::Single(plan) => plan.transaction_count(),
+            Self::Composite(plan) => plan.shape.transaction_count,
+        }
+    }
+
+    pub(super) fn input_count(&self) -> usize {
+        match self {
+            Self::Single(plan) => plan.input_count(),
+            Self::Composite(plan) => plan.shape.input_count,
+        }
+    }
+
+    pub(super) fn private_output_count(&self) -> usize {
+        match self {
+            Self::Single(plan) => plan.private_output_count(),
+            Self::Composite(plan) => plan.shape.private_output_count,
+        }
+    }
+
+    pub(super) fn public_output_count(&self) -> usize {
+        match self {
+            Self::Single(plan) => plan.public_output_count(),
+            Self::Composite(plan) => plan.shape.public_output_count,
+        }
+    }
 }
 
 pub(super) struct PreparedBlockedShieldRescuePlan {
@@ -434,6 +527,7 @@ pub(super) struct DesktopUnshieldPlanRequest<'a> {
     pub(super) fee_mode: FeeHandlingMode,
     pub(super) recipient: Address,
     pub(super) unwrap: bool,
+    pub(super) native_top_up: Option<DesktopNativeTopUpRequest>,
     pub(super) verify_proof: bool,
     pub(super) progress_tx: Option<&'a TransactionGenerationProgressSender>,
 }
@@ -1008,6 +1102,8 @@ pub(crate) struct ApproximateTransactionShape {
     pub(crate) private_output_count: usize,
     pub(crate) public_output_count: usize,
     pub(crate) max_receiver_amount: U256,
+    pub(crate) relay_call_count: usize,
+    pub(crate) uses_relay_adapt: bool,
     pub(crate) unwrap: bool,
     pub(crate) send: bool,
 }
@@ -1019,6 +1115,13 @@ pub(crate) struct PublicBroadcasterAmountSplit {
     pub(crate) total_private_spend: U256,
     pub(crate) fee_amount: U256,
     pub(crate) fee_mode: FeeHandlingMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicBroadcasterReportedAmounts {
+    pub(crate) recipient_amount: U256,
+    pub(crate) total_private_spend: U256,
+    pub(crate) protocol_fee_amount: U256,
 }
 
 pub(crate) fn public_broadcaster_amount_split(
@@ -1193,6 +1296,52 @@ pub(super) const fn recipient_amount_after_protocol_fee(
     protocol_fee_amount: U256,
 ) -> U256 {
     amount.saturating_sub(protocol_fee_amount)
+}
+
+pub(crate) fn public_broadcaster_reported_amounts(
+    action_token: Address,
+    fee_token: Address,
+    split: PublicBroadcasterAmountSplit,
+    protocol_fee_bps: U256,
+    native_top_up: Option<&DesktopNativeTopUpPlan>,
+) -> PublicBroadcasterReportedAmounts {
+    if let Some(native_top_up) = native_top_up
+        && action_token == native_top_up.wrapped_native_token
+    {
+        let combined_wrapped_native_amount = native_top_up_required_wrapped_native_amount(
+            action_token,
+            native_top_up.wrapped_native_token,
+            split.receiver_amount,
+            native_top_up.native_amount,
+        );
+        let protocol_fee_amount =
+            railgun_protocol_fee_amount(combined_wrapped_native_amount, protocol_fee_bps);
+        let recipient_amount = recipient_amount_after_protocol_fee(
+            combined_wrapped_native_amount,
+            protocol_fee_amount,
+        )
+        .saturating_sub(native_top_up.native_amount);
+        let fee_spend = if action_token == fee_token {
+            split.fee_amount
+        } else {
+            U256::ZERO
+        };
+        return PublicBroadcasterReportedAmounts {
+            recipient_amount,
+            total_private_spend: combined_wrapped_native_amount + fee_spend,
+            protocol_fee_amount,
+        };
+    }
+
+    let protocol_fee_amount = railgun_protocol_fee_amount(split.receiver_amount, protocol_fee_bps);
+    PublicBroadcasterReportedAmounts {
+        recipient_amount: recipient_amount_after_protocol_fee(
+            split.receiver_amount,
+            protocol_fee_amount,
+        ),
+        total_private_spend: split.total_private_spend,
+        protocol_fee_amount,
+    }
 }
 
 pub(crate) fn public_broadcaster_build_error(
@@ -1570,6 +1719,9 @@ pub(crate) fn approximate_public_broadcaster_cost(
                 input_count: shape.input_count,
                 private_output_count: shape.private_output_count,
                 public_output_count: shape.public_output_count,
+                relay_call_count: shape.relay_call_count,
+                uses_relay_adapt: shape.uses_relay_adapt,
+                native_top_up: None,
             });
         }
         fee_amount = buffered_public_broadcaster_fee(computed_fee);
@@ -1608,6 +1760,9 @@ pub(crate) fn approximate_public_broadcaster_cost(
         input_count: shape.input_count,
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
+        relay_call_count: shape.relay_call_count,
+        uses_relay_adapt: shape.uses_relay_adapt,
+        native_top_up: None,
     })
 }
 
@@ -1652,6 +1807,8 @@ pub(crate) const fn send_approximate_shape(
         private_output_count: selection.private_output_count,
         public_output_count: 0,
         max_receiver_amount,
+        relay_call_count: 0,
+        uses_relay_adapt: false,
         unwrap: false,
         send: true,
     }
@@ -1668,9 +1825,123 @@ pub(crate) const fn unshield_approximate_shape(
         private_output_count: selection.private_output_count,
         public_output_count: selection.public_output_count,
         max_receiver_amount,
+        relay_call_count: if unwrap { 1 } else { 0 },
+        uses_relay_adapt: unwrap,
         unwrap,
         send: false,
     }
+}
+
+pub(crate) fn native_top_up_approximate_shape(
+    utxos: &[Utxo],
+    token: Address,
+    fee_token: Address,
+    receiver_amount: U256,
+    fee_amount: U256,
+    native_top_up: &DesktopNativeTopUpPlan,
+) -> Result<ApproximateTransactionShape> {
+    let wrapped_native = native_top_up.wrapped_native_token;
+    if token == wrapped_native {
+        let combined_wrapped_native_amount = native_top_up_required_wrapped_native_amount(
+            token,
+            wrapped_native,
+            receiver_amount,
+            native_top_up.native_amount,
+        );
+        let selection = native_top_up_selection_info_with_broadcaster_fee_seed(
+            utxos,
+            wrapped_native,
+            fee_token,
+            combined_wrapped_native_amount,
+            fee_amount,
+        )?;
+        let max_combined_net = native_top_up_net_after_protocol_fee(selection.max_spendable);
+        let max_receiver_amount = native_top_up_wrapped_native_amount_for_net(
+            max_combined_net.saturating_sub(native_top_up.native_amount),
+        );
+        return Ok(ApproximateTransactionShape {
+            transaction_count: selection.transaction_count,
+            input_count: selection.input_count,
+            private_output_count: selection.private_output_count,
+            public_output_count: selection.public_output_count,
+            max_receiver_amount,
+            relay_call_count: 3,
+            uses_relay_adapt: true,
+            unwrap: true,
+            send: false,
+        });
+    }
+
+    let primary_selection = if fee_token == wrapped_native {
+        unshield_selection_info(utxos, token, receiver_amount, false)?
+    } else {
+        native_top_up_selection_info_with_broadcaster_fee_seed(
+            utxos,
+            token,
+            fee_token,
+            receiver_amount,
+            fee_amount,
+        )?
+    };
+    let top_up_selection = if fee_token == wrapped_native {
+        unshield_selection_info_with_broadcaster_fee_token(
+            utxos,
+            wrapped_native,
+            wrapped_native,
+            native_top_up.wrapped_native_amount,
+            fee_amount,
+            false,
+        )?
+    } else {
+        unshield_selection_info(
+            utxos,
+            wrapped_native,
+            native_top_up.wrapped_native_amount,
+            false,
+        )?
+    };
+    let transaction_count =
+        primary_selection.transaction_count + top_up_selection.transaction_count;
+    if transaction_count > MAX_BATCH_TRANSACTIONS {
+        return Err(Report::new(BuildError::TooManyBatchTransactions {
+            requested: transaction_count,
+            max: MAX_BATCH_TRANSACTIONS,
+        }));
+    }
+
+    Ok(ApproximateTransactionShape {
+        transaction_count,
+        input_count: primary_selection.input_count + top_up_selection.input_count,
+        private_output_count: primary_selection.private_output_count
+            + top_up_selection.private_output_count,
+        public_output_count: primary_selection.public_output_count
+            + top_up_selection.public_output_count,
+        max_receiver_amount: primary_selection.max_spendable,
+        relay_call_count: 2,
+        uses_relay_adapt: true,
+        unwrap: true,
+        send: false,
+    })
+}
+
+fn native_top_up_selection_info_with_broadcaster_fee_seed(
+    utxos: &[Utxo],
+    token: Address,
+    fee_token: Address,
+    amount: U256,
+    fee_amount: U256,
+) -> Result<railgun_wallet::tx::UnshieldSelectionInfo> {
+    if fee_amount.is_zero() && token != fee_token {
+        return unshield_selection_info_with_separate_broadcaster_fee_seed(
+            utxos, token, fee_token, amount, false,
+        )
+        .map_err(Report::new);
+    }
+
+    unshield_selection_info_with_broadcaster_fee_token(
+        utxos, token, fee_token, amount, fee_amount, false,
+    )
+    .map_err(Report::new)
 }
 
 #[must_use]

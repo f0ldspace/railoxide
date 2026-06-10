@@ -170,6 +170,7 @@ impl WalletRoot {
                 asset.chain_id,
                 fee_token,
                 false,
+                false,
                 favorites_only_broadcasters,
                 policy,
             );
@@ -337,6 +338,7 @@ impl WalletRoot {
                     asset.label.clone(),
                     asset.icon_path.clone(),
                     recipient.clone(),
+                    None,
                     self_broadcast_gas_payer_display
                         .expect("self-broadcast gas payer was validated"),
                     self_broadcast_command_tx,
@@ -642,6 +644,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) -> Option<UnshieldSpendDraft> {
+        self.refresh_unshield_native_top_up_state(key, cx);
         let form = self.unshield_forms.get(&key)?;
         if form.generating {
             return None;
@@ -740,6 +743,8 @@ impl WalletRoot {
             );
             return None;
         }
+        let native_top_up =
+            enabled_native_top_up_plan(form.native_top_up_enabled, form.native_top_up.as_ref());
 
         let (
             self_broadcast_public_account_uuid,
@@ -779,6 +784,7 @@ impl WalletRoot {
                 asset.chain_id,
                 fee_token,
                 unwrap,
+                native_top_up.is_some(),
                 favorites_only_broadcasters,
                 policy,
             );
@@ -813,6 +819,7 @@ impl WalletRoot {
             session,
             recipient,
             amount,
+            native_top_up,
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
@@ -864,6 +871,7 @@ impl WalletRoot {
             session,
             recipient,
             amount,
+            native_top_up,
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
@@ -871,6 +879,7 @@ impl WalletRoot {
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+        let native_top_up_request = native_top_up_request_from_plan(native_top_up.as_ref());
 
         let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
             if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
@@ -926,6 +935,17 @@ impl WalletRoot {
         }
         cx.notify();
 
+        let recipient_output = native_top_up.as_ref().map(|top_up| {
+            let recipient_amount = native_top_up_primary_recipient_amount_for_fee_mode(
+                asset.token,
+                top_up.wrapped_native_token,
+                amount,
+                fee_mode,
+                top_up.native_amount,
+            );
+            private_amount_label(recipient_amount, &asset, false)
+        });
+
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
                 self.start_private_broadcaster_progress(
@@ -948,6 +968,7 @@ impl WalletRoot {
                     asset.label.clone(),
                     asset.icon_path.clone(),
                     recipient.to_checksum(None),
+                    recipient_output,
                     self_broadcast_gas_payer_display
                         .expect("self-broadcast gas payer was validated"),
                     self_broadcast_command_tx,
@@ -976,6 +997,7 @@ impl WalletRoot {
                     fee_mode,
                     recipient,
                     unwrap,
+                    native_top_up: native_top_up_request.clone(),
                     verify_proof: true,
                     progress_tx: Some(progress_tx),
                 };
@@ -998,6 +1020,7 @@ impl WalletRoot {
                     amount,
                     recipient,
                     unwrap,
+                    native_top_up: native_top_up_request.clone(),
                     verify_proof: true,
                     fee_rows,
                     selection: Self::public_broadcaster_submission_selection(
@@ -1046,6 +1069,7 @@ impl WalletRoot {
                     fee_mode,
                     recipient,
                     unwrap,
+                    native_top_up: native_top_up_request,
                     verify_proof: true,
                     gas_fee: self_broadcast_gas_fee,
                     progress_tx: Some(progress_tx),
@@ -1089,6 +1113,9 @@ impl WalletRoot {
                 let mut self_broadcast_progress_result = None;
                 let mut progress_error = None;
                 let mut clear_spend_authorization = false;
+                let mut refresh_public_balances = false;
+                let affects_visible_public_account =
+                    root.unshield_delivery_affects_visible_public_account(chain_id, recipient);
                 {
                     let Some(form) = root.unshield_forms.get_mut(&key) else {
                         return;
@@ -1102,6 +1129,20 @@ impl WalletRoot {
                     form.generating = false;
                     match result {
                         Ok(result) => {
+                            refresh_public_balances = match &result {
+                                UnshieldResult::PublicBroadcaster(result)
+                                    if matches!(
+                                        result.result,
+                                        PublicBroadcasterResultKind::Submitted { .. }
+                                    ) =>
+                                {
+                                    affects_visible_public_account
+                                }
+                                UnshieldResult::SelfBroadcast(result) if result.tx.status => {
+                                    affects_visible_public_account
+                                }
+                                _ => false,
+                            };
                             if let UnshieldResult::PublicBroadcaster(result) = &result {
                                 progress_result = Some((**result).clone());
                             }
@@ -1132,6 +1173,9 @@ impl WalletRoot {
                 }
                 if clear_spend_authorization {
                     root.clear_spend_authorization(cx);
+                }
+                if refresh_public_balances {
+                    root.schedule_public_balance_refresh(cx);
                 }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(

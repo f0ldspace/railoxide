@@ -390,6 +390,7 @@ impl WalletRoot {
             generating,
             show_all_broadcasters,
             favorites_only,
+            native_top_up,
         ) = (match picker.kind {
             DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
                 (
@@ -400,6 +401,7 @@ impl WalletRoot {
                     form.generating,
                     form.allow_suspicious_broadcasters,
                     form.favorites_only_broadcasters,
+                    false,
                 )
             }),
             DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
@@ -411,6 +413,7 @@ impl WalletRoot {
                     form.generating,
                     form.allow_suspicious_broadcasters,
                     form.favorites_only_broadcasters,
+                    form.native_top_up_enabled && form.native_top_up.is_some(),
                 )
             }),
         })?;
@@ -425,6 +428,7 @@ impl WalletRoot {
             chain_id,
             token,
             unwrap,
+            native_top_up,
             favorites_only,
             policy,
         );

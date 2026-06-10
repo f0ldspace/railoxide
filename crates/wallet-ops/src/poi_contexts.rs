@@ -310,6 +310,47 @@ pub(crate) fn persist_pending_unshield_output_poi_contexts(
     persist_pending_output_poi_context_records(db, &records)
 }
 
+pub(crate) fn persist_pending_composite_unshield_output_poi_contexts(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    chunks: &[TransactionPlanChunk],
+    private_output_roles: &[CompositePrivateOutputRole],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+) -> Result<usize> {
+    let created_at = now_epoch_secs()?;
+    let mut records = Vec::with_capacity(private_output_roles.len());
+    for output_role in private_output_roles {
+        let chunk = chunks
+            .get(output_role.chunk_index)
+            .ok_or_else(|| eyre!("composite output role references missing chunk"))?;
+        let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
+        let note = chunk
+            .outputs
+            .get(output_role.output_index)
+            .ok_or_else(|| eyre!("composite output role references missing private output"))?;
+        records.push(pending_output_poi_context_record(
+            chain_id,
+            wallet_id,
+            created_at,
+            &chunk_context,
+            note,
+            pending_output_role_from_composite(output_role.role),
+        ));
+    }
+    persist_pending_output_poi_context_records(db, &records)
+}
+
+const fn pending_output_role_from_composite(
+    role: CompositePrivateOutputRoleKind,
+) -> PendingOutputPoiRole {
+    match role {
+        CompositePrivateOutputRoleKind::BroadcasterFee => PendingOutputPoiRole::BroadcasterFee,
+        CompositePrivateOutputRoleKind::Change => PendingOutputPoiRole::Change,
+    }
+}
+
 pub(crate) fn build_pending_output_poi_context_records(
     chain_id: u64,
     wallet_id: &str,

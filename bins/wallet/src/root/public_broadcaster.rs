@@ -62,11 +62,16 @@ impl WalletRoot {
         chain_id: u64,
         token: Address,
         unwrap: bool,
+        native_top_up: bool,
         favorites_only: bool,
         policy: BroadcasterFeePolicy,
     ) -> Vec<PublicBroadcasterCandidate> {
-        let required_relay_adapt =
-            required_relay_adapt_for_unwrap(&self.effective_chain_configs, chain_id, unwrap);
+        let required_relay_adapt = required_relay_adapt_for_unshield(
+            &self.effective_chain_configs,
+            chain_id,
+            unwrap,
+            native_top_up,
+        );
         let candidates = public_broadcaster_candidates_for_asset(
             &self.monitor_fee_rows(),
             chain_id,
@@ -87,6 +92,7 @@ impl WalletRoot {
         &self,
         chain_id: u64,
         unwrap: bool,
+        native_top_up: bool,
         favorites_only: bool,
         policy: BroadcasterFeePolicy,
     ) -> Vec<PublicBroadcasterFeeTokenOption> {
@@ -98,8 +104,12 @@ impl WalletRoot {
             return Vec::new();
         };
         let fee_rows = self.monitor_fee_rows();
-        let required_relay_adapt =
-            required_relay_adapt_for_unwrap(&self.effective_chain_configs, chain_id, unwrap);
+        let required_relay_adapt = required_relay_adapt_for_unshield(
+            &self.effective_chain_configs,
+            chain_id,
+            unwrap,
+            native_top_up,
+        );
         public_broadcaster_fee_token_options_from_snapshot(
             snapshot,
             &fee_rows,
@@ -122,8 +132,8 @@ impl WalletRoot {
         allow_suspicious_broadcasters: bool,
     ) -> Address {
         let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
-        let options =
-            self.current_public_broadcaster_fee_token_options(chain_id, unwrap, false, policy);
+        let options = self
+            .current_public_broadcaster_fee_token_options(chain_id, unwrap, false, false, policy);
         resolve_selected_public_broadcaster_fee_token(action_token, action_token, &options)
     }
 
@@ -404,12 +414,13 @@ pub(super) fn should_show_fee_mode_toggle(
     matches!(kind, DeliveryFormKind::Unshield) || action_token == fee_token
 }
 
-pub(super) fn required_relay_adapt_for_unwrap(
+pub(super) fn required_relay_adapt_for_unshield(
     effective_chain_configs: &BTreeMap<u64, EffectiveChainConfig>,
     chain_id: u64,
     unwrap: bool,
+    native_top_up: bool,
 ) -> Option<Address> {
-    unwrap
+    (unwrap || native_top_up)
         .then(|| {
             effective_chain_configs
                 .get(&chain_id)

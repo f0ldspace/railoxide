@@ -227,10 +227,17 @@ fn effective_chain_overrides_drive_unwrap_ui_filters() {
     let configs = build_effective_chain_configs(&settings).expect("effective chains");
 
     assert_eq!(
-        required_relay_adapt_for_unwrap(&configs, 1, true),
+        required_relay_adapt_for_unshield(&configs, 1, true, false),
         Some(relay)
     );
-    assert_eq!(required_relay_adapt_for_unwrap(&configs, 1, false), None);
+    assert_eq!(
+        required_relay_adapt_for_unshield(&configs, 1, false, true),
+        Some(relay)
+    );
+    assert_eq!(
+        required_relay_adapt_for_unshield(&configs, 1, false, false),
+        None
+    );
     assert!(is_effective_wrapped_native_token(&configs, 1, wrapped));
     assert!(!is_effective_wrapped_native_token(&configs, 1, other));
 }

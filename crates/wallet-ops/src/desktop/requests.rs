@@ -3,8 +3,9 @@ use alloy::uint;
 use railgun_wallet::RailgunSpendSigner;
 
 pub(crate) use crate::poi_contexts::{
-    active_list_pre_transaction_pois, persist_pending_send_output_poi_contexts,
-    persist_pending_unshield_output_poi_contexts, public_broadcaster_pre_transaction_pois,
+    active_list_pre_transaction_pois, persist_pending_composite_unshield_output_poi_contexts,
+    persist_pending_send_output_poi_contexts, persist_pending_unshield_output_poi_contexts,
+    public_broadcaster_pre_transaction_pois,
 };
 pub(crate) use crate::utxos::utxo_outputs_from_utxos;
 
@@ -182,6 +183,7 @@ pub struct DesktopUnshieldCalldataRequest {
     pub fee_mode: FeeHandlingMode,
     pub recipient: Address,
     pub unwrap: bool,
+    pub native_top_up: Option<DesktopNativeTopUpRequest>,
     pub verify_proof: bool,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
@@ -337,6 +339,7 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub fee_mode: FeeHandlingMode,
     pub recipient: Address,
     pub unwrap: bool,
+    pub native_top_up: Option<DesktopNativeTopUpRequest>,
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub progress_tx: Option<TransactionGenerationProgressSender>,

@@ -4,7 +4,7 @@ use eyre::eyre;
 pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     request: DesktopUnshieldPlanRequest<'_>,
     http: &HttpContext,
-) -> Result<PreparedPrivatePlan<UnshieldPlan>> {
+) -> Result<PreparedDesktopUnshieldPlan> {
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
             "selected wallet session is for chain {}, not {}",
@@ -52,6 +52,19 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     );
     let selection_info = unshield_selection_info(&utxos, request.token, receiver_amount, false)
         .wrap_err("select POI-verified unshield notes")?;
+    let native_top_up = request
+        .native_top_up
+        .as_ref()
+        .map(|top_up| {
+            desktop_native_top_up_plan_from_request(
+                &request,
+                &chain,
+                top_up,
+                receiver_amount,
+                &utxos,
+            )
+        })
+        .transpose()?;
 
     let signer = request.spend_authorization.into_signer(
         request.vault_store,
@@ -70,6 +83,35 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         request.progress_tx,
         TransactionGenerationStage::ProvingTransaction,
     );
+    if let Some(native_top_up) = native_top_up {
+        let composite_request = native_top_up_composite_unshield_request(
+            request.token,
+            receiver_amount,
+            request.recipient,
+            request.unwrap,
+            request.verify_proof,
+            &native_top_up,
+        )?;
+        let plan = tx_builder
+            .build_composite_unshield_plan_with_signer(
+                &request.view_session.scan_keys(),
+                &signer,
+                &forest,
+                &utxos,
+                composite_request,
+                &prover,
+            )
+            .await
+            .wrap_err("build desktop composite unshield calldata")?;
+
+        return Ok(PreparedDesktopUnshieldPlan {
+            plan: DesktopUnshieldPreparedPlan::Composite(plan),
+            max_spendable: selection_info.max_spendable,
+            prover,
+            native_top_up: Some(native_top_up),
+        });
+    }
+
     let plan = tx_builder
         .build_unshield_plan_with_signer(
             &request.view_session.scan_keys(),
@@ -82,10 +124,414 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         .await
         .wrap_err("build desktop unshield calldata")?;
 
-    Ok(PreparedPrivatePlan {
-        plan,
+    Ok(PreparedDesktopUnshieldPlan {
+        plan: DesktopUnshieldPreparedPlan::Single(plan),
         max_spendable: selection_info.max_spendable,
         prover,
+        native_top_up: None,
+    })
+}
+
+fn desktop_native_top_up_plan_from_request(
+    request: &DesktopUnshieldPlanRequest<'_>,
+    chain: &EffectiveDesktopChainConfig,
+    top_up: &DesktopNativeTopUpRequest,
+    receiver_amount: U256,
+    utxos: &[Utxo],
+) -> Result<DesktopNativeTopUpPlan> {
+    desktop_native_top_up_plan_from_unshield_fields(
+        request.chain_id,
+        chain,
+        request.view_session,
+        request.vault_store,
+        request.token,
+        request.recipient,
+        request.unwrap,
+        top_up,
+        receiver_amount,
+        None,
+        U256::ZERO,
+        utxos,
+    )
+}
+
+pub(super) fn desktop_native_top_up_plan_from_unshield_fields(
+    chain_id: u64,
+    chain: &EffectiveDesktopChainConfig,
+    view_session: &vault::DesktopViewSession,
+    vault_store: &vault::DesktopVaultStore,
+    token: Address,
+    recipient: Address,
+    unwrap: bool,
+    top_up: &DesktopNativeTopUpRequest,
+    receiver_amount: U256,
+    broadcaster_fee_token: Option<Address>,
+    broadcaster_fee_amount: U256,
+    utxos: &[Utxo],
+) -> Result<DesktopNativeTopUpPlan> {
+    let policy = native_top_up_policy_for_chain(chain_id)
+        .ok_or_else(|| eyre!("selected chain does not support native top-up"))?;
+    let wrapped_native_token = chain
+        .wrapped_native_token
+        .ok_or_else(|| eyre!("selected chain has no wrapped native token for native top-up"))?;
+    let accounts = vault_store
+        .list_active_public_accounts_for_session(view_session)
+        .wrap_err("load active public accounts for native top-up")?;
+    let account = accounts
+        .iter()
+        .find(|account| account.public_account_uuid == top_up.public_account_uuid)
+        .ok_or_else(|| eyre!("native top-up Public account is not visible"))?;
+    if account.address != recipient {
+        return Err(eyre!(
+            "native top-up Public account does not match unshield recipient"
+        ));
+    }
+    if top_up.native_balance >= policy.offer_threshold {
+        return Err(eyre!(
+            "native top-up recipient already has enough native gas"
+        ));
+    }
+    if unwrap {
+        return Err(eyre!(
+            "native top-up cannot be combined with unwrap-to-native output"
+        ));
+    }
+    let wrapped_native_amount = native_top_up_wrapped_native_amount(policy.top_up_amount);
+    let mut required_wrapped_native = native_top_up_required_wrapped_native_amount(
+        token,
+        wrapped_native_token,
+        receiver_amount,
+        policy.top_up_amount,
+    );
+    if broadcaster_fee_token == Some(wrapped_native_token) {
+        required_wrapped_native = required_wrapped_native.saturating_add(broadcaster_fee_amount);
+    }
+    let max_wrapped_native = max_unshield_spendable(utxos, wrapped_native_token);
+    if max_wrapped_native < required_wrapped_native {
+        return Err(eyre!(
+            "native top-up wrapped-native max spendable: {max_wrapped_native}; required: {required_wrapped_native}"
+        ));
+    }
+
+    Ok(DesktopNativeTopUpPlan {
+        public_account_uuid: account.public_account_uuid.clone(),
+        recipient,
+        wrapped_native_token,
+        native_amount: policy.top_up_amount,
+        wrapped_native_amount,
+        native_balance_before: top_up.native_balance,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    use local_db::{DbConfig, DbStore};
+
+    const TEST_PASSWORD: &str = "correct horse battery staple";
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn temp_db_root() -> PathBuf {
+        let dir = std::env::temp_dir().join("railoxide-wallet-ops-private-tx-tests");
+        fs::create_dir_all(&dir).expect("create temp db parent");
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        dir.join(format!("db-{pid}-{nanos}"))
+    }
+
+    fn test_utxo(token: Address, value: U256) -> Utxo {
+        Utxo::new(
+            Note::new_unshield(Address::ZERO, token, value),
+            0,
+            0,
+            UtxoSource {
+                tx_hash: FixedBytes::ZERO,
+                block_number: 0,
+                block_timestamp: 0,
+            },
+            UtxoCommitmentKind::Transact,
+        )
+    }
+
+    fn test_chain_config(wrapped_native: Address) -> EffectiveDesktopChainConfig {
+        EffectiveDesktopChainConfig {
+            rpc_urls: Vec::new(),
+            railgun_contract: Address::ZERO,
+            relay_adapt_contract: Address::ZERO,
+            wrapped_native_token: Some(wrapped_native),
+            gas: settings::EffectiveChainGasSettings {
+                gas_limit_buffer: GAS_LIMIT_BUFFER,
+                gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
+                gas_price_buffer_denominator: GAS_PRICE_BUFFER_DENOMINATOR as u64,
+            },
+        }
+    }
+
+    #[test]
+    fn native_top_up_estimate_rejects_unwrap_as_unsupported() {
+        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let chain = test_chain_config(wrapped_native);
+        let top_up = DesktopNativeTopUpRequest {
+            public_account_uuid: "pub-1".to_string(),
+            native_balance: U256::ZERO,
+        };
+        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
+
+        let error = desktop_native_top_up_plan_for_estimate(
+            1,
+            &chain,
+            wrapped_native,
+            Address::from([0x52; 20]),
+            true,
+            &top_up,
+            policy.offer_threshold,
+        )
+        .expect_err("unwrap-to-native cannot be combined with native top-up");
+        assert_eq!(
+            error.to_string(),
+            "native top-up cannot be combined with unwrap-to-native output"
+        );
+    }
+
+    #[test]
+    fn native_top_up_plan_validation_counts_wrapped_native_broadcaster_fee() {
+        let root_dir = temp_db_root();
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
+        store
+            .create_vault_with_params(TEST_PASSWORD, vault::KdfParams::new(1024, 1, 1))
+            .expect("create vault");
+        let wallet_id = "wallet-1";
+        let metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                0,
+                vault::WalletSource::Generated,
+                "Wallet",
+            )
+            .expect("wallet metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                0,
+                "english",
+                TEST_MNEMONIC,
+                &metadata,
+            )
+            .expect("store wallet");
+        let view_session = store
+            .load_view_session(TEST_PASSWORD, wallet_id)
+            .expect("load view session");
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                "0x0101010101010101010101010101010101010101010101010101010101010101",
+                Some("Recipient"),
+                true,
+            )
+            .expect("import public account");
+        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let token = Address::from([0x51; 20]);
+        let receiver_amount = U256::from(25_u64);
+        let top_up = DesktopNativeTopUpRequest {
+            public_account_uuid: account.public_account_uuid.clone(),
+            native_balance: U256::ZERO,
+        };
+        let chain = test_chain_config(wrapped_native);
+        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
+        let required_without_fee = native_top_up_required_wrapped_native_amount(
+            token,
+            wrapped_native,
+            receiver_amount,
+            policy.top_up_amount,
+        );
+        let utxos = vec![test_utxo(wrapped_native, required_without_fee)];
+
+        let unwrap_error = desktop_native_top_up_plan_from_unshield_fields(
+            1,
+            &chain,
+            &view_session,
+            &store,
+            wrapped_native,
+            account.address,
+            true,
+            &top_up,
+            policy.offer_threshold,
+            None,
+            U256::ZERO,
+            &utxos,
+        )
+        .expect_err("unwrap-to-native cannot be combined with native top-up");
+        assert_eq!(
+            unwrap_error.to_string(),
+            "native top-up cannot be combined with unwrap-to-native output"
+        );
+
+        desktop_native_top_up_plan_from_unshield_fields(
+            1,
+            &chain,
+            &view_session,
+            &store,
+            token,
+            account.address,
+            false,
+            &top_up,
+            receiver_amount,
+            Some(wrapped_native),
+            U256::ZERO,
+            &utxos,
+        )
+        .expect("zero wrapped-native broadcaster fee fits available balance");
+
+        let fee_amount = U256::from(1_u64);
+        let error = desktop_native_top_up_plan_from_unshield_fields(
+            1,
+            &chain,
+            &view_session,
+            &store,
+            token,
+            account.address,
+            false,
+            &top_up,
+            receiver_amount,
+            Some(wrapped_native),
+            fee_amount,
+            &utxos,
+        )
+        .expect_err("wrapped-native broadcaster fee should require additional balance");
+        let expected_required = required_without_fee.saturating_add(fee_amount);
+        let message = error.to_string();
+        assert!(message.contains("native top-up wrapped-native max spendable"));
+        assert!(message.contains(&format!("required: {expected_required}")));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+}
+
+pub(super) fn desktop_native_top_up_plan_for_estimate(
+    chain_id: u64,
+    chain: &EffectiveDesktopChainConfig,
+    _token: Address,
+    recipient: Address,
+    unwrap: bool,
+    top_up: &DesktopNativeTopUpRequest,
+    _receiver_amount: U256,
+) -> Result<DesktopNativeTopUpPlan> {
+    let policy = native_top_up_policy_for_chain(chain_id)
+        .ok_or_else(|| eyre!("selected chain does not support native top-up"))?;
+    let wrapped_native_token = chain
+        .wrapped_native_token
+        .ok_or_else(|| eyre!("selected chain has no wrapped native token for native top-up"))?;
+    if top_up.native_balance >= policy.offer_threshold {
+        return Err(eyre!(
+            "native top-up recipient already has enough native gas"
+        ));
+    }
+    if unwrap {
+        return Err(eyre!(
+            "native top-up cannot be combined with unwrap-to-native output"
+        ));
+    }
+    let wrapped_native_amount = native_top_up_wrapped_native_amount(policy.top_up_amount);
+
+    Ok(DesktopNativeTopUpPlan {
+        public_account_uuid: top_up.public_account_uuid.clone(),
+        recipient,
+        wrapped_native_token,
+        native_amount: policy.top_up_amount,
+        wrapped_native_amount,
+        native_balance_before: top_up.native_balance,
+    })
+}
+
+pub(crate) fn native_top_up_composite_unshield_request(
+    token: Address,
+    receiver_amount: U256,
+    recipient: Address,
+    unwrap: bool,
+    verify_proof: bool,
+    native_top_up: &DesktopNativeTopUpPlan,
+) -> Result<CompositeUnshieldRequest> {
+    if unwrap {
+        return Err(eyre!(
+            "native top-up cannot be combined with unwrap-to-native output"
+        ));
+    }
+
+    let wrapped_native = native_top_up.wrapped_native_token;
+    let native_amount = native_top_up.native_amount;
+    let wrapped_native_amount = native_top_up.wrapped_native_amount;
+    let mut calls = vec![
+        CompositeRelayAction::UnwrapBase {
+            amount: native_amount,
+        },
+        CompositeRelayAction::Transfer {
+            token: CompositeRelayActionToken::BaseNative,
+            recipient,
+            amount: native_amount,
+        },
+    ];
+    let legs = if token == wrapped_native {
+        let combined_wrapped_native_amount = native_top_up_required_wrapped_native_amount(
+            token,
+            wrapped_native,
+            receiver_amount,
+            native_amount,
+        );
+        let wrapped_output_amount =
+            native_top_up_net_after_protocol_fee(combined_wrapped_native_amount) - native_amount;
+        calls.push(CompositeRelayAction::Transfer {
+            token: CompositeRelayActionToken::Erc20(wrapped_native),
+            recipient,
+            amount: wrapped_output_amount,
+        });
+        vec![CompositeUnshieldLeg {
+            token_address: wrapped_native,
+            amount: combined_wrapped_native_amount,
+            recipient: CompositeUnshieldRecipient::RelayAdapt,
+            role: CompositeUnshieldLegRole::WrappedNativeOutput,
+        }]
+    } else {
+        vec![
+            CompositeUnshieldLeg {
+                token_address: token,
+                amount: receiver_amount,
+                recipient: CompositeUnshieldRecipient::Public(recipient),
+                role: CompositeUnshieldLegRole::Primary,
+            },
+            CompositeUnshieldLeg {
+                token_address: wrapped_native,
+                amount: wrapped_native_amount,
+                recipient: CompositeUnshieldRecipient::RelayAdapt,
+                role: CompositeUnshieldLegRole::NativeTopUp,
+            },
+        ]
+    };
+
+    Ok(CompositeUnshieldRequest {
+        legs,
+        relay_actions: Some(CompositeRelayActions {
+            min_gas_limit: U256::ZERO,
+            calls,
+        }),
+        broadcaster_fee: None,
+        min_gas_price: 0,
+        verify_proof,
+        spend_up_to: false,
     })
 }
 
@@ -403,7 +849,7 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
 }
 
 pub(super) async fn persist_manual_unshield_pending_pois(
-    plan: &UnshieldPlan,
+    plan: &DesktopUnshieldPreparedPlan,
     session: &WalletSession,
     chain_id: u64,
     wallet_id: &str,
@@ -413,7 +859,7 @@ pub(super) async fn persist_manual_unshield_pending_pois(
     operation_label: &'static str,
 ) -> Result<()> {
     let (pending_poi_list_keys, pending_pois) = active_list_pre_transaction_pois(
-        &plan.chunks,
+        plan.chunks(),
         session,
         chain_id,
         prover,
@@ -422,16 +868,31 @@ pub(super) async fn persist_manual_unshield_pending_pois(
         operation_label,
     )
     .await?;
-    persist_pending_unshield_output_poi_contexts(
-        session.db.as_ref(),
-        chain_id,
-        wallet_id,
-        &plan.chunks,
-        &pending_pois,
-        &pending_poi_list_keys,
-        false,
-        false,
-    )?;
+    match plan {
+        DesktopUnshieldPreparedPlan::Single(plan) => {
+            persist_pending_unshield_output_poi_contexts(
+                session.db.as_ref(),
+                chain_id,
+                wallet_id,
+                &plan.chunks,
+                &pending_pois,
+                &pending_poi_list_keys,
+                false,
+                false,
+            )?;
+        }
+        DesktopUnshieldPreparedPlan::Composite(plan) => {
+            persist_pending_composite_unshield_output_poi_contexts(
+                session.db.as_ref(),
+                chain_id,
+                wallet_id,
+                &plan.chunks,
+                &plan.private_output_roles,
+                &pending_pois,
+                &pending_poi_list_keys,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -478,15 +939,18 @@ pub(super) fn prepared_unshield_call_from_plan(
     chain_id: u64,
     token: Address,
     amount: U256,
+    fee_mode: FeeHandlingMode,
     recipient: Address,
     unwrap: bool,
     max_spendable: U256,
-    plan: &UnshieldPlan,
+    plan: &DesktopUnshieldPreparedPlan,
+    native_top_up: Option<DesktopNativeTopUpPlan>,
 ) -> PreparedUnshieldCall {
     PreparedUnshieldCall {
         chain_id,
         token,
         amount,
+        fee_mode,
         recipient,
         unwrap,
         max_spendable,
@@ -494,8 +958,9 @@ pub(super) fn prepared_unshield_call_from_plan(
         input_count: plan.input_count(),
         private_output_count: plan.private_output_count(),
         public_output_count: plan.public_output_count(),
-        to: plan.call.to,
-        data: hex::encode_prefixed(&plan.call.data),
+        to: plan.call_to(),
+        data: hex::encode_prefixed(plan.call_data()),
+        native_top_up,
     }
 }
 
@@ -539,6 +1004,7 @@ pub async fn prepare_desktop_unshield_calldata(
             fee_mode: request.fee_mode,
             recipient: request.recipient,
             unwrap: request.unwrap,
+            native_top_up: request.native_top_up,
             verify_proof: request.verify_proof,
             progress_tx: request.progress_tx.as_ref(),
         },
@@ -566,10 +1032,12 @@ pub async fn prepare_desktop_unshield_calldata(
         request.chain_id,
         request.token,
         request.amount,
+        request.fee_mode,
         request.recipient,
         request.unwrap,
         prepared.max_spendable,
         &prepared.plan,
+        prepared.native_top_up,
     ))
 }
 
@@ -649,7 +1117,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         &request.fee_rows,
         request.chain_id,
         request.fee_token,
-        if request.unwrap {
+        if request.unwrap || request.native_top_up.is_some() {
             Some(chain.relay_adapt_contract)
         } else {
             None
@@ -668,6 +1136,21 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let utxos = request.session.unspent_utxos().await;
     let same_token_fee = request.fee_token == request.token;
+    let native_top_up = request
+        .native_top_up
+        .as_ref()
+        .map(|top_up| {
+            desktop_native_top_up_plan_for_estimate(
+                request.chain_id,
+                &chain,
+                request.token,
+                request.recipient,
+                request.unwrap,
+                top_up,
+                request.amount,
+            )
+        })
+        .transpose()?;
     let initial_fee_amount =
         initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
             let seed_split = public_broadcaster_amount_split_for_tokens_and_protocol(
@@ -677,6 +1160,16 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                 same_token_fee,
                 RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
             )?;
+            if let Some(native_top_up) = &native_top_up {
+                return native_top_up_approximate_shape(
+                    &utxos,
+                    request.token,
+                    request.fee_token,
+                    seed_split.receiver_amount,
+                    U256::ZERO,
+                    native_top_up,
+                );
+            }
             let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
                 request.token,
@@ -700,7 +1193,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             ))
         })?;
 
-    approximate_public_broadcaster_cost(
+    let mut estimate = approximate_public_broadcaster_cost(
         broadcaster,
         request.token,
         request.fee_token,
@@ -710,6 +1203,16 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         min_gas_price,
         initial_fee_amount,
         |split| {
+            if let Some(native_top_up) = &native_top_up {
+                return native_top_up_approximate_shape(
+                    &utxos,
+                    request.token,
+                    request.fee_token,
+                    split.receiver_amount,
+                    split.fee_amount,
+                    native_top_up,
+                );
+            }
             let selection = unshield_selection_info_with_broadcaster_fee_token(
                 &utxos,
                 request.token,
@@ -733,7 +1236,25 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                 request.unwrap,
             ))
         },
-    )
+    )?;
+    let reported_amounts = public_broadcaster_reported_amounts(
+        request.token,
+        request.fee_token,
+        PublicBroadcasterAmountSplit {
+            entered_amount: estimate.entered_amount,
+            receiver_amount: estimate.receiver_amount,
+            total_private_spend: estimate.total_private_spend,
+            fee_amount: estimate.fee_amount,
+            fee_mode: estimate.fee_mode,
+        },
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        native_top_up.as_ref(),
+    );
+    estimate.recipient_amount = reported_amounts.recipient_amount;
+    estimate.total_private_spend = reported_amounts.total_private_spend;
+    estimate.protocol_fee_amount = reported_amounts.protocol_fee_amount;
+    estimate.native_top_up = native_top_up;
+    Ok(estimate)
 }
 
 pub async fn estimate_desktop_send_public_broadcaster_cost(
@@ -838,16 +1359,11 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let progress_tx = request.progress_tx.clone();
     let session = Arc::clone(&request.session);
     let prepared = prepare_desktop_unshield_public_broadcaster(request, http).await?;
-    let pending_spent_inputs = prepared
-        .plan
-        .inputs
-        .iter()
-        .map(|input| input.utxo.clone())
-        .collect::<Vec<_>>();
+    let pending_spent_inputs = prepared.plan.input_utxos();
     let result = submit_public_broadcaster_plan(
         waku,
-        prepared.plan.call.to,
-        prepared.plan.call.data,
+        prepared.plan.call_to(),
+        prepared.plan.call_data(),
         prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
         prepared.action_token,
@@ -863,6 +1379,13 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         prepared.gas_limit,
         prepared.min_gas_price,
         prepared.bound_min_gas_price,
+        prepared.transaction_count,
+        prepared.input_count,
+        prepared.private_output_count,
+        prepared.public_output_count,
+        prepared.relay_call_count,
+        prepared.uses_relay_adapt,
+        prepared.native_top_up,
         progress_tx,
         timeout,
         republish_interval,
@@ -907,6 +1430,13 @@ pub async fn submit_desktop_send_public_broadcaster(
         prepared.gas_limit,
         prepared.min_gas_price,
         prepared.bound_min_gas_price,
+        prepared.transaction_count,
+        prepared.input_count,
+        prepared.private_output_count,
+        prepared.public_output_count,
+        prepared.relay_call_count,
+        prepared.uses_relay_adapt,
+        prepared.native_top_up,
         progress_tx,
         timeout,
         republish_interval,
@@ -933,6 +1463,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             fee_mode: request.fee_mode,
             recipient: request.recipient,
             unwrap: request.unwrap,
+            native_top_up: request.native_top_up,
             verify_proof: request.verify_proof,
             progress_tx: request.progress_tx.as_ref(),
         },
@@ -940,7 +1471,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
     )
     .await?;
     let pending_output_pois_required =
-        unshield_chunks_require_pending_output_pois(&prepared.plan.chunks);
+        unshield_chunks_require_pending_output_pois(prepared.plan.chunks());
     emit_self_broadcast_event(
         request.event_tx.as_ref(),
         SelfBroadcastSessionEvent::PendingOutputPoiProofsRequired {
@@ -964,13 +1495,8 @@ pub async fn submit_desktop_unshield_self_broadcast(
         )
         .await?;
     }
-    let pending_spent_inputs = prepared
-        .plan
-        .inputs
-        .iter()
-        .map(|input| input.utxo.clone())
-        .collect::<Vec<_>>();
-    submit_self_broadcast_plan(
+    let pending_spent_inputs = prepared.plan.input_utxos();
+    let mut result = submit_self_broadcast_plan(
         request.chain_id,
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),
@@ -982,16 +1508,19 @@ pub async fn submit_desktop_unshield_self_broadcast(
         request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
-        prepared.plan.call.to,
-        prepared.plan.call.data,
+        prepared.plan.call_to(),
+        prepared.plan.call_data(),
         pending_spent_inputs,
+        prepared.native_top_up.is_some(),
         request.gas_fee,
         request.progress_tx,
         request.command_rx,
         request.event_tx,
         http,
     )
-    .await
+    .await?;
+    result.native_top_up = prepared.native_top_up;
+    Ok(result)
 }
 
 pub async fn submit_blocked_shield_rescue_self_broadcast(
@@ -1030,6 +1559,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         prepared.plan.call.to,
         prepared.plan.call.data,
         pending_spent_inputs,
+        false,
         request.gas_fee,
         request.progress_tx,
         request.command_rx,
@@ -1097,6 +1627,7 @@ pub async fn submit_desktop_send_self_broadcast(
         prepared.plan.call.to,
         prepared.plan.call.data,
         pending_spent_inputs,
+        false,
         request.gas_fee,
         request.progress_tx,
         request.command_rx,

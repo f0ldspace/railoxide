@@ -97,6 +97,25 @@ pub(super) fn format_native_token_amount_for_display(chain_id: u64, amount: U256
     )
 }
 
+pub(super) fn format_native_top_up_recipient_suffix(chain_id: u64, amount: U256) -> String {
+    format!(
+        "+ {} (gas top-up)",
+        format_native_token_amount_for_display(chain_id, amount)
+    )
+}
+
+pub(super) fn format_recipient_amount_with_native_top_up(
+    recipient_amount: String,
+    chain_id: u64,
+    native_amount: U256,
+) -> String {
+    format!(
+        "{} {}",
+        recipient_amount,
+        format_native_top_up_recipient_suffix(chain_id, native_amount)
+    )
+}
+
 pub(super) fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
     decimals.map_or_else(
         || amount.to_string(),

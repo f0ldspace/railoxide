@@ -10,11 +10,12 @@ pub(super) use broadcaster_monitor::FeeRow;
 pub(super) use broadcaster_monitor_waku::{DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
 pub(super) use gpui_component::select::SelectItem;
 pub(super) use wallet_ops::{
-    BlockedShieldRescueInfo, FeeHandlingMode, ListUtxosOutput, PublicAccountBalance,
-    PublicActionProgressStep, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,
-    PublicBalanceEntry, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterFeeMargin, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-    SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage, UtxoOutput,
+    BlockedShieldRescueInfo, DesktopNativeTopUpPlan, FeeHandlingMode, ListUtxosOutput,
+    PublicAccountBalance, PublicActionProgressStep, PublicAssetId, PublicBalanceAmount,
+    PublicBalanceAsset, PublicBalanceEntry, PublicBroadcasterCandidate,
+    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMargin, PublicBroadcasterResultKind,
+    PublicBroadcasterSelection, PublicBroadcasterSubmissionResult, SyncProgressStage,
+    SyncProgressUpdate, TransactionGenerationStage, UtxoOutput,
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WALLET_SETTINGS_KEY,
@@ -181,6 +182,9 @@ pub(super) fn public_broadcaster_cost_estimate(
         input_count: 1,
         private_output_count: 2,
         public_output_count: 0,
+        relay_call_count: 0,
+        uses_relay_adapt: false,
+        native_top_up: None,
     }
 }
 
@@ -196,6 +200,7 @@ pub(super) fn private_progress_state(
         asset_label: Arc::from("ETH"),
         icon_path: None,
         recipient: Arc::from("0zk"),
+        recipient_output: None,
         gas_payer: None,
         steps: match flow {
             PrivateSubmissionProgressFlow::PublicBroadcaster => {

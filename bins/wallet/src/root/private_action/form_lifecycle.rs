@@ -61,8 +61,7 @@ impl WalletRoot {
         let root = cx.entity();
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
-            let max_height =
-                (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
+            let max_height = window.viewport_size().height * 0.88;
             let content_max_height = dialog_content_max_height(window);
             let close_root = root.clone();
             let content_root = root.clone();
@@ -389,6 +388,9 @@ impl WalletRoot {
     ) {
         let changed = self.set_programmatic_amount_input(kind, key, amount, window, cx);
         if changed {
+            if kind == DeliveryFormKind::Unshield {
+                self.refresh_unshield_native_top_up_state(key, cx);
+            }
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
         }
     }
@@ -506,6 +508,7 @@ impl WalletRoot {
         let fee_token_options = self.current_public_broadcaster_fee_token_options(
             asset.chain_id,
             false,
+            false,
             favorites_only,
             policy,
         );
@@ -517,6 +520,7 @@ impl WalletRoot {
         let candidates = self.current_public_broadcaster_candidates(
             asset.chain_id,
             selected_fee_token,
+            false,
             false,
             favorites_only,
             policy,
@@ -619,6 +623,7 @@ impl WalletRoot {
         let fee_token_options = self.current_public_broadcaster_fee_token_options(
             asset.chain_id,
             unwrap,
+            false,
             favorites_only,
             policy,
         );
@@ -631,6 +636,7 @@ impl WalletRoot {
             asset.chain_id,
             selected_fee_token,
             unwrap,
+            false,
             favorites_only,
             policy,
         );
@@ -651,6 +657,8 @@ impl WalletRoot {
         }
         form.asset = asset;
         form.unwrap = unwrap;
+        form.native_top_up = None;
+        form.native_top_up_enabled = false;
         form.selected_fee_token = selected_fee_token;
         form.broadcaster_choice = broadcaster_choice;
         form.fee_mode = fee_mode;
@@ -675,6 +683,7 @@ impl WalletRoot {
 
         self.clear_private_broadcaster_progress_state();
         cx.notify();
+        self.refresh_unshield_native_top_up_state(key, cx);
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         if delivery_mode == DeliveryMode::SelfBroadcast {
@@ -792,6 +801,7 @@ impl WalletRoot {
             chain_id,
             fee_token,
             false,
+            false,
             favorites_only,
             policy,
         );
@@ -848,6 +858,7 @@ impl WalletRoot {
         let candidates = self.current_public_broadcaster_candidates(
             chain_id,
             fee_token,
+            false,
             false,
             favorites_only,
             policy,
@@ -917,8 +928,9 @@ impl WalletRoot {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
-        let candidates =
-            self.current_public_broadcaster_candidates(chain_id, fee_token, false, enabled, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id, fee_token, false, false, enabled, policy,
+        );
         let preserve_estimate =
             should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
         let reset_specific =
@@ -1331,6 +1343,8 @@ impl WalletRoot {
                         form.recipient_value = Arc::from(input.read(cx).value().as_ref());
                     }
                     this.clear_unshield_form_text_edit_state(key, cx);
+                    this.refresh_unshield_native_top_up_state(key, cx);
+                    this.maybe_schedule_unshield_native_top_up_balance_refresh(key, cx);
                     this.update_recipient_suggestions_for_input_change(
                         DeliveryFormKind::Unshield,
                         key,
@@ -1361,9 +1375,11 @@ impl WalletRoot {
                         key,
                         cx,
                     ) {
+                        this.refresh_unshield_native_top_up_state(key, cx);
                         return;
                     }
                     this.clear_unshield_form_text_edit_state(key, cx);
+                    this.refresh_unshield_native_top_up_state(key, cx);
                     this.debounce_public_broadcaster_cost_estimate(
                         DeliveryFormKind::Unshield,
                         key,
@@ -1432,6 +1448,8 @@ impl WalletRoot {
                 asset_select,
                 asset_select_items,
                 unwrap: false,
+                native_top_up: None,
+                native_top_up_enabled: false,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
                 self_broadcast_gas_payer_uuid,
                 self_broadcast_gas_payer_select: gas_payer_select,
@@ -1491,11 +1509,14 @@ impl WalletRoot {
         form.unwrap = unwrap;
         form.error = None;
         form.result = None;
+        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
+        let delivery_mode = form.delivery_mode;
         cx.notify();
-        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+        self.refresh_unshield_native_top_up_state(key, cx);
+        if delivery_mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
@@ -1521,6 +1542,7 @@ impl WalletRoot {
         form.fee_mode = fee_mode;
         form.error = None;
         form.result = None;
+        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
@@ -1529,8 +1551,10 @@ impl WalletRoot {
             form.amount_input
                 .update(cx, |input, cx| input.set_value(adjusted, window, cx));
         }
+        let delivery_mode = form.delivery_mode;
         cx.notify();
-        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+        self.refresh_unshield_native_top_up_state(key, cx);
+        if delivery_mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
@@ -1644,17 +1668,25 @@ impl WalletRoot {
         fee_token: Address,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, unwrap, current_choice, generating, allow_suspicious, favorites_only)) =
-            self.unshield_forms.get(&key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.unwrap,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                    form.allow_suspicious_broadcasters,
-                    form.favorites_only_broadcasters,
-                )
-            })
+        let Some((
+            chain_id,
+            unwrap,
+            native_top_up,
+            current_choice,
+            generating,
+            allow_suspicious,
+            favorites_only,
+        )) = self.unshield_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                form.unwrap,
+                form.native_top_up_enabled && form.native_top_up.is_some(),
+                form.broadcaster_choice.clone(),
+                form.generating,
+                form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
+            )
+        })
         else {
             return;
         };
@@ -1666,6 +1698,7 @@ impl WalletRoot {
             chain_id,
             fee_token,
             unwrap,
+            native_top_up,
             favorites_only,
             policy,
         );
@@ -1698,18 +1731,27 @@ impl WalletRoot {
         allow: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, fee_token, unwrap, choice, generating, current_allow, favorites_only)) =
-            self.unshield_forms.get(&key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.selected_fee_token,
-                    form.unwrap,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                    form.allow_suspicious_broadcasters,
-                    form.favorites_only_broadcasters,
-                )
-            })
+        let Some((
+            chain_id,
+            fee_token,
+            unwrap,
+            native_top_up,
+            choice,
+            generating,
+            current_allow,
+            favorites_only,
+        )) = self.unshield_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                form.selected_fee_token,
+                form.unwrap,
+                form.native_top_up_enabled && form.native_top_up.is_some(),
+                form.broadcaster_choice.clone(),
+                form.generating,
+                form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
+            )
+        })
         else {
             return;
         };
@@ -1721,6 +1763,7 @@ impl WalletRoot {
             chain_id,
             fee_token,
             unwrap,
+            native_top_up,
             favorites_only,
             policy,
         );
@@ -1760,6 +1803,7 @@ impl WalletRoot {
             chain_id,
             fee_token,
             unwrap,
+            native_top_up,
             choice,
             generating,
             allow_suspicious,
@@ -1769,6 +1813,7 @@ impl WalletRoot {
                 form.asset.chain_id,
                 form.selected_fee_token,
                 form.unwrap,
+                form.native_top_up_enabled && form.native_top_up.is_some(),
                 form.broadcaster_choice.clone(),
                 form.generating,
                 form.allow_suspicious_broadcasters,
@@ -1782,8 +1827,14 @@ impl WalletRoot {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
-        let candidates = self
-            .current_public_broadcaster_candidates(chain_id, fee_token, unwrap, enabled, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id,
+            fee_token,
+            unwrap,
+            native_top_up,
+            enabled,
+            policy,
+        );
         let preserve_estimate =
             should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
         let reset_specific =

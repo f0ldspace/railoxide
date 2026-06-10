@@ -11,9 +11,9 @@ use super::{
     render_private_submission_active_status_notice, render_public_broadcaster_cost_estimate,
     render_public_broadcaster_cost_status, render_public_broadcaster_settings,
     render_recipient_picker, render_self_broadcast_settings, render_send_result,
-    render_unshield_generating_status, render_unshield_output_toggle, render_unshield_result,
-    selected_broadcaster_fee_warning, send_element_id,
-    should_render_public_broadcaster_cost_preview, unshield_element_id,
+    render_unshield_generating_status, render_unshield_native_top_up_control,
+    render_unshield_output_toggle, render_unshield_result, selected_broadcaster_fee_warning,
+    send_element_id, should_render_public_broadcaster_cost_preview, unshield_element_id,
 };
 
 impl WalletRoot {
@@ -88,6 +88,7 @@ impl WalletRoot {
             let fee_token_options = self.current_public_broadcaster_fee_token_options(
                 asset.chain_id,
                 false,
+                false,
                 form.favorites_only_broadcasters,
                 policy,
             );
@@ -99,6 +100,7 @@ impl WalletRoot {
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 form.selected_fee_token,
+                false,
                 false,
                 form.favorites_only_broadcasters,
                 policy,
@@ -358,6 +360,7 @@ impl WalletRoot {
         let estimate_root = root.clone();
         let progress_root = root.clone();
         let recipient_root = root.clone();
+        let top_up_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
@@ -406,9 +409,11 @@ impl WalletRoot {
             let trust_filter =
                 self.public_broadcaster_trust_filter(form.favorites_only_broadcasters);
             let fee_rows = self.monitor_fee_rows();
+            let native_top_up = form.native_top_up_enabled && form.native_top_up.is_some();
             let fee_token_options = self.current_public_broadcaster_fee_token_options(
                 asset.chain_id,
                 form.unwrap,
+                native_top_up,
                 form.favorites_only_broadcasters,
                 policy,
             );
@@ -421,6 +426,7 @@ impl WalletRoot {
                 asset.chain_id,
                 form.selected_fee_token,
                 form.unwrap,
+                native_top_up,
                 form.favorites_only_broadcasters,
                 policy,
             );
@@ -537,6 +543,14 @@ impl WalletRoot {
                         .w(px(220.0)),
                     ),
             )
+            .child(render_unshield_native_top_up_control(
+                top_up_root,
+                key,
+                form.native_top_up.as_ref(),
+                form.native_top_up_enabled,
+                form.generating,
+                Some(&self.effective_token_registry),
+            ))
             .child(
                 div().flex().items_end().gap_3().justify_end().child(
                     app_button(
@@ -644,7 +658,7 @@ impl WalletRoot {
         if let Some(result) = form.result.as_ref() {
             match result {
                 UnshieldResult::Manual(result) => {
-                    card = card.child(render_unshield_result(key, result));
+                    card = card.child(render_unshield_result(key, asset, result));
                 }
                 UnshieldResult::PublicBroadcaster(result) => {
                     card = card.child(render_private_broadcaster_status_notice(

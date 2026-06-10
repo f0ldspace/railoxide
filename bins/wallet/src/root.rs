@@ -103,6 +103,7 @@ use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
 use startup::WalletStartupRoot;
 use tokens::{
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
+    format_native_top_up_recipient_suffix, format_recipient_amount_with_native_top_up,
     format_send_amount_input, format_unshield_amount_input, is_effective_wrapped_native_token,
     native_token_display_label, native_wrapped_output_labels, parse_address, token_display_label,
     token_display_metadata,
@@ -129,6 +130,8 @@ use manage_wallets::{
     WalletManagementSelection, active_wallet_management_rows, hidden_wallet_management_rows,
     selected_wallet_after_metadata_refresh, wallet_ids_after_drop, wallet_source_label,
 };
+#[cfg(test)]
+use private_action::native_top_up_request_from_plan;
 #[cfg(test)]
 use private_action::{
     PrivateActionMetric, PrivateWalletRecipientSource, RecipientOption, RecipientOptionSource,
@@ -188,12 +191,12 @@ use public_balances::{
 #[cfg(test)]
 use public_broadcaster::{
     fee_token_option_has_eligible_broadcaster, public_broadcaster_fee_token_options_from_snapshot,
-    required_relay_adapt_for_unwrap, resolve_selected_public_broadcaster_fee_token,
+    required_relay_adapt_for_unshield, resolve_selected_public_broadcaster_fee_token,
 };
 #[cfg(test)]
 use public_broadcaster_cost::{
-    CostEstimateStatus, format_public_broadcaster_fee_margin, public_broadcaster_cost_status_text,
-    should_render_public_broadcaster_cost_preview,
+    CostEstimateStatus, PublicBroadcasterCostDisplay, format_public_broadcaster_fee_margin,
+    public_broadcaster_cost_status_text, should_render_public_broadcaster_cost_preview,
 };
 #[cfg(test)]
 use settings::{
@@ -254,7 +257,6 @@ const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
-const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(820.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH: Pixels = px(560.0);
 const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);

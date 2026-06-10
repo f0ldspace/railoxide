@@ -2,7 +2,8 @@ use super::*;
 use crate::root::private_action::{
     RecipientSuggestionDirection, filtered_recipient_options,
     hardware_wallet_recipient_source_from_metadata, recipient_option_display_address,
-    recipient_query_is_valid, recipient_suggestion_index_after_move,
+    recipient_query_is_valid, recipient_suggestion_filter_query,
+    recipient_suggestion_index_after_move,
 };
 
 #[test]
@@ -594,6 +595,7 @@ fn recipient_option_search_matches_label_and_address_case_insensitively() {
 
 #[test]
 fn recipient_combobox_helpers_filter_validate_and_move_selection() {
+    const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
     let options = vec![
         RecipientOption {
             label: Arc::from("Alice Cold Wallet"),
@@ -631,6 +633,32 @@ fn recipient_combobox_helpers_filter_validate_and_move_selection() {
         DeliveryFormKind::Unshield,
         "alice"
     ));
+    assert_eq!(
+        recipient_suggestion_filter_query(
+            DeliveryFormKind::Unshield,
+            "0x1111111111111111111111111111111111111111"
+        ),
+        ""
+    );
+    assert_eq!(
+        recipient_suggestion_filter_query(DeliveryFormKind::Unshield, "alice"),
+        "alice"
+    );
+    assert_eq!(
+        filtered_recipient_options(
+            &options,
+            &recipient_suggestion_filter_query(
+                DeliveryFormKind::Unshield,
+                "0x1111111111111111111111111111111111111111"
+            )
+        )
+        .len(),
+        3
+    );
+    assert_eq!(
+        recipient_suggestion_filter_query(DeliveryFormKind::Send, RAILGUN_ADDRESS),
+        ""
+    );
     assert_eq!(
         recipient_suggestion_index_after_move(None, 3, RecipientSuggestionDirection::Next),
         Some(0)

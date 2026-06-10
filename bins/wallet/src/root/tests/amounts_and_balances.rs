@@ -131,6 +131,349 @@ fn public_broadcaster_fee_margin_display_is_signed_fee_token_amount() {
 }
 
 #[test]
+fn native_top_up_plan_display_and_request_use_fixed_native_amount() {
+    let token = Address::from([0x41; 20]);
+    let candidate = wallet_ops::public_broadcaster_candidates_for_asset(
+        &[fee_row(1, token, "native-top-up")],
+        1,
+        token,
+        None,
+        BroadcasterFeePolicy::default(),
+        None,
+    )
+    .expect("candidate")
+    .remove(0);
+    let mut estimate = public_broadcaster_cost_estimate(candidate);
+    estimate.native_top_up = Some(DesktopNativeTopUpPlan {
+        public_account_uuid: "public-account".to_string(),
+        recipient: Address::from([0x42; 20]),
+        wrapped_native_token: token,
+        native_amount: uint!(3_000_000_000_000_000_U256),
+        wrapped_native_amount: wallet_ops::native_top_up_wrapped_native_amount(uint!(
+            3_000_000_000_000_000_U256
+        )),
+        native_balance_before: uint!(1_U256),
+    });
+
+    let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
+    assert_eq!(
+        display.native_top_up_recipient_suffix(),
+        Some("+ 0.003 ETH (gas top-up)".to_string())
+    );
+    assert_eq!(
+        estimate
+            .native_top_up
+            .as_ref()
+            .map(|top_up| top_up.wrapped_native_amount),
+        Some(uint!(3_007_518_796_992_481_U256))
+    );
+
+    let request =
+        native_top_up_request_from_plan(estimate.native_top_up.as_ref()).expect("top-up request");
+    assert_eq!(request.public_account_uuid, "public-account");
+    assert_eq!(request.native_balance, uint!(1_U256));
+
+    let result = PublicBroadcasterSubmissionResult {
+        broadcaster: estimate.broadcaster.clone(),
+        action_token: estimate.action_token,
+        fee_token: estimate.fee_token,
+        entered_amount: estimate.entered_amount,
+        receiver_amount: estimate.receiver_amount,
+        recipient_amount: estimate.recipient_amount,
+        total_private_spend: estimate.total_private_spend,
+        fee_amount: estimate.fee_amount,
+        protocol_fee_amount: estimate.protocol_fee_amount,
+        protocol_fee_bps: estimate.protocol_fee_bps,
+        fee_mode: estimate.fee_mode,
+        gas_limit: estimate.gas_limit,
+        min_gas_price: estimate.min_gas_price,
+        transaction_count: estimate.transaction_count,
+        input_count: estimate.input_count,
+        private_output_count: estimate.private_output_count,
+        public_output_count: estimate.public_output_count,
+        relay_call_count: estimate.relay_call_count,
+        uses_relay_adapt: estimate.uses_relay_adapt,
+        result: PublicBroadcasterResultKind::Submitted {
+            tx_hash: "0xabc".to_string(),
+        },
+        native_top_up: estimate.native_top_up.clone(),
+    };
+    let display = PublicBroadcasterCostDisplay::from_result(&result, None, None);
+    assert_eq!(
+        display.native_top_up_recipient_suffix(),
+        Some("+ 0.003 ETH (gas top-up)".to_string())
+    );
+}
+
+#[test]
+fn native_top_up_eligibility_is_visible_account_only_and_explicit() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let recipient = Address::from([0x42; 20]);
+    let account = public_account_for_search(Some("Recipient"), recipient);
+    let private_snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![unshield_utxo_output(weth, 3_007_518_796_992_481, 0, 1)],
+        totals: Vec::new(),
+    };
+    let balance_snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![(account.clone(), PublicBalanceAmount::Available(U256::ZERO))],
+    );
+
+    let state = unshield_native_top_up_state_from_inputs(
+        1,
+        usdc,
+        false,
+        recipient,
+        uint!(100_000_000_U256),
+        wallet_ops::FeeHandlingMode::DeductFromAmount,
+        std::slice::from_ref(&account),
+        Some(&balance_snapshot),
+        Some(&private_snapshot),
+        Some(weth),
+    );
+    let plan = state.plan.expect("eligible top-up plan");
+    assert_eq!(plan.public_account_uuid, "public-account");
+    assert_eq!(plan.recipient, recipient);
+    assert_eq!(plan.native_amount, uint!(3_000_000_000_000_000_U256));
+    assert_eq!(
+        plan.wrapped_native_amount,
+        uint!(3_007_518_796_992_481_U256)
+    );
+    assert_eq!(
+        enabled_native_top_up_plan(false, Some(&plan)),
+        None,
+        "eligibility must not auto-select the top-up"
+    );
+    assert_eq!(
+        enabled_native_top_up_plan(true, Some(&plan)),
+        Some(plan.clone())
+    );
+
+    let arbitrary = unshield_native_top_up_state_from_inputs(
+        1,
+        usdc,
+        false,
+        Address::from([0x43; 20]),
+        uint!(100_000_000_U256),
+        wallet_ops::FeeHandlingMode::DeductFromAmount,
+        std::slice::from_ref(&account),
+        Some(&balance_snapshot),
+        Some(&private_snapshot),
+        Some(weth),
+    );
+    assert!(arbitrary.plan.is_none());
+
+    let stale_snapshot = public_native_balance_snapshot_for_test(
+        56,
+        vec![(account.clone(), PublicBalanceAmount::Available(U256::ZERO))],
+    );
+    let stale = unshield_native_top_up_state_from_inputs(
+        1,
+        usdc,
+        false,
+        recipient,
+        uint!(100_000_000_U256),
+        wallet_ops::FeeHandlingMode::DeductFromAmount,
+        std::slice::from_ref(&account),
+        Some(&stale_snapshot),
+        Some(&private_snapshot),
+        Some(weth),
+    );
+    assert!(stale.plan.is_none());
+
+    let unavailable_snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![(account.clone(), PublicBalanceAmount::Unavailable)],
+    );
+    let unavailable = unshield_native_top_up_state_from_inputs(
+        1,
+        usdc,
+        false,
+        recipient,
+        uint!(100_000_000_U256),
+        wallet_ops::FeeHandlingMode::DeductFromAmount,
+        std::slice::from_ref(&account),
+        Some(&unavailable_snapshot),
+        Some(&private_snapshot),
+        Some(weth),
+    );
+    assert!(unavailable.plan.is_none());
+
+    let funded_snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![(
+            account.clone(),
+            PublicBalanceAmount::Available(uint!(1_000_000_000_000_000_U256)),
+        )],
+    );
+    let funded = unshield_native_top_up_state_from_inputs(
+        1,
+        usdc,
+        false,
+        recipient,
+        uint!(100_000_000_U256),
+        wallet_ops::FeeHandlingMode::DeductFromAmount,
+        std::slice::from_ref(&account),
+        Some(&funded_snapshot),
+        Some(&private_snapshot),
+        Some(weth),
+    );
+    assert!(funded.plan.is_none());
+}
+
+#[test]
+fn native_top_up_eligibility_uses_add_on_top_gross_amount() {
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let recipient = Address::from([0x42; 20]);
+    let account = public_account_for_search(Some("Recipient"), recipient);
+    let entered_amount = uint!(1_000_000_U256);
+    let top_up_amount = uint!(3_000_000_000_000_000_U256);
+    let old_required =
+        entered_amount + wallet_ops::native_top_up_wrapped_native_amount(top_up_amount);
+    let gross_required = wallet_ops::native_top_up_required_wrapped_native_amount_for_fee_mode(
+        weth,
+        weth,
+        entered_amount,
+        wallet_ops::FeeHandlingMode::AddToAmount,
+        top_up_amount,
+    );
+    assert!(gross_required > old_required);
+    let private_snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![unshield_utxo_output(weth, old_required.to::<u64>(), 0, 1)],
+        totals: Vec::new(),
+    };
+    let balance_snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![(account.clone(), PublicBalanceAmount::Available(U256::ZERO))],
+    );
+
+    let state = unshield_native_top_up_state_from_inputs(
+        1,
+        weth,
+        false,
+        recipient,
+        entered_amount,
+        wallet_ops::FeeHandlingMode::AddToAmount,
+        std::slice::from_ref(&account),
+        Some(&balance_snapshot),
+        Some(&private_snapshot),
+        Some(weth),
+    );
+
+    assert!(state.plan.is_none());
+}
+
+#[test]
+fn native_top_up_public_balance_refresh_is_needed_for_missing_visible_account_snapshot() {
+    let recipient = Address::from([0x42; 20]);
+    let account = public_account_for_search(Some("Recipient"), recipient);
+    let accounts = std::slice::from_ref(&account);
+
+    assert!(unshield_native_top_up_needs_public_balance_refresh(
+        1, recipient, accounts, None,
+    ));
+
+    let stale_snapshot = public_native_balance_snapshot_for_test(
+        56,
+        vec![(account.clone(), PublicBalanceAmount::Available(U256::ZERO))],
+    );
+    assert!(unshield_native_top_up_needs_public_balance_refresh(
+        1,
+        recipient,
+        accounts,
+        Some(&stale_snapshot),
+    ));
+
+    let missing_account = PublicBalanceSnapshot {
+        chain_id: 1,
+        refreshed_at: SystemTime::UNIX_EPOCH,
+        accounts: Vec::new(),
+    };
+    assert!(unshield_native_top_up_needs_public_balance_refresh(
+        1,
+        recipient,
+        accounts,
+        Some(&missing_account),
+    ));
+
+    let missing_native_balance = PublicBalanceSnapshot {
+        chain_id: 1,
+        refreshed_at: SystemTime::UNIX_EPOCH,
+        accounts: vec![PublicAccountBalance {
+            account: account.clone(),
+            balances: Vec::new(),
+        }],
+    };
+    assert!(unshield_native_top_up_needs_public_balance_refresh(
+        1,
+        recipient,
+        accounts,
+        Some(&missing_native_balance),
+    ));
+
+    let current_snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![(account.clone(), PublicBalanceAmount::Available(U256::ZERO))],
+    );
+    assert!(!unshield_native_top_up_needs_public_balance_refresh(
+        1,
+        recipient,
+        accounts,
+        Some(&current_snapshot),
+    ));
+    assert!(!unshield_native_top_up_needs_public_balance_refresh(
+        1,
+        Address::from([0x43; 20]),
+        accounts,
+        None,
+    ));
+    assert!(!unshield_native_top_up_needs_public_balance_refresh(
+        999, recipient, accounts, None,
+    ));
+}
+
+#[test]
+fn native_top_up_passive_eligibility_refresh_does_not_cancel_estimate() {
+    assert!(!native_top_up_refresh_invalidates_estimate(
+        false, false, true
+    ));
+    assert!(!native_top_up_refresh_invalidates_estimate(
+        false, true, true
+    ));
+    assert!(native_top_up_refresh_invalidates_estimate(true, true, true));
+    assert!(native_top_up_refresh_invalidates_estimate(
+        true, false, false
+    ));
+}
+
+#[test]
+fn native_top_up_privacy_warning_names_linkage_and_remittance() {
+    let ethereum = native_top_up_privacy_warning(1);
+    let polygon = native_top_up_privacy_warning(137);
+
+    assert!(ethereum.contains("linkage signal"));
+    assert!(ethereum.contains("spendable private balances"));
+    assert!(ethereum.contains("ETH top-up"));
+    assert!(ethereum.contains("recipient wallet"));
+    assert!(ethereum.contains("transaction or broadcaster fee"));
+    assert!(polygon.contains("MATIC top-up"));
+    assert!(!polygon.contains("ETH top-up"));
+}
+
+#[test]
 fn max_unshield_amount_from_snapshot_uses_batched_top_chunks() {
     let token = Address::from([0x11; 20]);
     let other = Address::from([0x22; 20]);

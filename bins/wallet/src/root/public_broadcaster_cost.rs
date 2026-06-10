@@ -25,8 +25,8 @@ use wallet_ops::{
 
 use super::broadcaster_picker::broadcaster_candidate_label;
 use super::private_action::{
-    delivery_element_id, send_public_broadcaster_estimate_input_error,
-    unshield_public_broadcaster_estimate_input_error,
+    delivery_element_id, native_top_up_request_from_plan,
+    send_public_broadcaster_estimate_input_error, unshield_public_broadcaster_estimate_input_error,
 };
 use super::private_broadcaster::PrivateBroadcasterProgressState;
 use super::spend_authorization::spend_authorization_recipient_display;
@@ -34,7 +34,8 @@ use super::{
     COST_ESTIMATE_DEBOUNCE, ChainUtxoState, DeliveryFormKind, DeliveryMode, UnshieldAsset,
     UnshieldAssetKey, WalletRoot, broadcaster_candidate_anchor_rate, effective_fee_handling_mode,
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
-    format_report_chain, format_send_amount_input, should_show_distinct_amount,
+    format_native_top_up_recipient_suffix, format_report_chain, format_send_amount_input,
+    should_show_distinct_amount,
 };
 
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: gpui::Pixels = px(12.0);
@@ -61,6 +62,7 @@ pub(super) struct PublicBroadcasterCostDisplay<'a> {
     gas_limit: u64,
     min_gas_price: u128,
     fee_anchor_rate: Option<U256>,
+    native_top_up: Option<&'a wallet_ops::DesktopNativeTopUpPlan>,
 }
 
 pub(super) struct PrivateBroadcasterProgressContext<'a> {
@@ -189,7 +191,7 @@ fn format_exact_candidate_token_amount(
 }
 
 impl<'a> PublicBroadcasterCostDisplay<'a> {
-    pub(super) const fn from_result(
+    pub(super) fn from_result(
         result: &'a PublicBroadcasterSubmissionResult,
         fee_anchor_rate: Option<U256>,
         registry: Option<&'a EffectiveTokenRegistry>,
@@ -211,10 +213,11 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             gas_limit: result.gas_limit,
             min_gas_price: result.min_gas_price,
             fee_anchor_rate,
+            native_top_up: result.native_top_up.as_ref(),
         }
     }
 
-    pub(super) const fn from_estimate(
+    pub(super) fn from_estimate(
         asset: &UnshieldAsset,
         estimate: &'a PublicBroadcasterCostEstimate,
         fee_anchor_rate: Option<U256>,
@@ -223,7 +226,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         Self::from_estimate_chain(asset.chain_id, estimate, fee_anchor_rate, registry)
     }
 
-    pub(super) const fn from_estimate_chain(
+    pub(super) fn from_estimate_chain(
         chain_id: u64,
         estimate: &'a PublicBroadcasterCostEstimate,
         fee_anchor_rate: Option<U256>,
@@ -246,6 +249,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             gas_limit: estimate.gas_limit,
             min_gas_price: estimate.min_gas_price,
             fee_anchor_rate,
+            native_top_up: estimate.native_top_up.as_ref(),
         }
     }
 
@@ -328,6 +332,12 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
             self.gas_limit,
             format_gwei(public_broadcaster_service_gas_price(self.min_gas_price))
         )
+    }
+
+    pub(super) fn native_top_up_recipient_suffix(&self) -> Option<String> {
+        self.native_top_up.as_ref().map(|top_up| {
+            format_native_top_up_recipient_suffix(self.chain_id, top_up.native_amount)
+        })
     }
 
     pub(super) fn fee_mode_summary(&self) -> String {
@@ -551,6 +561,7 @@ impl WalletRoot {
             asset.chain_id,
             fee_token,
             false,
+            false,
             favorites_only_broadcasters,
             policy,
         );
@@ -632,6 +643,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) {
+        self.refresh_unshield_native_top_up_state(key, cx);
         let Some(form) = self.unshield_forms.get(&key) else {
             return;
         };
@@ -647,6 +659,11 @@ impl WalletRoot {
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
         let fee_token = form.selected_fee_token;
+        let native_top_up_plan = form
+            .native_top_up_enabled
+            .then(|| form.native_top_up.clone())
+            .flatten();
+        let native_top_up = native_top_up_request_from_plan(native_top_up_plan.as_ref());
         let fee_mode = effective_fee_handling_mode(
             DeliveryFormKind::Unshield,
             asset.token,
@@ -711,6 +728,7 @@ impl WalletRoot {
             asset.chain_id,
             fee_token,
             unwrap,
+            native_top_up.is_some(),
             favorites_only_broadcasters,
             policy,
         );
@@ -751,6 +769,7 @@ impl WalletRoot {
             amount,
             recipient,
             unwrap,
+            native_top_up,
             fee_rows,
             selection,
             fee_mode,
@@ -820,9 +839,10 @@ fn append_public_broadcaster_cost_rows(
         ));
     }
     card = card
-        .child(cost_estimate_row(
+        .child(cost_estimate_row_with_optional_suffix(
             "Recipient receives",
             display.action_amount(display.recipient_amount),
+            display.native_top_up_recipient_suffix(),
         ))
         .when(
             should_show_distinct_amount(display.entered_amount, display.total_private_spend),
@@ -1021,11 +1041,13 @@ pub(super) fn render_public_broadcaster_cost_estimate(
         transaction_fee_breakdown_open,
     )
     .child(cost_estimate_detail_text(format!(
-        "Shape: {} proofs · {} inputs · {} private outputs · {} public outputs",
+        "Shape: {} proofs · {} inputs · {} private outputs · {} public outputs · {} RelayAdapt calls{}",
         estimate.transaction_count,
         estimate.input_count,
         estimate.private_output_count,
-        estimate.public_output_count
+        estimate.public_output_count,
+        estimate.relay_call_count,
+        if estimate.uses_relay_adapt { " · RelayAdapt" } else { "" }
     )))
     .child(cost_estimate_detail_text(display.fee_mode_summary()))
 }
@@ -1124,13 +1146,21 @@ pub(super) fn render_public_broadcaster_cost_status(
 }
 
 fn cost_estimate_row(label: &'static str, value: String) -> gpui::Div {
+    cost_estimate_row_with_optional_suffix(label, value, None)
+}
+
+fn cost_estimate_row_with_optional_suffix(
+    label: &'static str,
+    value: String,
+    suffix: Option<String>,
+) -> gpui::Div {
     div()
         .flex()
         .items_center()
         .justify_between()
         .gap_3()
-        .child(app_muted_text(label))
-        .child(app_strong_text(value))
+        .child(app_muted_text(label).flex_none())
+        .child(strong_wrapping_value(value, suffix))
 }
 
 pub(super) fn cost_estimate_detail_text(text: impl Into<SharedString>) -> gpui::Div {
@@ -1196,9 +1226,10 @@ pub(super) fn render_private_broadcaster_progress_context(
             "Entered amount",
             display.action_amount(display.entered_amount),
         ))
-        .child(private_broadcaster_context_row(
+        .child(private_broadcaster_context_row_with_optional_suffix(
             "Recipient receives",
             display.action_amount(display.recipient_amount),
+            display.native_top_up_recipient_suffix(),
         ))
         .when(
             should_show_distinct_amount(display.entered_amount, display.total_private_spend),
@@ -1225,6 +1256,20 @@ pub(super) fn private_broadcaster_context_row(label: &'static str, value: String
     private_broadcaster_context_row_with_action(label, value, None)
 }
 
+fn private_broadcaster_context_row_with_optional_suffix(
+    label: &'static str,
+    value: String,
+    suffix: Option<String>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_start()
+        .justify_between()
+        .gap_3()
+        .child(app_muted_text(label).flex_none())
+        .child(strong_wrapping_value(value, suffix))
+}
+
 fn private_broadcaster_context_row_with_action(
     label: &'static str,
     value: String,
@@ -1236,20 +1281,38 @@ fn private_broadcaster_context_row_with_action(
         .justify_between()
         .gap_3()
         .child(app_muted_text(label).flex_none())
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_end()
-                .gap_2()
-                .child(
-                    app_strong_text(value)
-                        .min_w(px(0.0))
-                        .text_align(gpui::TextAlign::Right)
-                        .whitespace_normal(),
-                )
-                .children(action),
-        )
+        .child(strong_wrapping_value(value, None).children(action))
+}
+
+fn strong_wrapping_value(value: String, suffix: Option<String>) -> gpui::Div {
+    let row = div()
+        .min_w(px(0.0))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap_1();
+
+    if let Some(suffix) = suffix {
+        return row
+            .child(
+                app_strong_text(value)
+                    .text_align(gpui::TextAlign::Right)
+                    .whitespace_nowrap()
+                    .flex_none(),
+            )
+            .child(
+                app_strong_text(suffix)
+                    .text_align(gpui::TextAlign::Right)
+                    .whitespace_nowrap()
+                    .flex_none(),
+            );
+    }
+
+    row.child(
+        app_strong_text(value)
+            .min_w(px(0.0))
+            .text_align(gpui::TextAlign::Right)
+            .whitespace_normal(),
+    )
 }

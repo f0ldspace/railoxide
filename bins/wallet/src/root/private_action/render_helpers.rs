@@ -377,8 +377,14 @@ pub(in crate::root) fn render_send_result(
 
 pub(in crate::root) fn render_unshield_result(
     key: UnshieldAssetKey,
+    asset: &UnshieldAsset,
     result: &PreparedUnshieldCall,
 ) -> gpui::Div {
+    let title = if result.native_top_up.is_some() {
+        "Prepared composite unshield calldata"
+    } else {
+        "Prepared calldata"
+    };
     div()
         .flex()
         .flex_col()
@@ -388,10 +394,27 @@ pub(in crate::root) fn render_unshield_result(
         .bg(rgb(theme::SURFACE_ELEVATED))
         .border_1()
         .border_color(rgb(theme::SUCCESS))
-        .child(app_strong_text("Prepared calldata"))
+        .child(app_strong_text(title))
         .child(app_muted_text(
             "Submit this transaction externally. The wallet has not broadcast it.",
         ))
+        .children(result.native_top_up.as_ref().map(|top_up| {
+            let recipient_amount = native_top_up_primary_recipient_amount_for_fee_mode(
+                result.token,
+                top_up.wrapped_native_token,
+                result.amount,
+                result.fee_mode,
+                top_up.native_amount,
+            );
+            render_unshield_output_row_with_optional_suffix(
+                "Recipient receives",
+                format_exact_asset_amount_for_display(recipient_amount, asset),
+                Some(format_native_top_up_recipient_suffix(
+                    result.chain_id,
+                    top_up.native_amount,
+                )),
+            )
+        }))
         .child(render_unshield_copy_field(
             "To",
             result.to.to_checksum(None),
@@ -434,4 +457,132 @@ pub(in crate::root) fn render_unshield_copy_field(
                 .child(SharedString::from(value.clone())),
         )
         .child(clipboard_with_toast(button_id, value))
+}
+
+pub(in crate::root) fn render_unshield_native_top_up_control(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    plan: Option<&DesktopNativeTopUpPlan>,
+    enabled: bool,
+    generating: bool,
+    registry: Option<&EffectiveTokenRegistry>,
+) -> gpui::Div {
+    if let Some(plan) = plan {
+        let toggle_root = root.clone();
+        let label = format!(
+            "Also send {} for gas",
+            native_token_display_label(key.chain_id)
+        );
+        let native_amount =
+            format_native_token_amount_for_display(key.chain_id, plan.native_amount);
+        let source_amount = format_exact_token_amount_for_display(
+            key.chain_id,
+            plan.wrapped_native_token,
+            plan.wrapped_native_amount,
+            registry,
+        );
+        return div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p(px(10.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if enabled {
+                theme::WARNING
+            } else {
+                theme::BORDER
+            }))
+            .bg(rgb(theme::SURFACE_ELEVATED))
+            .when(!generating, |this| {
+                this.cursor_pointer().on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    cx.stop_propagation();
+                    toggle_root.update(cx, |root, cx| {
+                        root.set_unshield_native_top_up_enabled(key, !enabled, cx);
+                    });
+                })
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_strong_text(label))
+                            .child(cost_estimate_detail_text(format!(
+                                "Recipient receives {native_amount}; funded from private {source_amount}.",
+                            ))),
+                    )
+                    .child(render_switch(
+                        unshield_element_id(key, "native-top-up-toggle"),
+                        enabled,
+                        generating,
+                        theme::WARNING,
+                        move |checked, _window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.set_unshield_native_top_up_enabled(key, checked, cx);
+                            });
+                        },
+                    )),
+            )
+            .children(enabled.then(|| {
+                Alert::warning(
+                    unshield_element_id(key, "native-top-up-privacy"),
+                    native_top_up_privacy_warning(key.chain_id),
+                )
+                .small()
+            }));
+    }
+
+    div()
+}
+
+fn render_unshield_output_row_with_optional_suffix(
+    label: &'static str,
+    value: String,
+    suffix: Option<String>,
+) -> gpui::Div {
+    let value_row = div()
+        .min_w(px(0.0))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap_1();
+    let value_row = if let Some(suffix) = suffix {
+        value_row
+            .child(
+                app_strong_text(value)
+                    .text_align(gpui::TextAlign::Right)
+                    .whitespace_nowrap()
+                    .flex_none(),
+            )
+            .child(
+                app_strong_text(suffix)
+                    .text_align(gpui::TextAlign::Right)
+                    .whitespace_nowrap()
+                    .flex_none(),
+            )
+    } else {
+        value_row.child(
+            app_strong_text(value)
+                .min_w(px(0.0))
+                .text_align(gpui::TextAlign::Right)
+                .whitespace_normal(),
+        )
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(app_muted_text(label).flex_none())
+        .child(value_row)
 }
