@@ -117,6 +117,32 @@ const WALLETCONNECT_BLUE: u32 = 0x3396ff;
 const WALLETCONNECT_BLUE_HOVER: u32 = 0x4aa3ff;
 static WALLETCONNECT_RELAY_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) struct WalletConnectAttentionTransition {
+    pub(in crate::root) sync_badge_count: bool,
+    pub(in crate::root) request_attention: bool,
+    pub(in crate::root) clear_attention: bool,
+}
+
+pub(in crate::root) const fn walletconnect_attention_count(
+    has_pending_proposal: bool,
+    pending_request_count: usize,
+) -> usize {
+    pending_request_count + if has_pending_proposal { 1 } else { 0 }
+}
+
+pub(in crate::root) const fn walletconnect_attention_transition(
+    previous_count: usize,
+    next_count: usize,
+    window_active: bool,
+) -> WalletConnectAttentionTransition {
+    WalletConnectAttentionTransition {
+        sync_badge_count: previous_count != next_count,
+        request_attention: next_count > previous_count && !window_active,
+        clear_attention: previous_count != 0 && next_count == 0,
+    }
+}
+
 pub(super) struct WalletConnectUiState {
     pub(super) uri_input: Entity<InputState>,
     pub(super) account_select: Entity<SelectState<SearchableVec<WalletConnectAccountSelectItem>>>,
@@ -283,6 +309,10 @@ impl WalletConnectUiState {
             self.remember_handled_request(request_key);
         }
         request
+    }
+
+    fn attention_count(&self) -> usize {
+        walletconnect_attention_count(self.pending_proposal.is_some(), self.pending_requests.len())
     }
 
     fn remember_handled_request(&mut self, request_key: &str) {

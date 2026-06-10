@@ -299,6 +299,7 @@ impl WalletRoot {
         self.sync_walletconnect_relay_workers(cx);
         self.ensure_walletconnect_pending_request_expiry_timer(cx);
         self.ensure_walletconnect_session_expiry_timer(cx);
+        self.sync_walletconnect_attention();
     }
 
     pub(in crate::root::walletconnect) fn sync_walletconnect_relay_workers(
@@ -781,6 +782,7 @@ impl WalletRoot {
             .detach();
         }
         if changed {
+            self.sync_walletconnect_attention();
             cx.notify();
         }
     }

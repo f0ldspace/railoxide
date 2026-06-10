@@ -425,6 +425,7 @@ impl WalletRoot {
                         root.walletconnect.error = Some(Arc::from(message));
                     }
                 }
+                root.sync_walletconnect_attention();
                 cx.notify();
             });
         })
@@ -688,6 +689,7 @@ impl WalletRoot {
                         "Request was removed locally, but relay error response failed: {error}"
                     )));
                 }
+                root.sync_walletconnect_attention();
                 cx.notify();
             });
         })
@@ -794,6 +796,7 @@ impl WalletRoot {
                         )));
                     }
                 }
+                root.sync_walletconnect_attention();
                 cx.notify();
             });
         })

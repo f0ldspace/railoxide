@@ -113,6 +113,7 @@ impl WalletRoot {
             self.walletconnect.status = Some(Arc::from(
                 "WalletConnect pairing expired before the dapp proposal arrived.",
             ));
+            self.sync_walletconnect_attention();
             return;
         }
         for message in messages
@@ -136,6 +137,7 @@ impl WalletRoot {
                         "Review the WalletConnect session proposal before connecting.",
                     ));
                     self.walletconnect.error = None;
+                    self.sync_walletconnect_attention();
                     return;
                 }
                 Err(error) => {
@@ -517,6 +519,7 @@ impl WalletRoot {
                         )));
                     }
                 }
+                root.sync_walletconnect_attention();
                 cx.notify();
             });
         })
@@ -738,6 +741,7 @@ impl WalletRoot {
                         "Proposal was removed locally, but relay rejection failed: {error}"
                     )));
                 }
+                root.sync_walletconnect_attention();
                 cx.notify();
             });
         })

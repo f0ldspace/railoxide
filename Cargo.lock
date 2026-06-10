@@ -14287,9 +14287,13 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "qrcodegen",
  "railgun-ui",
  "rand 0.10.1",
+ "raw-window-handle",
  "reqwest",
  "rust-embed",
  "serde_json",
@@ -14299,6 +14303,7 @@ dependencies = [
  "tracing-subscriber",
  "ui",
  "wallet-ops",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

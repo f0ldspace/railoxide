@@ -41,6 +41,7 @@ mod dialogs;
 mod gas_fee;
 mod manage_wallets;
 mod network;
+mod platform_attention;
 mod private_action;
 mod private_assets;
 mod private_broadcaster;
@@ -400,6 +401,9 @@ pub(crate) struct WalletRoot {
     repair_cache_block_input: Entity<InputState>,
     tx_search_input: Entity<InputState>,
     tx_search_query: Arc<str>,
+    walletconnect_attention_count: usize,
+    walletconnect_window_active: bool,
+    platform_attention: platform_attention::PlatformAttentionState,
     walletconnect: walletconnect::WalletConnectUiState,
     show_spent_utxos: bool,
     local_pending_spent_clear_confirming: bool,
@@ -711,6 +715,9 @@ impl WalletRoot {
         };
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");
+        let mut platform_attention = platform_attention::PlatformAttentionState::new(window);
+        platform_attention.sync_badge_count(0);
+        platform_attention.clear_attention();
         let walletconnect = walletconnect::WalletConnectUiState::new(window, cx);
         let chain_select =
             cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
@@ -887,6 +894,9 @@ impl WalletRoot {
             repair_cache_block_input,
             tx_search_input: tx_search_input.clone(),
             tx_search_query: Arc::from(""),
+            walletconnect_attention_count: 0,
+            walletconnect_window_active: window.is_window_active(),
+            platform_attention,
             walletconnect,
             show_spent_utxos: false,
             local_pending_spent_clear_confirming: false,
@@ -900,6 +910,10 @@ impl WalletRoot {
             logs_open: false,
             drawer_split: cx.new(|_| ResizableState::default()),
         };
+        cx.observe_window_activation(window, |root, window, _cx| {
+            root.sync_walletconnect_attention_for_window(window);
+        })
+        .detach();
         cx.subscribe(&tx_search_input, |this, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 let query = input.read(cx).value().trim().to_ascii_lowercase();
