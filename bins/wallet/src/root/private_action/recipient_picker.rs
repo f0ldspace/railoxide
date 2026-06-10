@@ -17,6 +17,10 @@ impl RecipientOptionSource {
     }
 }
 
+const RECIPIENT_PICKER_INPUT_HEIGHT: Pixels = px(32.0);
+const RECIPIENT_SUGGESTIONS_MAX_HEIGHT: Pixels = px(220.0);
+const RECIPIENT_OPTION_ADDRESS_TEXT_SIZE: Pixels = px(11.0);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::root) struct RecipientOption {
     pub(in crate::root) label: Arc<str>,
@@ -111,6 +115,17 @@ pub(in crate::root) fn filtered_recipient_options(
         .collect()
 }
 
+pub(in crate::root) fn recipient_suggestion_filter_query(
+    kind: DeliveryFormKind,
+    recipient: &str,
+) -> String {
+    if recipient_query_is_valid(kind, recipient) {
+        String::new()
+    } else {
+        recipient.to_owned()
+    }
+}
+
 pub(in crate::root) fn recipient_query_is_valid(kind: DeliveryFormKind, recipient: &str) -> bool {
     let recipient = recipient.trim();
     !recipient.is_empty()
@@ -200,6 +215,25 @@ fn private_recipient_matches_existing_option(recipient: &str, options: &[Recipie
     })
 }
 
+#[derive(Default)]
+struct RecipientPickerLayoutState {
+    bounds: Option<Bounds<Pixels>>,
+}
+
+#[derive(IntoElement)]
+struct RecipientPicker {
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    input: Entity<InputState>,
+    current_value: Arc<str>,
+    suggestions_open: bool,
+    selected_index: Option<usize>,
+    suggestions_scroll: ScrollHandle,
+    options: Vec<RecipientOption>,
+    generating: bool,
+}
+
 pub(in crate::root) fn render_recipient_picker(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -211,117 +245,185 @@ pub(in crate::root) fn render_recipient_picker(
     suggestions_scroll: &ScrollHandle,
     options: &[RecipientOption],
     generating: bool,
-) -> gpui::Div {
-    let keyboard_root = root.clone();
-    let escape_root = root.clone();
-    let outside_root = root.clone();
-    let toggle_root = root.clone();
-    let dropdown_root = root.clone();
-    let save_root = root;
-    let focus_input = input.clone();
-    let save_recipient = current_value.trim().to_owned();
-    let save_visible = match kind {
-        DeliveryFormKind::Send => can_save_private_recipient(current_value, options),
-        DeliveryFormKind::Unshield => can_save_public_recipient(current_value, options),
-    };
-    let filtered = filtered_recipient_options(options, current_value);
-    let selected_index = selected_index.and_then(|index| (index < filtered.len()).then_some(index));
-    let show_suggestions = suggestions_open && !save_visible && !generating && !options.is_empty();
+) -> impl IntoElement {
+    RecipientPicker {
+        root,
+        key,
+        kind,
+        input: input.clone(),
+        current_value: Arc::from(current_value),
+        suggestions_open,
+        selected_index,
+        suggestions_scroll: suggestions_scroll.clone(),
+        options: options.to_vec(),
+        generating,
+    }
+}
 
-    div()
-        .relative()
-        .w_full()
-        .on_mouse_down_out(move |_event, _window, cx| {
-            outside_root.update(cx, |root, cx| {
-                root.dismiss_recipient_suggestions(kind, key, cx);
-            });
-        })
-        .on_action(move |_: &InputEscape, _window, cx| {
-            if suggestions_open {
-                escape_root.update(cx, |root, cx| {
+impl RenderOnce for RecipientPicker {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let RecipientPicker {
+            root,
+            key,
+            kind,
+            input,
+            current_value,
+            suggestions_open,
+            selected_index,
+            suggestions_scroll,
+            options,
+            generating,
+        } = self;
+        let layout_state = window.use_keyed_state(
+            delivery_element_id(key, kind, "recipient-picker-layout"),
+            cx,
+            |_, _| RecipientPickerLayoutState::default(),
+        );
+        let picker_bounds = layout_state.read(cx).bounds.clone();
+        let keyboard_root = root.clone();
+        let escape_root = root.clone();
+        let outside_root = root.clone();
+        let toggle_root = root.clone();
+        let dropdown_root = root.clone();
+        let save_root = root;
+        let focus_input = input.clone();
+        let save_recipient = current_value.trim().to_owned();
+        let save_visible = match kind {
+            DeliveryFormKind::Send => can_save_private_recipient(&current_value, &options),
+            DeliveryFormKind::Unshield => can_save_public_recipient(&current_value, &options),
+        };
+        let filter_query = recipient_suggestion_filter_query(kind, &current_value);
+        let filtered = filtered_recipient_options(&options, &filter_query);
+        let selected_index =
+            selected_index.and_then(|index| (index < filtered.len()).then_some(index));
+        let show_suggestions =
+            suggestions_open && !save_visible && !generating && !options.is_empty();
+        let suggestions_bounds = if show_suggestions {
+            picker_bounds
+        } else {
+            None
+        };
+
+        div()
+            .relative()
+            .w_full()
+            .h(RECIPIENT_PICKER_INPUT_HEIGHT)
+            .on_mouse_down_out(move |_event, _window, cx| {
+                outside_root.update(cx, |root, cx| {
                     root.dismiss_recipient_suggestions(kind, key, cx);
                 });
-            } else {
-                cx.propagate();
-            }
-        })
-        .on_key_down(move |event: &KeyDownEvent, _window, cx| {
-            let direction = match event.keystroke.key.as_str() {
-                "down" => Some(RecipientSuggestionDirection::Next),
-                "up" => Some(RecipientSuggestionDirection::Previous),
-                "escape" if suggestions_open => {
-                    keyboard_root.update(cx, |root, cx| {
+            })
+            .on_action(move |_: &InputEscape, _window, cx| {
+                if suggestions_open {
+                    escape_root.update(cx, |root, cx| {
                         root.dismiss_recipient_suggestions(kind, key, cx);
                     });
-                    cx.stop_propagation();
-                    return;
+                } else {
+                    cx.propagate();
                 }
-                "escape" => return,
-                _ => None,
-            };
-            if let Some(direction) = direction {
-                keyboard_root.update(cx, |root, cx| {
-                    root.move_recipient_suggestion_selection(kind, key, direction, cx);
-                });
-                cx.stop_propagation();
-            }
-        })
-        .child(
-            private_action_input(input)
-                .w_full()
-                .pr(px(44.0))
-                .disabled(generating),
-        )
-        .children((!save_visible).then(|| {
-            div().absolute().right(px(6.0)).top(px(5.0)).child(
-                app_button_base(delivery_element_id(
+            })
+            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                let direction = match event.keystroke.key.as_str() {
+                    "down" => Some(RecipientSuggestionDirection::Next),
+                    "up" => Some(RecipientSuggestionDirection::Previous),
+                    "escape" if suggestions_open => {
+                        keyboard_root.update(cx, |root, cx| {
+                            root.dismiss_recipient_suggestions(kind, key, cx);
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    "escape" => return,
+                    _ => None,
+                };
+                if let Some(direction) = direction {
+                    keyboard_root.update(cx, |root, cx| {
+                        root.move_recipient_suggestion_selection(kind, key, direction, cx);
+                    });
+                    cx.stop_propagation();
+                }
+            })
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(RECIPIENT_PICKER_INPUT_HEIGHT)
+                    .child(
+                        private_action_input(&input)
+                            .w_full()
+                            .pr(px(44.0))
+                            .disabled(generating),
+                    )
+                    .child(
+                        canvas(
+                            {
+                                let layout_state = layout_state.clone();
+                                move |bounds, _window, cx| {
+                                    layout_state.update(cx, |state, _cx| {
+                                        state.bounds = Some(bounds);
+                                    });
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .children((!save_visible).then(|| {
+                        div().absolute().right(px(6.0)).top(px(5.0)).child(
+                            app_button_base(delivery_element_id(
+                                key,
+                                kind,
+                                "recipient-suggestions-trigger",
+                            ))
+                            .icon(Icon::new(RailgunActionIcon::BookUser))
+                            .outline()
+                            .small()
+                            .compact()
+                            .tooltip("Select recipient")
+                            .disabled(generating || options.is_empty())
+                            .on_click(move |_event, window, cx| {
+                                cx.stop_propagation();
+                                focus_input.read(cx).focus_handle(cx).focus(window);
+                                toggle_root.update(cx, |root, cx| {
+                                    root.toggle_recipient_suggestions(kind, key, cx);
+                                });
+                            }),
+                        )
+                    }))
+                    .children(save_visible.then(|| {
+                        div().absolute().right(px(6.0)).top(px(5.0)).child(
+                            app_button_base(delivery_element_id(key, kind, "save-recipient"))
+                                .icon(Icon::new(RailgunActionIcon::Save))
+                                .outline()
+                                .small()
+                                .compact()
+                                .tooltip("Save recipient")
+                                .disabled(generating)
+                                .on_click(move |_event, window, cx| {
+                                    let recipient = save_recipient.clone();
+                                    save_root.update(cx, |root, cx| {
+                                        root.open_save_recipient_dialog(
+                                            kind, key, recipient, window, cx,
+                                        );
+                                    });
+                                }),
+                        )
+                    })),
+            )
+            .children(suggestions_bounds.map(|bounds| {
+                deferred(render_recipient_suggestions_menu(
+                    &dropdown_root,
                     key,
                     kind,
-                    "recipient-suggestions-trigger",
+                    filtered,
+                    selected_index,
+                    &suggestions_scroll,
+                    bounds,
                 ))
-                .icon(Icon::new(RailgunActionIcon::BookUser))
-                .outline()
-                .small()
-                .compact()
-                .tooltip("Select recipient")
-                .disabled(generating || options.is_empty())
-                .on_click(move |_event, window, cx| {
-                    cx.stop_propagation();
-                    focus_input.read(cx).focus_handle(cx).focus(window);
-                    toggle_root.update(cx, |root, cx| {
-                        root.toggle_recipient_suggestions(kind, key, cx);
-                    });
-                }),
-            )
-        }))
-        .children(save_visible.then(|| {
-            div().absolute().right(px(6.0)).top(px(5.0)).child(
-                app_button_base(delivery_element_id(key, kind, "save-recipient"))
-                    .icon(Icon::new(RailgunActionIcon::Save))
-                    .outline()
-                    .small()
-                    .compact()
-                    .tooltip("Save recipient")
-                    .disabled(generating)
-                    .on_click(move |_event, window, cx| {
-                        let recipient = save_recipient.clone();
-                        save_root.update(cx, |root, cx| {
-                            root.open_save_recipient_dialog(kind, key, recipient, window, cx);
-                        });
-                    }),
-            )
-        }))
-        .children(show_suggestions.then(|| {
-            deferred(render_recipient_suggestions_menu(
-                &dropdown_root,
-                key,
-                kind,
-                filtered,
-                selected_index,
-                suggestions_scroll,
-            ))
-            .with_priority(2)
-        }))
+                .with_priority(2)
+            }))
+    }
 }
 
 fn render_recipient_suggestions_menu(
@@ -331,12 +433,32 @@ fn render_recipient_suggestions_menu(
     options: Vec<RecipientOption>,
     selected_index: Option<usize>,
     scroll_handle: &ScrollHandle,
+    picker_bounds: Bounds<Pixels>,
+) -> gpui::AnyElement {
+    let menu = render_recipient_suggestions_menu_content(
+        root,
+        key,
+        kind,
+        options,
+        selected_index,
+        scroll_handle,
+    );
+    anchored()
+        .snap_to_window_with_margin(px(8.0))
+        .child(div().w(picker_bounds.size.width).child(menu))
+        .into_any_element()
+}
+
+fn render_recipient_suggestions_menu_content(
+    root: &Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    options: Vec<RecipientOption>,
+    selected_index: Option<usize>,
+    scroll_handle: &ScrollHandle,
 ) -> gpui::Div {
     let menu = div()
-        .absolute()
-        .top(px(42.0))
-        .left_0()
-        .right_0()
+        .w_full()
         .p(px(8.0))
         .flex()
         .flex_col()
@@ -351,7 +473,7 @@ fn render_recipient_suggestions_menu(
     }
     let mut list = div()
         .id(delivery_element_id(key, kind, "recipient-suggestions-list"))
-        .max_h(px(220.0))
+        .max_h(RECIPIENT_SUGGESTIONS_MAX_HEIGHT)
         .overflow_y_scroll()
         .track_scroll(scroll_handle)
         .flex()
@@ -408,7 +530,7 @@ fn recipient_option_row(option: &RecipientOption) -> gpui::Div {
         )
         .child(
             div()
-                .text_size(APP_TEXT_SIZE)
+                .text_size(RECIPIENT_OPTION_ADDRESS_TEXT_SIZE)
                 .font_family(APP_FONT_FAMILY)
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(SharedString::from(display_address)),
@@ -547,6 +669,10 @@ impl WalletRoot {
             }),
         };
         if changed {
+            if kind == DeliveryFormKind::Unshield {
+                self.refresh_unshield_native_top_up_state(key, cx);
+                self.maybe_schedule_unshield_native_top_up_balance_refresh(key, cx);
+            }
             self.debounce_public_broadcaster_cost_estimate(kind, key, cx);
             cx.notify();
         }
@@ -564,8 +690,11 @@ impl WalletRoot {
         };
         let options = self.recipient_options_for_kind(kind);
         let open = open && !options.is_empty();
+        let filter_query = recipient_suggestion_filter_query(kind, &query);
         let selected_index = if open {
-            first_recipient_suggestion_index(filtered_recipient_options(&options, &query).len())
+            first_recipient_suggestion_index(
+                filtered_recipient_options(&options, &filter_query).len(),
+            )
         } else {
             None
         };
@@ -639,7 +768,8 @@ impl WalletRoot {
         if options.is_empty() || save_visible {
             return;
         }
-        let filtered_len = filtered_recipient_options(&options, &query).len();
+        let filter_query = recipient_suggestion_filter_query(kind, &query);
+        let filtered_len = filtered_recipient_options(&options, &filter_query).len();
         let current = self.recipient_suggestion_index(kind, key);
         let selected_index =
             recipient_suggestion_index_after_move(current, filtered_len, direction);
@@ -663,7 +793,9 @@ impl WalletRoot {
         let Some(query) = query else {
             return;
         };
-        let filtered = filtered_recipient_options(&self.recipient_options_for_kind(kind), &query);
+        let filter_query = recipient_suggestion_filter_query(kind, &query);
+        let filtered =
+            filtered_recipient_options(&self.recipient_options_for_kind(kind), &filter_query);
         let selected_index = self
             .recipient_suggestion_index(kind, key)
             .or_else(|| (filtered.len() == 1).then_some(0));
