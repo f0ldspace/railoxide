@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use broadcaster_monitor::{EventRx, EventTx, Shared};
 use gpui::ObjectFit;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, IntoElement, ParentElement, Point, Render,
-    SharedString, Styled, StyledImage as _, Window, WindowBounds, WindowOptions, div, img,
-    prelude::FluentBuilder as _, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Point, Render, SharedString, StatefulInteractiveElement, Styled,
+    StyledImage as _, Window, WindowBounds, WindowOptions, div, img, prelude::FluentBuilder as _,
+    px, rgb, size,
 };
 use gpui_component::{
     Icon, IconName, Root, Sizable, TitleBar,
@@ -13,14 +14,18 @@ use gpui_component::{
     resizable::{resizable_panel, v_resizable},
     scroll::ScrollableElement,
     tab::{Tab, TabBar},
+    tooltip::Tooltip,
 };
 use tokio::runtime::Handle;
+use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
 use ui::controls::{app_button, app_button_base};
 use ui::icons;
 use ui::logs::LogStore;
-use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
+use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 
-use crate::assets::{HEMATITE_HERO_PATH, HERO_WORDMARK_PATH, LOGO_ICON_PATH, WARM_GLOW_PATH};
+use crate::assets::{
+    HEMATITE_HERO_PATH, HERO_WORDMARK_PATH, LOGO_ICON_PATH, RailgunSocialIcon, WARM_GLOW_PATH,
+};
 
 use super::actions::register_wallet_shortcut_root;
 use super::chain_load::sync_status_bar;
@@ -31,6 +36,11 @@ use super::{
     SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, chain_load_overrides,
     rgb_with_alpha,
 };
+
+pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
+pub(super) const LINK_COPIED_MESSAGE: &str = "Link copied to clipboard!";
+pub(super) const RAILOXIDE_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railoxide";
+pub(super) const TELEGRAM_URL: &str = "https://t.me/railoxide";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum WalletTab {
@@ -393,11 +403,100 @@ fn render_wallet_brand_block(window: &Window, layout: WalletHeroLayout) -> gpui:
             )
         })
         .child(
-            img(HERO_WORDMARK_PATH)
-                .w(wordmark_width)
-                .h(wordmark_height)
-                .object_fit(ObjectFit::Contain),
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .child(
+                    img(HERO_WORDMARK_PATH)
+                        .w(wordmark_width)
+                        .h(wordmark_height)
+                        .object_fit(ObjectFit::Contain),
+                )
+                .child(render_wallet_build_metadata()),
         )
+}
+
+fn render_wallet_build_metadata() -> gpui::Div {
+    let build_label = wallet_build_label();
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(
+                    div()
+                        .font_family(APP_MONO_FONT_FAMILY)
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(build_label.clone()),
+                )
+                .child(clipboard_with_toast(
+                    "wallet-hero-build-info-copy",
+                    build_label,
+                )),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .gap_1()
+                .child(render_wallet_social_copy_button(
+                    "wallet-hero-repository-url-copy",
+                    Icon::new(IconName::GitHub).size_4(),
+                    RAILOXIDE_REPOSITORY_URL,
+                ))
+                .child(render_wallet_social_copy_button(
+                    "wallet-hero-telegram-url-copy",
+                    Icon::new(RailgunSocialIcon::Telegram).size_4(),
+                    TELEGRAM_URL,
+                )),
+        )
+}
+
+fn render_wallet_social_copy_button(
+    id: &'static str,
+    icon: impl IntoElement,
+    url: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .cursor_pointer()
+        .hover(|this| {
+            this.bg(rgb_with_alpha(theme::SURFACE_HOVER, 0.24))
+                .text_color(rgb(theme::TEXT))
+        })
+        .tooltip(|window, cx| Tooltip::new(COPY_URL_TOOLTIP).build(window, cx))
+        .on_click(move |_event, window, cx| {
+            copy_to_clipboard_with_custom_toast(url, LINK_COPIED_MESSAGE, window, cx);
+        })
+        .child(icon)
+}
+
+pub(super) fn wallet_build_label() -> SharedString {
+    SharedString::from(format!(
+        "v{} {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("RAILOXIDE_GIT_SHORT_HASH").unwrap_or("unknown")
+    ))
 }
 
 impl WalletRoot {

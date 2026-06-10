@@ -20,11 +20,25 @@ pub fn copy_to_clipboard_with_toast(
     window: &mut Window,
     cx: &mut App,
 ) {
+    copy_to_clipboard_with_custom_toast(value, COPIED_MESSAGE, window, cx);
+}
+
+/// Copy text to the clipboard and show a custom confirmation toast.
+pub fn copy_to_clipboard_with_custom_toast(
+    value: impl Into<SharedString>,
+    message: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let value = value.into();
     cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
-    push_copied_toast(window, cx);
+    push_copied_toast_message(message, window, cx);
 }
 
 fn push_copied_toast(window: &mut Window, cx: &mut App) {
-    window.push_notification(Notification::success(COPIED_MESSAGE), cx);
+    push_copied_toast_message(COPIED_MESSAGE, window, cx);
+}
+
+fn push_copied_toast_message(message: impl Into<SharedString>, window: &mut Window, cx: &mut App) {
+    window.push_notification(Notification::success(message), cx);
 }

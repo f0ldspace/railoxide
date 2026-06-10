@@ -14,6 +14,7 @@ pub(crate) const LEDGER_LOGO_SHORT_WHITE_ICON_PATH: &str =
     "railgun/icons/ledger-logo-short-white.svg";
 pub(crate) const TREZOR_SYMBOL_WHITE_ICON_PATH: &str = "railgun/icons/trezor-symbol-white-rgb.svg";
 pub(crate) const WALLETCONNECT_ICON_PATH: &str = "railgun/icons/walletconnect.svg";
+const TELEGRAM_ICON_PATH: &str = "railgun/icons/telegram.svg";
 const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
@@ -45,6 +46,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     LEDGER_LOGO_SHORT_WHITE_ICON_PATH,
     TREZOR_SYMBOL_WHITE_ICON_PATH,
     WALLETCONNECT_ICON_PATH,
+    TELEGRAM_ICON_PATH,
     ARROW_BIG_RIGHT_DASH_ICON_PATH,
     SHIELD_ICON_PATH,
     WALLET_ICON_PATH,
@@ -76,6 +78,7 @@ const LEDGER_LOGO_SHORT_WHITE_ICON_BYTES: &[u8] =
 const TREZOR_SYMBOL_WHITE_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/trezor-symbol-white-rgb.svg");
 const WALLETCONNECT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/walletconnect.svg");
+const TELEGRAM_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/telegram.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/arrow-big-right-dash.svg");
 const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
@@ -271,6 +274,20 @@ impl IconNamed for RailgunNetworkStatusIcon {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RailgunSocialIcon {
+    Telegram,
+}
+
+impl IconNamed for RailgunSocialIcon {
+    fn path(self) -> SharedString {
+        match self {
+            Self::Telegram => TELEGRAM_ICON_PATH,
+        }
+        .into()
+    }
+}
+
 fn railgun_asset(path: &str) -> Option<&'static [u8]> {
     match path {
         LOGO_ICON_PATH => Some(LOGO_ICON_BYTES),
@@ -281,6 +298,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         LEDGER_LOGO_SHORT_WHITE_ICON_PATH => Some(LEDGER_LOGO_SHORT_WHITE_ICON_BYTES),
         TREZOR_SYMBOL_WHITE_ICON_PATH => Some(TREZOR_SYMBOL_WHITE_ICON_BYTES),
         WALLETCONNECT_ICON_PATH => Some(WALLETCONNECT_ICON_BYTES),
+        TELEGRAM_ICON_PATH => Some(TELEGRAM_ICON_BYTES),
         ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
@@ -376,6 +394,12 @@ mod tests {
             assets
                 .load("railgun/icons/walletconnect.svg")
                 .expect("load walletconnect icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/telegram.svg")
+                .expect("load telegram icon")
                 .is_some()
         );
     }

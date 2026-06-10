@@ -9,15 +9,22 @@ use gpui_component::{
     progress::Progress as UiProgress,
     sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
     spinner::Spinner,
+    tooltip::Tooltip,
 };
+use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
 use ui::theme;
 use wallet_ops::ProverCacheBuildProgress;
 
 use crate::assets::{
-    LOGO_ICON_PATH, RailgunNetworkStatusIcon, RailgunSidebarIcon, SIDEBAR_WORDMARK_PATH,
+    LOGO_ICON_PATH, RailgunNetworkStatusIcon, RailgunSidebarIcon, RailgunSocialIcon,
+    SIDEBAR_WORDMARK_PATH,
 };
 
 use super::network::{network_health_color, render_network_status_popover_content};
+use super::shell::{
+    COPY_URL_TOOLTIP, LINK_COPIED_MESSAGE, RAILOXIDE_REPOSITORY_URL, TELEGRAM_URL,
+    wallet_build_label,
+};
 use super::{SIDEBAR_WIDTH, WalletRoot, WalletTab, rgb_with_alpha, should_focus_utxo_table};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,6 +539,40 @@ impl WalletRoot {
         sidebar_is_narrow: bool,
     ) -> impl IntoElement {
         div()
+            .w_full()
+            .when(!collapsed, |this| {
+                this.flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Self::render_sidebar_brand_toggle(root.clone(), sidebar_is_narrow)
+                            .child(Self::render_sidebar_logo())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .line_height(gpui::relative(1.2))
+                                    .child(Self::render_sidebar_wordmark()),
+                            ),
+                    )
+                    .child(Self::render_sidebar_build_metadata())
+            })
+            .when(collapsed, |this| {
+                this.child(
+                    Self::render_sidebar_brand_toggle(root, sidebar_is_narrow)
+                        .justify_center()
+                        .child(Self::render_sidebar_logo()),
+                )
+            })
+    }
+
+    fn render_sidebar_brand_toggle(
+        root: Entity<Self>,
+        sidebar_is_narrow: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
             .id("sidebar-brand-toggle")
             .w_full()
             .flex()
@@ -548,19 +589,94 @@ impl WalletRoot {
                     cx.notify();
                 });
             })
-            .when(!collapsed, |this| {
-                this.child(Self::render_sidebar_logo()).child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .line_height(gpui::relative(1.2))
-                        .child(Self::render_sidebar_wordmark()),
-                )
+    }
+
+    fn render_sidebar_build_metadata() -> gpui::Div {
+        let build_label = wallet_build_label();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .max_w(px(166.0))
+                            .truncate()
+                            .font_family(theme::APP_MONO_FONT_FAMILY)
+                            .text_size(px(10.5))
+                            .line_height(px(14.0))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(build_label.clone()),
+                    )
+                    .child(clipboard_with_toast(
+                        "wallet-sidebar-build-info-copy",
+                        build_label,
+                    )),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .gap_1()
+                    .child(Self::render_sidebar_social_copy_button(
+                        "wallet-sidebar-repository-url-copy",
+                        Icon::new(IconName::GitHub).size_4(),
+                        RAILOXIDE_REPOSITORY_URL,
+                    ))
+                    .child(Self::render_sidebar_social_copy_button(
+                        "wallet-sidebar-telegram-url-copy",
+                        Icon::new(RailgunSocialIcon::Telegram).size_4(),
+                        TELEGRAM_URL,
+                    )),
+            )
+            .child(
+                div()
+                    .mt(px(18.0))
+                    .w(px(70.0))
+                    .h(px(1.0))
+                    .rounded_full()
+                    .bg(rgb_with_alpha(theme::TEXT_MUTED, 0.13)),
+            )
+    }
+
+    fn render_sidebar_social_copy_button(
+        id: &'static str,
+        icon: impl IntoElement,
+        url: &'static str,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .size(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .cursor_pointer()
+            .hover(|this| {
+                this.bg(rgb_with_alpha(theme::SURFACE_HOVER, 0.24))
+                    .text_color(rgb(theme::TEXT))
             })
-            .when(collapsed, |this| {
-                this.justify_center().child(Self::render_sidebar_logo())
+            .tooltip(|window, cx| Tooltip::new(COPY_URL_TOOLTIP).build(window, cx))
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
             })
+            .on_click(move |_event, window, cx| {
+                cx.stop_propagation();
+                copy_to_clipboard_with_custom_toast(url, LINK_COPIED_MESSAGE, window, cx);
+            })
+            .child(icon)
     }
 
     fn render_sidebar_logo() -> impl IntoElement {
