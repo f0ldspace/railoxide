@@ -19,10 +19,10 @@ use gpui_component::{
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
-use wallet_ops::hardware::{HardwareDerivationDescriptor, HardwareDeviceKind};
+use wallet_ops::hardware::HardwareDerivationDescriptor;
 #[cfg(feature = "hardware")]
 use wallet_ops::hardware::{
-    HardwareDerivationError,
+    HardwareDerivationError, HardwareDeviceKind,
     ledger::LedgerHardwareDerivationClient,
     synthetic_entropy_from_hardware_output,
     trezor::{TrezorHardwareDerivationClient, TrezorPinMatrixProvider},
@@ -37,6 +37,7 @@ use zeroize::Zeroizing;
 use crate::assets::WalletIconSource;
 
 use super::private_action::UnshieldAssetKey;
+use super::vault::hardware_device_label;
 use super::{
     WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
     scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
@@ -1264,13 +1265,6 @@ impl WalletRoot {
             window,
             cx,
         );
-    }
-}
-
-const fn hardware_device_label(device_kind: HardwareDeviceKind) -> &'static str {
-    match device_kind {
-        HardwareDeviceKind::Ledger => "Ledger",
-        HardwareDeviceKind::Trezor => "Trezor",
     }
 }
 

@@ -23,14 +23,13 @@ use ui::controls::{
 #[cfg(feature = "hardware")]
 use ui::theme::APP_MONO_FONT_FAMILY;
 use ui::theme::{self, APP_TEXT_SIZE};
-#[cfg(feature = "hardware")]
-use wallet_ops::hardware::trezor::TrezorPinMatrixRequestKind;
 use wallet_ops::hardware::{HardwareDeviceKind, HardwareWalletSyncIntent};
 #[cfg(feature = "hardware")]
 use wallet_ops::vault::TrezorPassphraseMode;
 
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
+use super::vault::hardware_device_label;
 #[cfg(feature = "hardware")]
 use super::vault::{
     HardwareProfileApprovalPrompt, HardwareProfilePickerView, HardwareProfileStep,
@@ -45,6 +44,11 @@ use crate::assets::RailgunActionIcon;
 use crate::assets::{
     IMPORT_ICON_PATH, LEDGER_LOGO_SHORT_WHITE_ICON_PATH, TREZOR_SYMBOL_WHITE_ICON_PATH,
 };
+
+#[cfg(feature = "hardware")]
+mod trezor;
+#[cfg(feature = "hardware")]
+use trezor::trezor_pin_matrix_title;
 
 impl WalletRoot {
     pub(super) const fn titlebar_color(&self) -> u32 {
@@ -1332,15 +1336,6 @@ fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
         .child(app_muted_text(subtitle).line_height(px(18.0)))
 }
 
-pub(in crate::root) const fn hardware_device_label(
-    device_kind: HardwareDeviceKind,
-) -> &'static str {
-    match device_kind {
-        HardwareDeviceKind::Ledger => "Ledger",
-        HardwareDeviceKind::Trezor => "Trezor",
-    }
-}
-
 pub(in crate::root) const fn hardware_create_button_id(
     device_kind: HardwareDeviceKind,
 ) -> &'static str {
@@ -1974,17 +1969,6 @@ fn render_trezor_pin_matrix_position_button(root: &Entity<WalletRoot>, position:
                 root.push_trezor_pin_matrix_position(position, cx);
             });
         })
-}
-
-#[cfg(feature = "hardware")]
-const fn trezor_pin_matrix_title(kind: TrezorPinMatrixRequestKind) -> &'static str {
-    match kind {
-        TrezorPinMatrixRequestKind::Current => "Enter Trezor PIN",
-        TrezorPinMatrixRequestKind::NewFirst => "Enter new Trezor PIN",
-        TrezorPinMatrixRequestKind::NewSecond => "Confirm new Trezor PIN",
-        TrezorPinMatrixRequestKind::WipeCodeFirst => "Enter Trezor wipe code",
-        TrezorPinMatrixRequestKind::WipeCodeSecond => "Confirm Trezor wipe code",
-    }
 }
 
 #[cfg(feature = "hardware")]

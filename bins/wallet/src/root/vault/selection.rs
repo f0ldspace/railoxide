@@ -1,0 +1,224 @@
+use super::*;
+
+pub(in crate::root) fn wallet_options_from_metadata(
+    mut metadata: Vec<WalletMetadataBundle>,
+) -> Vec<WalletOption> {
+    metadata.retain(|metadata| metadata.status == wallet_ops::vault::WalletStatus::Active);
+    sort_wallet_metadata(&mut metadata);
+    metadata
+        .into_iter()
+        .map(|metadata| WalletOption {
+            wallet_id: Arc::from(metadata.wallet_uuid),
+            source: metadata.source,
+        })
+        .collect()
+}
+
+pub(in crate::root) const fn hardware_device_wallet_select_value(
+    device_kind: HardwareDeviceKind,
+) -> &'static str {
+    match device_kind {
+        HardwareDeviceKind::Ledger => "hardware-device:ledger",
+        HardwareDeviceKind::Trezor => "hardware-device:trezor",
+    }
+}
+
+pub(in crate::root) const fn hardware_device_wallet_select_label(
+    device_kind: HardwareDeviceKind,
+) -> &'static str {
+    match device_kind {
+        HardwareDeviceKind::Ledger => "Ledger",
+        HardwareDeviceKind::Trezor => "Trezor",
+    }
+}
+
+pub(in crate::root) fn hardware_device_kind_from_wallet_select_value(
+    value: &str,
+) -> Option<HardwareDeviceKind> {
+    match value {
+        "hardware-device:ledger" => Some(HardwareDeviceKind::Ledger),
+        "hardware-device:trezor" => Some(HardwareDeviceKind::Trezor),
+        _ => None,
+    }
+}
+
+pub(in crate::root) fn wallet_select_items_from_metadata(
+    metadata: &[WalletMetadataBundle],
+) -> Vec<WalletSelectItem> {
+    let mut metadata = metadata.to_vec();
+    metadata.retain(|metadata| metadata.status == wallet_ops::vault::WalletStatus::Active);
+    sort_wallet_metadata(&mut metadata);
+
+    let mut items = Vec::new();
+    let mut ledger_added = false;
+    let mut trezor_added = false;
+
+    for metadata in metadata {
+        let Some(device_kind) = hardware_device_kind_from_source(metadata.source) else {
+            items.push(WalletSelectItem {
+                wallet_id: Arc::from(metadata.wallet_uuid),
+                label: Arc::from(metadata.label),
+            });
+            continue;
+        };
+        if metadata.hardware_account.is_none() {
+            continue;
+        }
+
+        let added = match device_kind {
+            HardwareDeviceKind::Ledger => &mut ledger_added,
+            HardwareDeviceKind::Trezor => &mut trezor_added,
+        };
+        if *added {
+            continue;
+        }
+        *added = true;
+        items.push(WalletSelectItem {
+            wallet_id: Arc::from(hardware_device_wallet_select_value(device_kind)),
+            label: Arc::from(hardware_device_wallet_select_label(device_kind)),
+        });
+    }
+
+    items
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct HardwareWalletDisplayInfo {
+    pub(in crate::root) chip_label: String,
+    pub(in crate::root) detail_label: String,
+}
+
+pub(in crate::root) fn hardware_wallet_display_info(
+    wallet: &WalletMetadataBundle,
+    active_profile: Option<&HardwareProfileMetadata>,
+) -> Option<HardwareWalletDisplayInfo> {
+    let account = wallet.hardware_account.as_ref()?;
+    let device_kind = hardware_device_kind_from_source(wallet.source)?;
+    let profile_label = hardware_wallet_profile_label(
+        wallet,
+        &account.profile_id,
+        account.account_index,
+        active_profile,
+    );
+    let compact_profile_label = compact_hardware_profile_label(&profile_label, device_kind);
+    let renamed_account_label = renamed_hardware_account_label(wallet, account);
+    let account_label = renamed_account_label
+        .clone()
+        .unwrap_or_else(|| hardware_account_index_label(account.account_index));
+    let chip_label = format!("{compact_profile_label} / {account_label}");
+    let detail_label = if let Some(renamed_account_label) = renamed_account_label {
+        format!(
+            "{}: {profile_label} / {renamed_account_label} account {}",
+            hardware_device_wallet_select_label(device_kind),
+            account.account_index
+        )
+    } else {
+        format!(
+            "{}: {profile_label} account {}",
+            hardware_device_wallet_select_label(device_kind),
+            account.account_index
+        )
+    };
+
+    Some(HardwareWalletDisplayInfo {
+        chip_label,
+        detail_label,
+    })
+}
+
+fn hardware_wallet_profile_label(
+    wallet: &WalletMetadataBundle,
+    profile_id: &str,
+    account_index: u32,
+    active_profile: Option<&HardwareProfileMetadata>,
+) -> String {
+    if let Some(profile) = active_profile.filter(|profile| profile.profile_id == profile_id) {
+        return profile.label.clone();
+    }
+
+    let label = wallet
+        .hardware_account
+        .as_ref()
+        .map_or(wallet.label.as_str(), |account| account.label.as_str());
+    strip_hardware_account_suffix(label, account_index).to_owned()
+}
+
+fn renamed_hardware_account_label(
+    wallet: &WalletMetadataBundle,
+    account: &HardwareRailgunAccountMetadata,
+) -> Option<String> {
+    (wallet.label != account.label)
+        .then(|| strip_hardware_account_suffix(&wallet.label, account.account_index).to_owned())
+}
+
+fn hardware_account_index_label(account_index: u32) -> String {
+    format!("Account {account_index}")
+}
+
+fn strip_hardware_account_suffix(label: &str, account_index: u32) -> &str {
+    let recovery_suffix = format!(" account {account_index} recovery");
+    if let Some(profile_label) = label.strip_suffix(&recovery_suffix)
+        && !profile_label.trim().is_empty()
+    {
+        return profile_label.trim();
+    }
+
+    let suffix = format!(" account {account_index}");
+    if let Some(profile_label) = label.strip_suffix(&suffix)
+        && !profile_label.trim().is_empty()
+    {
+        return profile_label.trim();
+    }
+
+    label
+}
+
+fn compact_hardware_profile_label(profile_label: &str, device_kind: HardwareDeviceKind) -> String {
+    let default_profile_prefix = match device_kind {
+        HardwareDeviceKind::Ledger => "Ledger hardware profile",
+        HardwareDeviceKind::Trezor => "Trezor hardware profile",
+    };
+
+    if let Some(suffix) = profile_label.strip_prefix(default_profile_prefix) {
+        let suffix = suffix.trim();
+        return if suffix.is_empty() {
+            "Profile".to_owned()
+        } else {
+            format!("Profile {suffix}")
+        };
+    }
+
+    profile_label.to_owned()
+}
+
+pub(in crate::root) fn wallet_select_value_for_selected_wallet(
+    wallet_id: &Arc<str>,
+    metadata: &[WalletMetadataBundle],
+) -> Arc<str> {
+    metadata
+        .iter()
+        .find(|metadata| {
+            metadata.status == wallet_ops::vault::WalletStatus::Active
+                && metadata.wallet_uuid == wallet_id.as_ref()
+        })
+        .and_then(|metadata| {
+            if metadata.hardware_account.is_some() {
+                hardware_device_kind_from_source(metadata.source)
+                    .map(hardware_device_wallet_select_value)
+                    .map(Arc::from)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| Arc::clone(wallet_id))
+}
+
+pub(in crate::root::vault) const fn hardware_device_kind_from_source(
+    source: WalletSource,
+) -> Option<HardwareDeviceKind> {
+    match source {
+        WalletSource::LedgerDerived => Some(HardwareDeviceKind::Ledger),
+        WalletSource::TrezorDerived => Some(HardwareDeviceKind::Trezor),
+        WalletSource::Generated | WalletSource::Imported => None,
+    }
+}

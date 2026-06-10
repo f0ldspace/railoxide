@@ -1,148 +1,84 @@
-use std::collections::BTreeSet;
-use std::ops::Range;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
 use gpui::{
-    Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
+    Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
     alert::Alert,
-    button::{Button, ButtonVariants},
+    button::ButtonVariants,
     checkbox::Checkbox,
     collapsible::Collapsible,
-    input::InputState,
     menu::{DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,
-    spinner::Spinner,
     tooltip::Tooltip,
 };
-use qrcodegen::{QrCode, QrCodeEcc};
 use railgun_ui::{chain_name, short_address};
-use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    PublicActionAttemptInfo, PublicActionCommandSender, PublicActionProgressStep, PublicAssetId,
-    PublicBalanceEntry,
+    PublicAssetId, PublicBalanceEntry,
     hardware::{HardwareDeviceKind, HardwarePublicAccountDescriptor},
     vault::{
         DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountSource,
         PublicAccountStatus, WalletSource, public_account_default_label,
     },
 };
-#[cfg(feature = "hardware")]
-use wallet_ops::{
-    hardware::trezor::TrezorPinMatrixProvider,
-    hardware::{DEFAULT_HARDWARE_DERIVATION_PATH, parse_bip32_path},
-    vault::HardwareProfileSession,
-};
 use zeroize::Zeroizing;
 
-use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon, WalletIconSource};
+use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon};
+
+mod components;
+mod hardware;
+mod identicon;
+mod qr;
+mod types;
+
+pub(super) use components::{
+    next_public_account_label_number, public_account_display_label, public_account_matches_search,
+    public_account_source_icon, public_account_source_label,
+};
+use components::{
+    public_account_icon_button, public_account_metadata_badge, public_account_status_id,
+    public_account_walletconnect_button,
+};
+#[cfg(feature = "hardware")]
+use hardware::{HardwarePublicAccountDerivationProgress, create_hardware_public_account};
+pub(super) use hardware::{
+    HardwarePublicAccountDerivationStatus, hardware_public_account_setup_copy,
+};
+use hardware::{
+    hardware_public_device_label, render_hardware_public_account_checking,
+    render_hardware_public_account_confirmation_wait,
+};
+pub(super) use identicon::render_public_account_identicon;
+#[cfg(test)]
+pub(super) use identicon::{
+    PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
+    public_account_identicon_color, public_account_identicon_pattern,
+};
+#[cfg(test)]
+pub(super) use qr::{PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, public_address_qr_module_range};
+pub(super) use qr::{public_address_qr_payload, render_public_address_qr_dialog_content};
+pub(super) use types::PublicAccountFormState;
 
 use super::dialogs::PublicAccountDialogKind;
-use super::gas_fee::Eip1559GasFeeEditorState;
-use super::public_action::{PublicActionMode, PublicActionStepState};
+use super::public_action::PublicActionMode;
 use super::public_balances::{
     public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
 };
-use super::walletconnect::walletconnect_logo_with_presence;
 use super::{
     PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, WalletRoot,
     dialog_content_max_height, dialog_max_height, public_account_visible_balances_for_chain,
-    rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
+    scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
 };
 
-pub(super) const PUBLIC_ACCOUNT_IDENTICON_SIZE: Pixels = px(40.0);
-pub(super) const PUBLIC_ACCOUNT_IDENTICON_CELL_SIZE: Pixels = px(8.0);
-pub(super) const PUBLIC_ADDRESS_QR_MODULE_SIZE: Pixels = px(6.0);
-pub(super) const PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES: i32 = 4;
-pub(super) const PUBLIC_ADDRESS_QR_FOREGROUND: u32 = 0x1e3c67;
-pub(super) const PUBLIC_ADDRESS_QR_BACKGROUND: u32 = 0xffffff;
-pub(super) const PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE: usize = 5;
-pub(super) const PUBLIC_ACCOUNT_IDENTICON_SOURCE_COLUMNS: usize = 3;
-pub(super) const PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT: usize =
-    PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE * PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE;
-pub(super) const PUBLIC_ACCOUNT_IDENTICON_COLORS: [u32; 8] = [
-    theme::PRIMARY,
-    theme::SUCCESS,
-    theme::WARNING_STRONG,
-    theme::WARNING,
-    theme::DANGER,
-    theme::PURPLE,
-    theme::BLUE,
-    theme::OLIVE,
-];
 const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
 const PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE: Pixels = px(24.0);
 const PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE: Pixels = px(20.0);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HardwarePublicAccountDerivationStatus {
-    Idle,
-    CheckingDevice,
-    AwaitingAddressConfirmation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(feature = "hardware")]
-enum HardwarePublicAccountDerivationProgress {
-    CheckingDevice,
-    AwaitingAddressConfirmation(Address),
-}
-
-pub(super) struct PublicAccountFormState {
-    pub(super) add_label_input: Entity<InputState>,
-    pub(super) add_password_input: Entity<InputState>,
-    pub(super) import_label_input: Entity<InputState>,
-    pub(super) import_private_key_input: Entity<InputState>,
-    pub(super) import_password_input: Entity<InputState>,
-    pub(super) edit_label_input: Entity<InputState>,
-    pub(super) search_input: Entity<InputState>,
-    pub(super) send_recipient_input: Entity<InputState>,
-    pub(super) send_amount_input: Entity<InputState>,
-    pub(super) shield_amount_input: Entity<InputState>,
-    pub(super) send_gas_fee: Eip1559GasFeeEditorState,
-    pub(super) shield_gas_fee: Eip1559GasFeeEditorState,
-    pub(super) import_global: bool,
-    pub(super) selected_account_uuid: Option<Arc<str>>,
-    pub(super) editing_account_uuid: Option<Arc<str>>,
-    pub(super) search_query: Arc<str>,
-    pub(super) selected_asset: Option<PublicAssetId>,
-    pub(super) action_mode: PublicActionMode,
-    pub(super) action_generation: u64,
-    pub(super) action_progress: Vec<PublicActionStepState>,
-    pub(super) expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
-    pub(super) action_progress_dialog_open: bool,
-    pub(super) action_requires_device_approval: bool,
-    pub(super) action_progress_asset_label: Arc<str>,
-    pub(super) action_progress_icon_path: Option<WalletIconSource>,
-    pub(super) action_task_abort_handle: Option<tokio::task::AbortHandle>,
-    pub(super) action_stop_available: bool,
-    pub(super) action_stopped: bool,
-    pub(super) action_command_tx: Option<PublicActionCommandSender>,
-    pub(super) action_attempts: Vec<PublicActionAttemptInfo>,
-    pub(super) action_current_gas_fee: Option<(u128, u128)>,
-    pub(super) action_action_error: Option<Arc<str>>,
-    pub(super) next_derived_index: Option<u32>,
-    pub(super) next_account_label_number: u32,
-    pub(super) error: Option<Arc<str>>,
-    pub(super) send_error: Option<Arc<str>>,
-    pub(super) shield_error: Option<Arc<str>>,
-    pub(super) adding_account: bool,
-    pub(super) hardware_derivation_status: HardwarePublicAccountDerivationStatus,
-    pub(super) hardware_confirmation_address: Option<Address>,
-    pub(super) importing_account: bool,
-    pub(super) sending: bool,
-    pub(super) shielding: bool,
-    pub(super) active_accounts_open: bool,
-    pub(super) inactive_accounts_open: bool,
-    pub(super) pending_global_delete_uuid: Option<Arc<str>>,
-}
 
 impl WalletRoot {
     pub(super) fn open_public_account_dialog(
@@ -2037,506 +1973,5 @@ impl WalletRoot {
                             .text_color(rgb(theme::WARNING_STRONG)),
                     ),
             )
-    }
-}
-
-fn public_account_icon_button(
-    id: impl Into<ElementId>,
-    icon: impl Into<Icon>,
-    tooltip: impl Into<SharedString>,
-) -> Button {
-    Button::new(id)
-        .icon(icon)
-        .ghost()
-        .xsmall()
-        .compact()
-        .tooltip(tooltip)
-}
-
-fn public_account_walletconnect_button(
-    id: impl Into<ElementId>,
-    has_active_session: bool,
-) -> Button {
-    Button::new(id)
-        .text()
-        .xsmall()
-        .compact()
-        .cursor_pointer()
-        .tooltip(if has_active_session {
-            "Manage WalletConnect sessions"
-        } else {
-            "Connect dapp with WalletConnect"
-        })
-        .child(walletconnect_logo_with_presence(
-            px(16.0),
-            has_active_session,
-        ))
-}
-
-fn public_account_metadata_badge(
-    id: impl Into<ElementId>,
-    icon: impl Into<Icon>,
-    tooltip: impl Into<SharedString>,
-) -> impl IntoElement {
-    let tooltip = tooltip.into();
-    div()
-        .id(id)
-        .flex()
-        .size(px(18.0))
-        .items_center()
-        .justify_center()
-        .rounded_sm()
-        .bg(rgb(theme::SURFACE))
-        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-        .child(Icon::new(icon).xsmall().text_color(rgb(theme::TEXT_MUTED)))
-}
-
-const fn public_account_status_id(status: PublicAccountStatus) -> &'static str {
-    match status {
-        PublicAccountStatus::Active => "active",
-        PublicAccountStatus::Inactive => "inactive",
-    }
-}
-
-pub(super) fn render_public_account_identicon(address: &Address) -> gpui::Div {
-    let pattern = public_account_identicon_pattern(address);
-    let foreground = public_account_identicon_color(address);
-    let mut icon = div()
-        .size(PUBLIC_ACCOUNT_IDENTICON_SIZE)
-        .flex_none()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_0();
-    for row in pattern.chunks_exact(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE) {
-        let mut row_div = div().flex().gap_0();
-        for active in row {
-            let cell = div().size(PUBLIC_ACCOUNT_IDENTICON_CELL_SIZE);
-            row_div = row_div.child(if *active {
-                cell.bg(rgb(foreground))
-            } else {
-                cell
-            });
-        }
-        icon = icon.child(row_div);
-    }
-    icon
-}
-
-pub(super) fn public_account_identicon_pattern(
-    address: &Address,
-) -> [bool; PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT] {
-    let mut pattern = [false; PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT];
-    let mut has_foreground = false;
-    for (row_index, row) in pattern
-        .chunks_exact_mut(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE)
-        .enumerate()
-    {
-        for column in 0..PUBLIC_ACCOUNT_IDENTICON_SOURCE_COLUMNS {
-            let bit_index = row_index * PUBLIC_ACCOUNT_IDENTICON_SOURCE_COLUMNS + column;
-            let active = public_account_identicon_bit(address, bit_index);
-            has_foreground |= active;
-            row[column] = active;
-            row[PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE - column - 1] = active;
-        }
-    }
-    if !has_foreground {
-        pattern[PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT / 2] = true;
-    }
-    pattern
-}
-
-fn public_account_identicon_bit(address: &Address, bit_index: usize) -> bool {
-    let bytes = address.as_slice();
-    let byte = bytes[(bit_index * 7) % bytes.len()];
-    let shift = (bit_index * 5) % u8::BITS as usize;
-    ((byte >> shift) & 1) == 1
-}
-
-pub(super) fn public_account_identicon_color(address: &Address) -> u32 {
-    let bytes = address.as_slice();
-    let color_index = usize::from(bytes[3] ^ bytes[7] ^ bytes[11] ^ bytes[15] ^ bytes[19])
-        % PUBLIC_ACCOUNT_IDENTICON_COLORS.len();
-    PUBLIC_ACCOUNT_IDENTICON_COLORS[color_index]
-}
-
-pub(super) fn render_public_address_qr_dialog_content(
-    label: Option<SharedString>,
-    address: SharedString,
-    warning: Option<SharedString>,
-    copy_id: SharedString,
-    content_width: Pixels,
-) -> gpui::Div {
-    let address_copy_value = address.clone();
-    let copy_row_id = SharedString::from(format!("{}-row", copy_id.as_ref()));
-    div()
-        .w(content_width)
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap_4()
-        .children(warning.map(|warning| {
-            div()
-                .w_full()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .bg(rgb_with_alpha(theme::PRIMARY, 0.08))
-                .p(px(10.0))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .text_size(APP_TEXT_SIZE)
-                .line_height(px(18.0))
-                .child(warning)
-        }))
-        .children(label.map(|label| {
-            div()
-                .text_color(rgb(theme::TEXT))
-                .text_size(theme::ACCOUNT_LABEL_TEXT_SIZE)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(label)
-        }))
-        .child(render_public_address_qr_code(address.as_ref()))
-        .child(
-            div()
-                .id(copy_row_id)
-                .w_full()
-                .flex()
-                .items_center()
-                .gap_2()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .bg(rgb(theme::SURFACE_ELEVATED))
-                .px(px(10.0))
-                .py(px(8.0))
-                .cursor_pointer()
-                .hover(|this| {
-                    this.bg(rgb(theme::SURFACE_HOVER_SUBTLE))
-                        .border_color(rgb(theme::BORDER_STRONG))
-                })
-                .tooltip(|window, cx| Tooltip::new("Copy address").build(window, cx))
-                .on_click(move |_event, window, cx| {
-                    copy_to_clipboard_with_toast(address_copy_value.clone(), window, cx);
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_color(rgb(theme::TEXT))
-                        .text_size(px(12.0))
-                        .font_family(APP_MONO_FONT_FAMILY)
-                        .line_height(px(17.0))
-                        .child(address.clone()),
-                )
-                .child(clipboard_with_toast(copy_id, address)),
-        )
-}
-
-fn render_public_address_qr_code(payload: &str) -> gpui::Div {
-    let Ok(qr) = QrCode::encode_text(payload, QrCodeEcc::Medium) else {
-        return div()
-            .p(px(14.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(theme::DANGER))
-            .bg(rgb(theme::SURFACE_ELEVATED))
-            .text_color(rgb(theme::DANGER))
-            .child("QR code unavailable");
-    };
-    let mut grid = div()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
-        .bg(rgb(PUBLIC_ADDRESS_QR_BACKGROUND))
-        .p(px(6.0));
-    let module_range = public_address_qr_module_range(qr.size());
-    for y in module_range.clone() {
-        let mut row = div().flex().flex_none();
-        for x in module_range.clone() {
-            let active = x >= 0 && y >= 0 && x < qr.size() && y < qr.size() && qr.get_module(x, y);
-            row = row.child(
-                div()
-                    .size(PUBLIC_ADDRESS_QR_MODULE_SIZE)
-                    .flex_none()
-                    .bg(rgb(if active {
-                        PUBLIC_ADDRESS_QR_FOREGROUND
-                    } else {
-                        PUBLIC_ADDRESS_QR_BACKGROUND
-                    })),
-            );
-        }
-        grid = grid.child(row);
-    }
-    grid
-}
-
-pub(super) fn public_account_matches_search(account: &PublicAccountMetadata, query: &str) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return true;
-    }
-    account
-        .label
-        .as_deref()
-        .is_some_and(|label| label.to_ascii_lowercase().contains(&query))
-        || format!("{:#x}", account.address).contains(&query)
-}
-
-pub(super) fn public_account_display_label(account: &PublicAccountMetadata) -> Option<String> {
-    account
-        .label
-        .as_ref()
-        .filter(|label| !label.trim().is_empty())
-        .cloned()
-}
-
-pub(super) fn public_address_qr_payload(address: Address) -> String {
-    format!("{address:#x}")
-}
-
-pub(super) const fn public_address_qr_module_range(qr_size: i32) -> Range<i32> {
-    -PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES..qr_size + PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES
-}
-
-pub(super) fn next_public_account_label_number(account_count: usize) -> u32 {
-    u32::try_from(account_count)
-        .ok()
-        .and_then(|count| count.checked_add(1))
-        .unwrap_or(u32::MAX)
-}
-
-const fn hardware_public_device_label(device_kind: HardwareDeviceKind) -> &'static str {
-    match device_kind {
-        HardwareDeviceKind::Ledger => "Ledger",
-        HardwareDeviceKind::Trezor => "Trezor",
-    }
-}
-
-fn render_hardware_public_account_checking(device_kind: HardwareDeviceKind) -> gpui::Div {
-    let device_label = hardware_public_device_label(device_kind);
-    div()
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            Spinner::new()
-                .icon(IconName::LoaderCircle)
-                .color(rgb(theme::TEXT_MUTED).into())
-                .with_size(px(14.0)),
-        )
-        .child(app_muted_text(format!("Checking {device_label}...")))
-}
-
-fn render_hardware_public_account_confirmation_wait(
-    device_kind: HardwareDeviceKind,
-    preview_address: Option<Address>,
-) -> gpui::Div {
-    let device_label = hardware_public_device_label(device_kind);
-    div()
-        .w_full()
-        .p(px(12.0))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb_with_alpha(theme::SURFACE, 0.72))
-        .child(app_strong_text(format!("Confirm on {device_label}")))
-        .child(
-            app_muted_text(format!(
-                "Compare this address with the one shown on your {device_label}:"
-            ))
-            .whitespace_normal(),
-        )
-        .child(render_hardware_public_confirmation_address(preview_address))
-        .child(app_muted_text("Only approve if the addresses match.").whitespace_normal())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    Spinner::new()
-                        .icon(IconName::LoaderCircle)
-                        .color(rgb(theme::SUCCESS).into())
-                        .with_size(px(14.0)),
-                )
-                .child(
-                    app_muted_text(format!("Waiting for {device_label} approval..."))
-                        .text_color(rgb(theme::SUCCESS)),
-                ),
-        )
-}
-
-fn render_hardware_public_confirmation_address(preview_address: Option<Address>) -> gpui::Div {
-    div()
-        .w_full()
-        .p(px(10.0))
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .child(
-            app_muted_text(preview_address.map_or_else(
-                || "Preparing address preview...".to_owned(),
-                |address| format!("{address:#x}"),
-            ))
-            .font_family(APP_MONO_FONT_FAMILY)
-            .text_size(APP_TEXT_SIZE)
-            .whitespace_normal(),
-        )
-}
-
-pub(super) fn hardware_public_account_setup_copy(device_kind: HardwareDeviceKind) -> String {
-    let device_label = hardware_public_device_label(device_kind);
-    format!(
-        "Add a hardware-native Public EVM account from your {device_label}. The path is partitioned by the selected Private wallet account index. Confirm the receive address on your device before it is saved, and public transactions will require device approval."
-    )
-}
-
-#[cfg(feature = "hardware")]
-async fn create_hardware_public_account(
-    store: Arc<DesktopVaultStore>,
-    view_session: Arc<DesktopViewSession>,
-    device_kind: HardwareDeviceKind,
-    label: String,
-    trezor_app_passphrase: Option<Zeroizing<String>>,
-    trezor_pin_matrix_provider: Option<TrezorPinMatrixProvider>,
-    progress_tx: tokio::sync::mpsc::UnboundedSender<HardwarePublicAccountDerivationProgress>,
-) -> Result<(PublicAccountMetadata, HardwareProfileSession), String> {
-    let _ = progress_tx.send(HardwarePublicAccountDerivationProgress::CheckingDevice);
-    let mut hardware_session = view_session
-        .hardware_profile_session()
-        .cloned()
-        .ok_or_else(|| {
-            "unlock the matching hardware profile before adding a hardware public account"
-                .to_owned()
-        })?;
-    let account_index = store
-        .next_derived_public_account_index_for_session(view_session.as_ref())
-        .map_err(|error| error.to_string())?;
-    let descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
-        device_kind,
-        view_session.derivation_index(),
-        account_index,
-    )
-    .map_err(|error| error.to_string())?;
-    let confirmed_account = match device_kind {
-        HardwareDeviceKind::Ledger => {
-            let client = wallet_ops::hardware::ledger::LedgerHardwareDerivationClient::connect()
-                .await
-                .map_err(|error| error.to_string())?;
-            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
-                .map_err(|error| error.to_string())?;
-            let active = client
-                .active_profile_session(&profile_path)
-                .await
-                .map_err(|error| error.to_string())?;
-            ensure_hardware_public_profile_session(&hardware_session, &active)?;
-            let preview = client
-                .public_ethereum_address(&descriptor)
-                .await
-                .map_err(|error| error.to_string())?;
-            let _ = progress_tx.send(
-                HardwarePublicAccountDerivationProgress::AwaitingAddressConfirmation(preview),
-            );
-            let confirmed = client
-                .confirmed_public_ethereum_account(&descriptor)
-                .await
-                .map_err(|error| error.to_string())?;
-            ensure_hardware_public_confirmation_matches(preview, confirmed.address())?;
-            confirmed
-        }
-        HardwareDeviceKind::Trezor => {
-            let mut client =
-                wallet_ops::hardware::trezor::TrezorHardwareDerivationClient::connect_with_session(
-                    hardware_session.trezor_session_id.clone(),
-                )
-                .map_err(|error| error.to_string())?;
-            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
-            if let Some(passphrase) = trezor_app_passphrase {
-                client.set_app_passphrase_zeroizing(passphrase);
-            }
-            if let Some(provider) = trezor_pin_matrix_provider {
-                client.set_pin_matrix_provider(provider);
-            }
-            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
-                .map_err(|error| error.to_string())?;
-            let active = client
-                .active_profile_session(&profile_path)
-                .map_err(|error| error.to_string())?;
-            ensure_hardware_public_profile_session(&hardware_session, &active)?;
-            hardware_session
-                .trezor_session_id
-                .clone_from(&active.trezor_session_id);
-            hardware_session.set_trezor_passphrase_mode(active.trezor_passphrase_mode());
-            let preview = client
-                .public_ethereum_address(&descriptor)
-                .map_err(|error| error.to_string())?;
-            let _ = progress_tx.send(
-                HardwarePublicAccountDerivationProgress::AwaitingAddressConfirmation(preview),
-            );
-            let confirmed = client
-                .confirmed_public_ethereum_account(&descriptor)
-                .map_err(|error| error.to_string())?;
-            ensure_hardware_public_confirmation_matches(preview, confirmed.address())?;
-            confirmed
-        }
-    };
-    let account = store
-        .add_hardware_public_account(view_session.as_ref(), confirmed_account, Some(&label))
-        .map_err(|error| error.to_string())?;
-    Ok((account, hardware_session))
-}
-
-#[cfg(feature = "hardware")]
-fn ensure_hardware_public_profile_session(
-    expected: &HardwareProfileSession,
-    actual: &HardwareProfileSession,
-) -> Result<(), String> {
-    if expected.device_kind == actual.device_kind && expected.binding == actual.binding {
-        Ok(())
-    } else {
-        Err("wrong hardware device or passphrase context is active".to_owned())
-    }
-}
-
-#[cfg(feature = "hardware")]
-fn ensure_hardware_public_confirmation_matches(
-    preview: Address,
-    confirmed: Address,
-) -> Result<(), String> {
-    if preview == confirmed {
-        Ok(())
-    } else {
-        Err(
-            "Hardware wallet returned a different address than the preview. Account was not saved."
-                .to_owned(),
-        )
-    }
-}
-
-pub(super) const fn public_account_source_label(source: PublicAccountSource) -> &'static str {
-    match source {
-        PublicAccountSource::Derived => "Derived",
-        PublicAccountSource::HardwareDerived => "Hardware",
-        PublicAccountSource::Imported => "Imported",
-    }
-}
-
-pub(super) const fn public_account_source_icon(
-    source: PublicAccountSource,
-) -> RailgunPublicAccountIcon {
-    match source {
-        PublicAccountSource::Derived | PublicAccountSource::HardwareDerived => {
-            RailgunPublicAccountIcon::Derived
-        }
-        PublicAccountSource::Imported => RailgunPublicAccountIcon::Imported,
     }
 }
