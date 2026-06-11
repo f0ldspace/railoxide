@@ -35,6 +35,7 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 - Aggressive batching to reduce rpc throttling
 - Resilient public broadcaster network connection management
 - Decenralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
+- WalletConnect support for DeFi exposure
 
 ## Install From Source
 
