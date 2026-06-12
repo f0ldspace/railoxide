@@ -30,11 +30,11 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 - Indexed POI tree support, prevents UTXO spend intent leaking to the poi proxy operator
 - Hardware-derived wallets:
   - public accounts have full hardware wallet support.
-  - 0zk accounts are derived detirministically by signing a hash with a hardware device, private keys are **not** stored in app, but for signing they are briefly exposed in memory.
+  - 0zk accounts are derived deterministically by signing a hash with a hardware device, private keys are **not** stored in app, but for signing they are briefly exposed in memory.
     Full on-device 0zk signing support is to be added as soon as hardware wallet vendors add railgun-specific cryptography functions.
 - Aggressive batching to reduce rpc throttling
 - Resilient public broadcaster network connection management
-- Decenralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
+- Decentralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
 - WalletConnect support for DeFi exposure
 
 ## Install From Source
@@ -110,6 +110,24 @@ Direct mode is explicit and privacy-degraded. Proxy mode routes wallet HTTP/RPC 
 
 For details, see [`docs/privacy-model.md`](docs/privacy-model.md).
 
+## LLM Use in Development
+
+RailOxide is developed with heavy LLM assistance, designed and maintained by a human developer who reads and understands every line that ships.
+
+Where LLMs are used:
+
+- **Code generation.** Parts of the codebase are LLM-generated — notably GUI code and 100% of the unit tests. Generated code is reviewed and reworked by hand before merge; tests are additionally checked for what they assert, not just that they pass.
+- **Refactoring.** Large mechanical refactors are LLM-assisted.
+- **Code review and auditing.** Every change goes through LLM-assisted review cycles before merge, in addition to manual review. This regularly catches subtle bugs that human eyes alone would miss.
+
+Security-sensitive paths — key material handling, transaction construction, proof generation — receive the strictest scrutiny regardless of how a first draft originated.
+
 ## Shared Crates
 
 RailOxide depends on shared RAILGUN Rust crates from [`railgun-rust`](https://github.com/triamazikamno/railgun-rust).
+
+## Disclaimer
+
+RailOxide is free and open-source software distributed under the [MIT License](LICENSE). It is provided **"as is", without warranty of any kind**, express or implied. To the maximum extent permitted by law, the authors and contributors accept no liability for any claim, damages, or loss — including loss of funds — arising from the use of, or inability to use, this software.
+
+This is alpha software that interacts with real cryptocurrency networks. You are solely responsible for your keys, your backups, and every transaction you sign. Verify transaction details before signing, keep offline backups of your recovery material, and do not commit funds you cannot afford to lose.
