@@ -11,15 +11,15 @@ use super::{
     PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
     PathBuf, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountScope,
     PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
-    RecordKind, SoftwareRailgunSpendSigner, SpendGrant, StoredHardwareWalletRecord,
-    StoredWalletRecord, VAULT_METADATA_KEY, VaultError, VaultMetadata, VaultRecordEntries,
-    ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX,
+    RecordKind, Serialize, SoftwareRailgunSpendSigner, SpendGrant, StoredHardwareWalletRecord,
+    StoredWalletRecord, U256, VAULT_METADATA_KEY, VaultError, VaultMetadata, VaultRecordEntries,
+    ViewUnlock, ViewingKeyData, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX,
     WALLETCONNECT_RELAY_IDENTITY_PREFIX, WALLETCONNECT_SESSION_PREFIX, WalletChainMetadataBundle,
     WalletConnectRelayIdentity, WalletConnectSessionAccountResolution,
     WalletConnectSessionLifecycleState, WalletConnectSessionRecord, WalletKeys,
     WalletMetadataBundle, WalletSource, WalletSpendBundle, WalletSpendSource, WalletStatus,
     WalletViewBundle, Zeroizing, assign_missing_display_orders, bip39_entropy_from_mnemonic,
-    broadcaster_banned_record_entry, broadcaster_banned_record_key,
+    bip39_mnemonic_from_entropy, broadcaster_banned_record_entry, broadcaster_banned_record_key,
     broadcaster_favorite_record_entry, broadcaster_favorite_record_key,
     broadcaster_preference_entry_identity, create_spend_grant, create_with_params,
     current_vault_version, default_wallet_label_for_metadata,
@@ -56,6 +56,7 @@ mod base;
 mod broadcaster_preferences;
 mod chain_cache;
 mod hardware;
+mod key_export;
 mod public_accounts;
 mod record_io;
 mod wallet_metadata;

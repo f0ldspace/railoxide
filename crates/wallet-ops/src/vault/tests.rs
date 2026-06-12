@@ -5,6 +5,7 @@ mod encrypted_cache;
 mod first_run;
 mod hardware;
 mod helpers;
+mod key_export;
 mod public_accounts;
 mod wallet_metadata;
 mod wallet_storage;

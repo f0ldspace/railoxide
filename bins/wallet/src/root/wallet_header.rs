@@ -21,6 +21,7 @@ use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSou
 
 use crate::assets::{LEDGER_LOGO_SHORT_WHITE_ICON_PATH, TREZOR_SYMBOL_WHITE_ICON_PATH};
 
+use super::key_export::WALLET_EXPORT_MENU_LABEL;
 use super::utxo::short_hash;
 use super::vault::{
     HardwareWalletDisplayInfo, hardware_device_kind_from_wallet_select_value,
@@ -221,7 +222,9 @@ impl WalletRoot {
         );
         let add_root = root.clone();
         let manage_root = root.clone();
+        let export_root = root.clone();
         let repair_root = root;
+        let export_disabled = self.selected_wallet_id.is_none();
 
         app_button_base("wallet-actions-menu-trigger")
             .outline()
@@ -233,6 +236,7 @@ impl WalletRoot {
             .dropdown_menu(move |menu, _window, _cx| {
                 let add_root = add_root.clone();
                 let manage_root = manage_root.clone();
+                let export_root = export_root.clone();
                 let repair_root = repair_root.clone();
                 menu.min_w(px(190.0))
                     .item(
@@ -251,6 +255,15 @@ impl WalletRoot {
                             });
                         },
                     ))
+                    .item(
+                        PopupMenuItem::new(WALLET_EXPORT_MENU_LABEL)
+                            .disabled(export_disabled)
+                            .on_click(move |_event, window, cx| {
+                                export_root.update(cx, |root, cx| {
+                                    root.open_key_export_dialog(window, cx);
+                                });
+                            }),
+                    )
                     .item(
                         PopupMenuItem::new("Repair wallet cache")
                             .disabled(disabled)

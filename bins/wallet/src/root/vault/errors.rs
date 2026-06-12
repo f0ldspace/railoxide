@@ -51,6 +51,7 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         }
         VaultError::HardwareWalletIdentityMismatch => "hardware_wallet_identity_mismatch",
         VaultError::HardwareWalletViewRequiresDevice => "hardware_wallet_view_requires_device",
+        VaultError::WalletMnemonicUnavailable => "wallet_mnemonic_unavailable",
         VaultError::UnsupportedHardwareCustodyBackend(_) => "unsupported_hardware_custody_backend",
         VaultError::InvalidHardwareAccountRecoveryRange => {
             "invalid_hardware_account_recovery_range"
@@ -78,6 +79,9 @@ pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::HardwareWalletViewRequiresDevice => {
             "Connect the matching hardware wallet to view this account.".into()
+        }
+        VaultError::WalletMnemonicUnavailable => {
+            "Mnemonic seed export is unavailable for hardware-derived wallets.".into()
         }
         VaultError::UnsupportedHardwareCustodyBackend(_) => {
             "This hardware wallet custody backend is not supported by this app version.".into()

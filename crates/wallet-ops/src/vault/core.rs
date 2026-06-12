@@ -122,6 +122,8 @@ pub enum VaultError {
     HardwareWalletIdentityMismatch,
     #[error("hardware wallet view requires device unlock")]
     HardwareWalletViewRequiresDevice,
+    #[error("wallet mnemonic is unavailable")]
+    WalletMnemonicUnavailable,
     #[error("unsupported hardware custody backend {0}")]
     UnsupportedHardwareCustodyBackend(String),
     #[error("invalid hardware account recovery range")]

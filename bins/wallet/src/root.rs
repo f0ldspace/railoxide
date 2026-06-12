@@ -39,6 +39,7 @@ mod broadcaster_view;
 mod chain_load;
 mod dialogs;
 mod gas_fee;
+mod key_export;
 mod manage_wallets;
 mod network;
 mod platform_attention;
@@ -77,6 +78,7 @@ use broadcaster_preferences::{
 use broadcaster_view::{BroadcasterActivityTab, BroadcasterPreferenceListKind};
 use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
 use gas_fee::Eip1559GasFeeEditorState;
+use key_export::KeyExportState;
 use manage_wallets::ManageWalletsState;
 use network::TorExitIpQueryState;
 use private_action::{
@@ -356,6 +358,7 @@ pub(crate) struct WalletRoot {
     wallet_metadata: Vec<WalletMetadataBundle>,
     wallet_options: Vec<WalletOption>,
     manage_wallets: ManageWalletsState,
+    key_export: KeyExportState,
     manage_wallet_label_input: Entity<InputState>,
     selected_wallet_id: Option<Arc<str>>,
     active_wallet_generation: u64,
@@ -850,6 +853,7 @@ impl WalletRoot {
             wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
             manage_wallets: ManageWalletsState::default(),
+            key_export: KeyExportState::default(),
             manage_wallet_label_input,
             selected_wallet_id: None,
             active_wallet_generation: 0,

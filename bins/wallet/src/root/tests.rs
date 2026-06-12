@@ -25,6 +25,7 @@ mod amounts_and_balances;
 mod broadcasters;
 mod chain_loading;
 mod helpers;
+mod key_export;
 mod private_assets;
 mod private_display;
 mod progress;

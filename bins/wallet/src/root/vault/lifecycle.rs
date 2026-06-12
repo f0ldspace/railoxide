@@ -285,6 +285,7 @@ impl WalletRoot {
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.clear_key_export_dialog_state(window, cx);
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
@@ -401,6 +402,7 @@ impl WalletRoot {
         self.reset_wallet_scoped_state(cx);
         self.setup_password = None;
         self.generated_seed = None;
+        self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
             self.active_hardware_profile = None;
@@ -459,6 +461,7 @@ impl WalletRoot {
         self.setup_password = None;
         self.vault_view_unlock = None;
         self.generated_seed = None;
+        self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
             self.active_hardware_profile = None;
