@@ -908,7 +908,11 @@ pub(crate) fn public_broadcaster_transact_params(
     BroadcasterRawParamsTransact {
         chain_type: 0,
         chain_id: broadcaster.chain_id,
+        transact_type: None,
         min_gas_price: Some(U256::from(min_gas_price)),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        authorization: None,
         fees_id: Some(broadcaster.fees_id.clone()),
         to,
         data,
