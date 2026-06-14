@@ -439,6 +439,12 @@ impl WalletRoot {
         }
     }
 
+    pub(in crate::root) fn private_action_generation_ready(&self, chain_id: u64) -> bool {
+        self.chain_states
+            .get(&chain_id)
+            .is_some_and(ChainUtxoState::private_action_generation_ready)
+    }
+
     pub(in crate::root) fn refresh_unshield_native_top_up_state(
         &mut self,
         key: UnshieldAssetKey,

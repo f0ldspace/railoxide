@@ -87,6 +87,43 @@ impl ChainUtxoState {
             Self::Idle | Self::Loading { .. } | Self::Error { .. } => None,
         }
     }
+
+    pub(super) const fn private_action_forms_available(&self) -> bool {
+        matches!(self, Self::Syncing { .. } | Self::Ready { .. })
+    }
+
+    pub(super) const fn private_action_generation_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SyncStatusContext {
+    Loading,
+    Syncing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SyncStatusLabels {
+    pub(super) title: String,
+    pub(super) percent: u8,
+    pub(super) detail: String,
+}
+
+impl SyncStatusContext {
+    const fn fallback_title(self) -> &'static str {
+        match self {
+            Self::Loading => "Preparing wallet sync",
+            Self::Syncing => "Checking wallet sync",
+        }
+    }
+
+    const fn fallback_detail(self) -> &'static str {
+        match self {
+            Self::Loading => "Connecting to chain and loading local wallet state...",
+            Self::Syncing => "Checking for new wallet events...",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -156,13 +193,25 @@ pub(super) fn loading_summary(progress: Option<SyncProgressUpdate>) -> String {
     )
 }
 
-pub(super) fn sync_status_bar(progress: Option<SyncProgressUpdate>) -> gpui::Div {
-    let title = progress.map_or("Preparing wallet sync", |progress| progress.stage.label());
-    let percent = progress.map_or(0, SyncProgressUpdate::percent);
-    let detail = progress.map_or_else(
-        || "Waiting for indexed sync progress...".to_string(),
-        progress_detail,
-    );
+pub(super) fn sync_status_labels(
+    context: SyncStatusContext,
+    progress: Option<SyncProgressUpdate>,
+) -> SyncStatusLabels {
+    SyncStatusLabels {
+        title: progress.map_or_else(
+            || context.fallback_title().to_string(),
+            |progress| progress.stage.label().to_string(),
+        ),
+        percent: progress.map_or(0, SyncProgressUpdate::percent),
+        detail: progress.map_or_else(|| context.fallback_detail().to_string(), progress_detail),
+    }
+}
+
+pub(super) fn sync_status_bar(
+    context: SyncStatusContext,
+    progress: Option<SyncProgressUpdate>,
+) -> gpui::Div {
+    let labels = sync_status_labels(context, progress);
     div()
         .h(px(36.0))
         .flex_none()
@@ -178,20 +227,20 @@ pub(super) fn sync_status_bar(progress: Option<SyncProgressUpdate>) -> gpui::Div
                 .min_w(px(170.0))
                 .text_color(rgb(theme::TEXT))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(title),
+                .child(SharedString::from(labels.title)),
         )
         .child(
             UiProgress::new()
                 .w(px(190.0))
                 .h(px(6.0))
-                .value(f32::from(percent)),
+                .value(f32::from(labels.percent)),
         )
         .child(
             div()
                 .w(px(42.0))
                 .text_color(rgb(theme::INFO))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(SharedString::from(format!("{percent}%"))),
+                .child(SharedString::from(format!("{}%", labels.percent))),
         )
         .child(
             div()
@@ -199,7 +248,7 @@ pub(super) fn sync_status_bar(progress: Option<SyncProgressUpdate>) -> gpui::Div
                 .min_w(px(0.0))
                 .text_color(rgb(theme::TEXT_MUTED))
                 .text_size(APP_TEXT_SIZE)
-                .child(SharedString::from(detail)),
+                .child(SharedString::from(labels.detail)),
         )
 }
 
@@ -594,6 +643,7 @@ impl WalletRoot {
                                         chain_id,
                                         ChainUtxoState::Ready { snapshot, session, poi_refreshing },
                                     );
+                                    root.reschedule_ready_public_broadcaster_cost_estimates(chain_id, cx);
                                     if root.selected_chain == chain_id {
                                         root.sync_utxo_table(cx);
                                     }

@@ -41,6 +41,7 @@ impl WalletRoot {
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
         let mut self_broadcast_submit_disabled = false;
+        let generation_ready = self.private_action_generation_ready(asset.chain_id);
         let public_broadcaster_submitted = matches!(
             form.result.as_ref(),
             Some(SendResult::PublicBroadcaster(result))
@@ -219,11 +220,17 @@ impl WalletRoot {
                     .primary()
                     .loading(form.generating)
                     .disabled(
-                        form.generating
+                        !generation_ready
+                            || form.generating
                             || public_broadcaster_submit_disabled
                             || self_broadcast_submit_disabled
                             || submitted,
                     )
+                    .tooltip(if generation_ready {
+                        "Prepare private transaction"
+                    } else {
+                        "Generation is available after wallet sync finishes"
+                    })
                     .on_click(move |_event, window, cx| {
                         submit_root.update(cx, |root, cx| {
                             root.generate_send_calldata_from_form(key, window, cx);
@@ -365,6 +372,7 @@ impl WalletRoot {
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
         let mut self_broadcast_submit_disabled = false;
+        let generation_ready = self.private_action_generation_ready(asset.chain_id);
         let public_broadcaster_submitted = matches!(
             form.result.as_ref(),
             Some(UnshieldResult::PublicBroadcaster(result))
@@ -570,11 +578,17 @@ impl WalletRoot {
                     .primary()
                     .loading(form.generating)
                     .disabled(
-                        form.generating
+                        !generation_ready
+                            || form.generating
                             || public_broadcaster_submit_disabled
                             || self_broadcast_submit_disabled
                             || submitted,
                     )
+                    .tooltip(if generation_ready {
+                        "Prepare private transaction"
+                    } else {
+                        "Generation is available after wallet sync finishes"
+                    })
                     .on_click(move |_event, window, cx| {
                         submit_root.update(cx, |root, cx| {
                             root.generate_unshield_calldata_from_form(key, window, cx);

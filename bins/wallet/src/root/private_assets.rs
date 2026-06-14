@@ -96,6 +96,57 @@ pub(super) fn private_asset_display_amounts(
     }
 }
 
+pub(super) fn private_send_action_tooltip(
+    can_send: bool,
+    actions_available: bool,
+    syncing: bool,
+    unavailable_balance_message: &'static str,
+) -> &'static str {
+    private_action_tooltip(
+        can_send,
+        actions_available,
+        syncing,
+        "Prepare private send calldata",
+        "Open private send form while wallet sync finishes",
+        unavailable_balance_message,
+    )
+}
+
+pub(super) fn private_unshield_action_tooltip(
+    can_unshield: bool,
+    actions_available: bool,
+    syncing: bool,
+    unavailable_balance_message: &'static str,
+) -> &'static str {
+    private_action_tooltip(
+        can_unshield,
+        actions_available,
+        syncing,
+        "Prepare unshield calldata",
+        "Open unshield form while wallet sync finishes",
+        unavailable_balance_message,
+    )
+}
+
+fn private_action_tooltip(
+    can_act: bool,
+    actions_available: bool,
+    syncing: bool,
+    ready_message: &'static str,
+    syncing_message: &'static str,
+    unavailable_balance_message: &'static str,
+) -> &'static str {
+    if can_act && syncing {
+        syncing_message
+    } else if can_act {
+        ready_message
+    } else if actions_available {
+        unavailable_balance_message
+    } else {
+        "Available after wallet session starts"
+    }
+}
+
 pub(super) fn total_private_balance_usd_amount(rows: &[FormattedTokenTotal]) -> Option<String> {
     let mut total: Option<U256> = None;
     for amount in rows.iter().filter_map(|row| row.usd_micro_amount) {
@@ -377,12 +428,25 @@ impl WalletRoot {
             Some(ChainUtxoState::Loading { progress }) => {
                 centered_message(loading_summary(*progress)).into_any_element()
             }
-            Some(ChainUtxoState::Syncing {
-                snapshot, progress, ..
-            }) => self.render_private_asset_snapshot(root, snapshot, false, true, *progress),
-            Some(ChainUtxoState::Ready { snapshot, .. }) => {
-                self.render_private_asset_snapshot(root, snapshot, true, false, None)
-            }
+            Some(
+                state @ ChainUtxoState::Syncing {
+                    snapshot, progress, ..
+                },
+            ) => self.render_private_asset_snapshot(
+                root,
+                snapshot,
+                state.private_action_forms_available(),
+                true,
+                *progress,
+            ),
+            Some(state @ ChainUtxoState::Ready { snapshot, .. }) => self
+                .render_private_asset_snapshot(
+                    root,
+                    snapshot,
+                    state.private_action_forms_available(),
+                    false,
+                    None,
+                ),
             Some(ChainUtxoState::Idle) | None => {
                 centered_message("Select a chain to load private balances").into_any_element()
             }
@@ -393,7 +457,7 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
         snapshot: &ListUtxosOutput,
-        chain_ready: bool,
+        actions_available: bool,
         syncing: bool,
         progress: Option<wallet_ops::SyncProgressUpdate>,
     ) -> gpui::AnyElement {
@@ -449,7 +513,8 @@ impl WalletRoot {
                             receive_available,
                             send_asset,
                             unshield_asset,
-                            chain_ready,
+                            actions_available,
+                            syncing,
                         ))
                     })
                     .when(!has_total_balance && receive_available, |column| {
@@ -464,7 +529,8 @@ impl WalletRoot {
                             ix,
                             asset,
                             snapshot,
-                            chain_ready,
+                            actions_available,
+                            syncing,
                         )
                         .into_any_element()
                     })),
@@ -532,13 +598,14 @@ impl WalletRoot {
         receive_available: bool,
         send_asset: Option<UnshieldAsset>,
         unshield_asset: Option<UnshieldAsset>,
-        chain_ready: bool,
+        actions_available: bool,
+        syncing: bool,
     ) -> gpui::Div {
         let receive_root = root.clone();
         let send_root = root.clone();
         let unshield_root = root;
-        let can_send = chain_ready && send_asset.is_some();
-        let can_unshield = chain_ready && unshield_asset.is_some();
+        let can_send = actions_available && send_asset.is_some();
+        let can_unshield = actions_available && unshield_asset.is_some();
 
         div()
             .w_full()
@@ -582,13 +649,12 @@ impl WalletRoot {
                             .child(Icon::new(RailgunActionIcon::Send).small())
                             .outline()
                             .disabled(!can_send)
-                            .tooltip(if can_send {
-                                "Prepare private send calldata"
-                            } else if chain_ready {
-                                "No sendable private asset available"
-                            } else {
-                                "Available after wallet sync finishes"
-                            })
+                            .tooltip(private_send_action_tooltip(
+                                can_send,
+                                actions_available,
+                                syncing,
+                                "No sendable private asset available",
+                            ))
                             .on_click(move |_event, window, cx| {
                                 let Some(asset) = send_asset.clone() else {
                                     return;
@@ -603,13 +669,12 @@ impl WalletRoot {
                             .child(Icon::new(IconName::Globe).small())
                             .outline()
                             .disabled(!can_unshield)
-                            .tooltip(if can_unshield {
-                                "Prepare unshield calldata"
-                            } else if chain_ready {
-                                "No unshieldable private asset available"
-                            } else {
-                                "Available after wallet sync finishes"
-                            })
+                            .tooltip(private_unshield_action_tooltip(
+                                can_unshield,
+                                actions_available,
+                                syncing,
+                                "No unshieldable private asset available",
+                            ))
                             .on_click(move |_event, window, cx| {
                                 let Some(asset) = unshield_asset.clone() else {
                                     return;
@@ -627,26 +692,25 @@ impl WalletRoot {
         ix: usize,
         asset: FormattedTokenTotal,
         snapshot: &ListUtxosOutput,
-        chain_ready: bool,
+        actions_available: bool,
+        syncing: bool,
     ) -> gpui::Div {
         let send_asset = build_send_asset(snapshot, &asset);
-        let can_send = chain_ready && send_asset.is_some();
+        let can_send = actions_available && send_asset.is_some();
         let unshield_asset = build_unshield_asset(snapshot, &asset);
-        let can_unshield = chain_ready && unshield_asset.is_some();
-        let send_tooltip = if can_send {
-            "Prepare private send calldata"
-        } else if chain_ready {
-            "No spendable private balance for this token"
-        } else {
-            "Available after wallet sync finishes"
-        };
-        let unshield_tooltip = if can_unshield {
-            "Prepare unshield calldata"
-        } else if chain_ready {
-            "No unshieldable private balance for this token"
-        } else {
-            "Available after wallet sync finishes"
-        };
+        let can_unshield = actions_available && unshield_asset.is_some();
+        let send_tooltip = private_send_action_tooltip(
+            can_send,
+            actions_available,
+            syncing,
+            "No spendable private balance for this token",
+        );
+        let unshield_tooltip = private_unshield_action_tooltip(
+            can_unshield,
+            actions_available,
+            syncing,
+            "No unshieldable private balance for this token",
+        );
         let send_opacity = if can_send { 1.0 } else { 0.5 };
         let unshield_opacity = if can_unshield { 1.0 } else { 0.5 };
         let show_pending_poi = should_show_pending_poi_amount(asset.pending_poi_total);

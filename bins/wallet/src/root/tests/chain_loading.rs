@@ -52,6 +52,40 @@ fn loading_summary_uses_sync_stage_and_percent() {
 }
 
 #[test]
+fn sync_status_labels_describe_no_progress_context() {
+    assert_eq!(
+        sync_status_labels(SyncStatusContext::Loading, None),
+        SyncStatusLabels {
+            title: "Preparing wallet sync".to_string(),
+            percent: 0,
+            detail: "Connecting to chain and loading local wallet state...".to_string(),
+        }
+    );
+    assert_eq!(
+        sync_status_labels(SyncStatusContext::Syncing, None),
+        SyncStatusLabels {
+            title: "Checking wallet sync".to_string(),
+            percent: 0,
+            detail: "Checking for new wallet events...".to_string(),
+        }
+    );
+}
+
+#[test]
+fn sync_status_labels_use_progress_when_available() {
+    let progress = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 150, 300);
+
+    assert_eq!(
+        sync_status_labels(SyncStatusContext::Loading, Some(progress)),
+        SyncStatusLabels {
+            title: "Indexing UTXOs".to_string(),
+            percent: 25,
+            detail: "Block 150 of 300".to_string(),
+        }
+    );
+}
+
+#[test]
 fn loading_chain_state_keeps_utxo_table_available() {
     let state = ChainUtxoState::Loading { progress: None };
 

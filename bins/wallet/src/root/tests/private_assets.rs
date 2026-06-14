@@ -67,6 +67,30 @@ fn private_asset_rows_use_totals_formatting() {
 }
 
 #[test]
+fn private_action_tooltips_distinguish_syncing_and_ready() {
+    assert_eq!(
+        private_send_action_tooltip(true, true, true, "No spendable private balance"),
+        "Open private send form while wallet sync finishes"
+    );
+    assert_eq!(
+        private_send_action_tooltip(true, true, false, "No spendable private balance"),
+        "Prepare private send calldata"
+    );
+    assert_eq!(
+        private_unshield_action_tooltip(true, true, true, "No unshieldable private balance"),
+        "Open unshield form while wallet sync finishes"
+    );
+    assert_eq!(
+        private_unshield_action_tooltip(false, true, false, "No unshieldable private balance"),
+        "No unshieldable private balance"
+    );
+    assert_eq!(
+        private_send_action_tooltip(false, false, false, "No spendable private balance"),
+        "Available after wallet session starts"
+    );
+}
+
+#[test]
 fn private_asset_rows_include_usd_when_cache_has_rates() {
     let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");

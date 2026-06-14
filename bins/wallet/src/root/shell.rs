@@ -28,7 +28,7 @@ use crate::assets::{
 };
 
 use super::actions::register_wallet_shortcut_root;
-use super::chain_load::sync_status_bar;
+use super::chain_load::{SyncStatusContext, sync_status_bar};
 use super::utxo::should_focus_utxo_table;
 use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
@@ -591,12 +591,18 @@ impl WalletRoot {
     }
 
     fn render_sync_status_bar(&self) -> Option<gpui::AnyElement> {
-        let progress = self
+        let state = self
             .chain_states
             .get(&self.selected_chain)
-            .filter(|state| state.is_syncing())
-            .map(ChainUtxoState::progress)?;
-        Some(sync_status_bar(progress).into_any_element())
+            .filter(|state| state.is_syncing())?;
+        let context = match state {
+            ChainUtxoState::Loading { .. } => SyncStatusContext::Loading,
+            ChainUtxoState::Syncing { .. } => SyncStatusContext::Syncing,
+            ChainUtxoState::Idle | ChainUtxoState::Ready { .. } | ChainUtxoState::Error { .. } => {
+                return None;
+            }
+        };
+        Some(sync_status_bar(context, state.progress()).into_any_element())
     }
 
     fn render_wallet_tabs(&self, root: &Entity<Self>) -> impl IntoElement {

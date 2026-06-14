@@ -498,6 +498,40 @@ impl WalletRoot {
         }
     }
 
+    pub(super) fn reschedule_ready_public_broadcaster_cost_estimates(
+        &mut self,
+        chain_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let send_keys = self
+            .send_forms
+            .iter()
+            .filter_map(|(key, form)| {
+                (key.chain_id == chain_id
+                    && form.delivery_mode == DeliveryMode::PublicBroadcaster
+                    && !form.generating)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        let unshield_keys = self
+            .unshield_forms
+            .iter()
+            .filter_map(|(key, form)| {
+                (key.chain_id == chain_id
+                    && form.delivery_mode == DeliveryMode::PublicBroadcaster
+                    && !form.generating)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+
+        for key in send_keys {
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        }
+        for key in unshield_keys {
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        }
+    }
+
     fn estimate_send_public_broadcaster_cost_from_form(
         &mut self,
         key: UnshieldAssetKey,

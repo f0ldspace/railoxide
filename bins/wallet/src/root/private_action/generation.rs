@@ -89,7 +89,11 @@ impl WalletRoot {
         };
         let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
         else {
-            self.set_send_form_error(key, "Wait for wallet sync to finish before sending", cx);
+            self.set_send_form_error(
+                key,
+                "You can prepare this form now, but generation is available after wallet sync finishes",
+                cx,
+            );
             return None;
         };
         let session = Arc::clone(session);
@@ -698,7 +702,7 @@ impl WalletRoot {
         else {
             self.set_unshield_form_error(
                 key,
-                "Wait for wallet sync to finish before unshielding",
+                "You can prepare this form now, but generation is available after wallet sync finishes",
                 cx,
             );
             return None;

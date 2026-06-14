@@ -1,3 +1,4 @@
+use super::chain_load::{SyncStatusContext, SyncStatusLabels, sync_status_labels};
 use super::private_action::{
     enabled_native_top_up_plan, native_top_up_privacy_warning,
     native_top_up_refresh_invalidates_estimate,
@@ -5,7 +6,8 @@ use super::private_action::{
 };
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
-    should_show_pending_amount, should_show_pending_poi_amount, total_private_balance_usd_amount,
+    private_send_action_tooltip, private_unshield_action_tooltip, should_show_pending_amount,
+    should_show_pending_poi_amount, total_private_balance_usd_amount,
 };
 use super::private_broadcaster::{
     PrivateBroadcasterProgressStepState, PrivateSubmissionProgressFlow, SelfBroadcastGasRetryKind,
