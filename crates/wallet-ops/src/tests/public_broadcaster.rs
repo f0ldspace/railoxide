@@ -96,7 +96,7 @@ fn specific_public_broadcaster_fails_when_not_available_for_fee_token() {
 }
 
 #[test]
-fn public_broadcaster_selection_sorts_by_fee_then_reliability() {
+fn public_broadcaster_selection_sorts_by_fee_then_seeded_tie_breaker() {
     let token = address(0x23);
     let candidates = eligible_public_broadcasters(
         &[
@@ -109,13 +109,27 @@ fn public_broadcaster_selection_sorts_by_fee_then_reliability() {
         None,
         SystemTime::now(),
     );
+    let sort_seed = (0_u8..=u8::MAX)
+        .map(|seed| [seed; 32])
+        .find(|seed| {
+            sort_specific_public_broadcasters(candidates.clone(), seed)[0].fees_id
+                == "cheap-low-rel"
+        })
+        .expect("test fixture should have a seed that places lower reliability first");
 
-    let sorted = sort_specific_public_broadcasters(candidates.clone());
+    let sorted = sort_specific_public_broadcasters(candidates.clone(), &sort_seed);
     let ids: Vec<_> = sorted
         .iter()
         .map(|candidate| candidate.fees_id.as_str())
         .collect();
-    assert_eq!(ids, vec!["cheap-high-rel", "cheap-low-rel", "expensive"]);
+    assert_eq!(ids, vec!["cheap-low-rel", "cheap-high-rel", "expensive"]);
+    assert_eq!(
+        ids,
+        sort_specific_public_broadcasters(candidates.clone(), &sort_seed)
+            .iter()
+            .map(|candidate| candidate.fees_id.as_str())
+            .collect::<Vec<_>>()
+    );
     let cheap_low_rel_address = candidates
         .iter()
         .find(|candidate| candidate.fees_id == "cheap-low-rel")
@@ -132,6 +146,46 @@ fn public_broadcaster_selection_sorts_by_fee_then_reliability() {
     .expect("specific candidate");
     assert_eq!(selected.fees_id, "cheap-low-rel");
     assert!(select_public_broadcaster(&candidates, &PublicBroadcasterSelection::Random).is_ok());
+}
+
+#[test]
+fn public_broadcaster_seeded_tie_breaker_replaces_lexical_address_order() {
+    let token = address(0x24);
+    let candidates = eligible_public_broadcasters(
+        &[
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "candidate-a", 71),
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "candidate-b", 72),
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "candidate-c", 73),
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "candidate-d", 74),
+        ],
+        1,
+        token,
+        None,
+        SystemTime::now(),
+    );
+    let mut lexical = candidates.clone();
+    lexical.sort_by(|left, right| left.railgun_address.cmp(&right.railgun_address));
+    let lexical_ids = lexical
+        .iter()
+        .map(|candidate| candidate.fees_id.as_str())
+        .collect::<Vec<_>>();
+    let sort_seed = (0_u8..=u8::MAX)
+        .map(|seed| [seed; 32])
+        .find(|seed| {
+            sort_specific_public_broadcasters(candidates.clone(), seed)
+                .iter()
+                .map(|candidate| candidate.fees_id.as_str())
+                .collect::<Vec<_>>()
+                != lexical_ids
+        })
+        .expect("test fixture should have a seed that differs from lexical address order");
+
+    let sorted = sort_specific_public_broadcasters(candidates, &sort_seed);
+    let sorted_ids = sorted
+        .iter()
+        .map(|candidate| candidate.fees_id.as_str())
+        .collect::<Vec<_>>();
+    assert_ne!(sorted_ids, lexical_ids);
 }
 
 #[test]

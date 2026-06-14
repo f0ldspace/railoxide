@@ -45,9 +45,8 @@ use wallet_ops::{
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
     quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy_and_trust,
     settings::EffectiveTokenRegistry,
-    sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
-    submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
-    submit_desktop_unshield_self_broadcast,
+    submit_desktop_send_public_broadcaster, submit_desktop_send_self_broadcast,
+    submit_desktop_unshield_public_broadcaster, submit_desktop_unshield_self_broadcast,
     vault::{
         DesktopVaultStore, DesktopViewSession, PrivateAddressBookEntry, PublicAccountMetadata,
         PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry, WalletMetadataBundle,

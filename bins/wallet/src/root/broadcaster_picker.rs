@@ -437,7 +437,8 @@ impl WalletRoot {
         } else {
             fee_policy_eligible_public_broadcasters(&candidates, policy)
         };
-        let candidates = sort_specific_public_broadcasters(candidates);
+        let candidates =
+            sort_specific_public_broadcasters(candidates, &self.public_broadcaster_sort_seed);
         let total_count = candidates.len();
         let candidates: Vec<_> = candidates
             .into_iter()

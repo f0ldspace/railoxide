@@ -12,6 +12,7 @@ use gpui_component::{
     select::{SearchableVec, SelectEvent, SelectState},
     table::{TableEvent, TableState},
 };
+use rand::RngExt;
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, watch};
 use ui::logs::LogsPane;
@@ -294,6 +295,7 @@ pub(crate) struct WalletRoot {
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
     public_broadcaster_policy: BroadcasterFeePolicy,
+    public_broadcaster_sort_seed: [u8; 32],
     public_broadcaster_response_timeout: Duration,
     public_broadcaster_republish_interval: Duration,
     default_allow_suspicious_broadcasters: bool,
@@ -778,6 +780,8 @@ impl WalletRoot {
         let network_health = http.network_health();
         let sidebar_public_broadcaster_count =
             ethereum_weth_public_broadcaster_count(&monitor_state.read().fee_rows());
+        let mut public_broadcaster_sort_seed = [0_u8; 32];
+        rand::rng().fill(public_broadcaster_sort_seed.as_mut_slice());
         let mut anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
         let root = Self {
             selected_chain: initial_chain_id,
@@ -789,6 +793,7 @@ impl WalletRoot {
             effective_token_registry,
             public_balance_refresh_interval,
             public_broadcaster_policy,
+            public_broadcaster_sort_seed,
             public_broadcaster_response_timeout,
             public_broadcaster_republish_interval,
             default_allow_suspicious_broadcasters,

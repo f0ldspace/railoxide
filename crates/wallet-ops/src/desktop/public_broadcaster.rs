@@ -2,6 +2,7 @@ use super::*;
 use alloy::uint;
 use eyre::eyre;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterCandidate {
@@ -913,14 +914,25 @@ pub fn fee_policy_eligible_public_broadcasters(
 #[must_use]
 pub fn sort_specific_public_broadcasters(
     mut candidates: Vec<PublicBroadcasterCandidate>,
+    sort_seed: &[u8; 32],
 ) -> Vec<PublicBroadcasterCandidate> {
     candidates.sort_by(|a, b| {
         a.fee
             .cmp(&b.fee)
-            .then_with(|| b.reliability.total_cmp(&a.reliability))
+            .then_with(|| {
+                seeded_broadcaster_sort_key(sort_seed, &a.railgun_address)
+                    .cmp(&seeded_broadcaster_sort_key(sort_seed, &b.railgun_address))
+            })
             .then_with(|| a.railgun_address.cmp(&b.railgun_address))
     });
     candidates
+}
+
+fn seeded_broadcaster_sort_key(sort_seed: &[u8; 32], railgun_address: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(sort_seed);
+    hasher.update(railgun_address.as_bytes());
+    hasher.finalize().into()
 }
 
 pub fn select_public_broadcaster(

@@ -80,11 +80,10 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     let policy_switch_root = root.clone();
     let favorites_label_root = root.clone();
     let favorites_switch_root = root;
-    let sorted = sort_specific_public_broadcasters(candidates);
-    let specific_label = selected_broadcaster_label(choice, &sorted);
+    let specific_label = selected_broadcaster_label(choice, &candidates);
     let random_selected = matches!(choice, BroadcasterChoice::Random);
     let specific_selected = matches!(choice, BroadcasterChoice::Specific { .. });
-    let selector_disabled = generating || sorted.is_empty();
+    let selector_disabled = generating || candidates.is_empty();
     let random_button = app_button(
         delivery_element_id(key, kind, "random"),
         "Random broadcaster",
@@ -258,7 +257,7 @@ pub(in crate::root) fn render_public_broadcaster_settings(
             },
         );
 
-    if sorted.is_empty() {
+    if candidates.is_empty() {
         return settings.child(app_muted_text(
             "No eligible broadcaster currently advertises this token.",
         ));
