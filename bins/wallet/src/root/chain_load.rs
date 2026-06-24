@@ -7,7 +7,7 @@ use tokio::sync::{OnceCell, watch};
 use ui::theme::{self, APP_TEXT_SIZE};
 use wallet_ops::{
     DesktopWalletSyncStartPolicy, HttpContext, ListUtxosOutput, PoiCacheService, PoiReadSource,
-    SyncProgressUpdate, ViewWalletChainSessionRequest, WalletSessionStore,
+    SyncProgressUnit, SyncProgressUpdate, ViewWalletChainSessionRequest, WalletSessionStore,
     vault::{DesktopVaultStore, WalletSource},
 };
 
@@ -253,6 +253,43 @@ pub(super) fn sync_status_bar(
 }
 
 pub(super) fn progress_detail(progress: SyncProgressUpdate) -> String {
+    match progress.unit {
+        SyncProgressUnit::Block => {}
+        SyncProgressUnit::ArtifactPreparation => {
+            return "Preparing artifact metadata...".to_string();
+        }
+        SyncProgressUnit::ArtifactChunk { completed, total } => {
+            if total == 0 {
+                return "Artifact chunks prepared".to_string();
+            }
+            if completed == 0 {
+                return format!("Downloading {total} artifact chunks...");
+            }
+            let completed = completed.min(total);
+            return format!("Artifact chunk {completed} of {total}");
+        }
+        SyncProgressUnit::ArtifactApplied => {
+            return match progress.stage {
+                wallet_ops::SyncProgressStage::SynchronizingCommitments => {
+                    "Commitment artifacts applied".to_string()
+                }
+                wallet_ops::SyncProgressStage::PreparingUtxoIndex => {
+                    "UTXO index artifacts prepared".to_string()
+                }
+                wallet_ops::SyncProgressStage::IndexingUtxos => "Artifacts applied".to_string(),
+            };
+        }
+        SyncProgressUnit::CommitmentTail => {
+            let current = progress
+                .current_block
+                .max(progress.start_block)
+                .min(progress.target_block);
+            return format!(
+                "Checking commitment tail: block {current} of {}",
+                progress.target_block
+            );
+        }
+    }
     let current = progress
         .current_block
         .max(progress.start_block)

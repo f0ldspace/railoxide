@@ -41,11 +41,17 @@ fn chain_error_state_preserves_start_block_hint() {
 fn loading_summary_uses_sync_stage_and_percent() {
     let commitments =
         SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
+    let preparing =
+        SyncProgressUpdate::artifact_chunk(SyncProgressStage::PreparingUtxoIndex, 25, 100, 3, 12);
     let indexing = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 150, 300);
 
     assert_eq!(
         loading_summary(Some(commitments)),
         "Synchronizing commitments · 25%"
+    );
+    assert_eq!(
+        loading_summary(Some(preparing)),
+        "Preparing UTXO index · 25%"
     );
     assert_eq!(loading_summary(Some(indexing)), "Indexing UTXOs · 25%");
     assert_eq!(loading_summary(None), "Preparing wallet sync...");
@@ -100,4 +106,49 @@ fn progress_detail_clamps_current_block() {
     let progress = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 400, 300);
 
     assert_eq!(progress_detail(progress), "Block 300 of 300");
+}
+
+#[test]
+fn progress_detail_uses_artifact_chunks_for_utxo_prep() {
+    let progress =
+        SyncProgressUpdate::artifact_chunk(SyncProgressStage::PreparingUtxoIndex, 58, 100, 7, 12);
+
+    assert_eq!(progress_detail(progress), "Artifact chunk 7 of 12");
+}
+
+#[test]
+fn progress_detail_describes_pending_artifact_chunks() {
+    let progress =
+        SyncProgressUpdate::artifact_chunk(SyncProgressStage::PreparingUtxoIndex, 25, 100, 0, 11);
+
+    assert_eq!(
+        progress_detail(progress),
+        "Downloading 11 artifact chunks..."
+    );
+}
+
+#[test]
+fn progress_detail_describes_artifact_metadata() {
+    let progress =
+        SyncProgressUpdate::artifact_preparation(SyncProgressStage::PreparingUtxoIndex, 5, 100);
+
+    assert_eq!(progress_detail(progress), "Preparing artifact metadata...");
+}
+
+#[test]
+fn progress_detail_describes_artifact_apply_completion() {
+    let progress =
+        SyncProgressUpdate::artifact_applied(SyncProgressStage::SynchronizingCommitments);
+
+    assert_eq!(progress_detail(progress), "Commitment artifacts applied");
+}
+
+#[test]
+fn progress_detail_describes_commitment_tail() {
+    let progress = SyncProgressUpdate::commitment_tail(200, 225, 300);
+
+    assert_eq!(
+        progress_detail(progress),
+        "Checking commitment tail: block 225 of 300"
+    );
 }
