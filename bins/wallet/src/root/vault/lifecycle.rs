@@ -214,6 +214,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.shutdown_wallet_session_store();
         self.install_view_session_with_dialog_policy(session, metadata, false, None, window, cx);
     }
 
@@ -399,6 +400,7 @@ impl WalletRoot {
         self.wallet_options = active;
         self.selected_wallet_id = None;
         self.sync_wallet_select(window, cx);
+        self.shutdown_wallet_session_store();
         self.reset_wallet_scoped_state(cx);
         self.setup_password = None;
         self.generated_seed = None;
@@ -423,11 +425,7 @@ impl WalletRoot {
     }
 
     pub(in crate::root) fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(store) = self.session_store.get().cloned() {
-            self.runtime.spawn(async move {
-                store.shutdown().await;
-            });
-        }
+        self.shutdown_wallet_session_store();
         window.close_all_dialogs(cx);
         self.clear_spend_authorization(cx);
         self.view_session = None;
@@ -477,7 +475,6 @@ impl WalletRoot {
         self.repair_cache_error = None;
         self.vault_state = VaultState::UnlockVault;
         self.wallet_setup_mode = WalletSetupMode::Choose;
-        self.session_store = Arc::new(tokio::sync::OnceCell::new());
         self.focus_vault_input_on_render = true;
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;

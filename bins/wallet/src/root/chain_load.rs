@@ -337,12 +337,6 @@ impl WalletRoot {
     }
 
     pub(super) fn reset_wallet_scoped_state(&mut self, cx: &mut Context<'_, Self>) {
-        if let Some(store) = self.session_store.get().cloned() {
-            self.runtime.spawn(async move {
-                store.shutdown().await;
-            });
-        }
-        self.session_store = Arc::new(OnceCell::new());
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
@@ -361,6 +355,15 @@ impl WalletRoot {
             *state = ChainUtxoState::Idle;
         }
         self.sync_utxo_table(cx);
+    }
+
+    pub(super) fn shutdown_wallet_session_store(&mut self) {
+        if let Some(store) = self.session_store.get().cloned() {
+            self.runtime.spawn(async move {
+                store.shutdown().await;
+            });
+        }
+        self.session_store = Arc::new(OnceCell::new());
     }
 
     pub(super) fn ensure_chain_load(&mut self, chain_id: u64, cx: &mut Context<'_, Self>) {
