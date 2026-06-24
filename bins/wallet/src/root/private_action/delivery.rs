@@ -67,7 +67,7 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     action_token: Address,
     fee_mode: FeeHandlingMode,
     choice: &BroadcasterChoice,
-    candidates: Vec<PublicBroadcasterCandidate>,
+    candidates: &[PublicBroadcasterCandidate],
     fee_token_options: &[PublicBroadcasterFeeTokenOption],
     selected_fee_token: Address,
     generating: bool,
@@ -80,7 +80,7 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     let policy_switch_root = root.clone();
     let favorites_label_root = root.clone();
     let favorites_switch_root = root;
-    let specific_label = selected_broadcaster_label(choice, &candidates);
+    let specific_label = selected_broadcaster_label(choice, candidates);
     let random_selected = matches!(choice, BroadcasterChoice::Random);
     let specific_selected = matches!(choice, BroadcasterChoice::Specific { .. });
     let selector_disabled = generating || candidates.is_empty();

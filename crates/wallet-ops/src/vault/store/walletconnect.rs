@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    DesktopVaultStore, DesktopViewSession, EncryptedRecord, KEY_LEN, PublicAccountScope,
+    PublicAccountStatus, VaultError, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
+    WALLETCONNECT_SESSION_PREFIX, WalletConnectRelayIdentity,
+    WalletConnectSessionAccountResolution, WalletConnectSessionLifecycleState,
+    WalletConnectSessionRecord, fill, sort_walletconnect_sessions,
+    walletconnect_relay_identity_record_entry, walletconnect_relay_identity_record_key,
+    walletconnect_session_record_entry, walletconnect_session_record_key,
+};
 
 impl DesktopVaultStore {
     pub fn load_walletconnect_relay_identity(

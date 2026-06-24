@@ -1,4 +1,4 @@
-use super::*;
+use super::{DesktopVaultStore, EncryptedRecord, VaultError};
 
 impl DesktopVaultStore {
     pub(super) fn encrypted_record(&self, key: &str) -> Result<EncryptedRecord, VaultError> {

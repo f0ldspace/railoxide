@@ -630,16 +630,13 @@ impl WalletRoot {
                 self.public_form.action_action_error = None;
                 self.public_form.action_attempts.push(attempt);
             }
-            PublicActionSessionEvent::AttemptRejected { message, .. } => {
+            PublicActionSessionEvent::AttemptRejected { message, .. }
+            | PublicActionSessionEvent::HardwareApprovalFailed { message } => {
                 self.discard_active_trezor_session_if_stale(&message, cx);
                 self.public_form.action_action_error = Some(Arc::from(message));
             }
             PublicActionSessionEvent::HardwareApprovalStarted
             | PublicActionSessionEvent::HardwareApprovalCompleted => {}
-            PublicActionSessionEvent::HardwareApprovalFailed { message } => {
-                self.discard_active_trezor_session_if_stale(&message, cx);
-                self.public_form.action_action_error = Some(Arc::from(message));
-            }
             PublicActionSessionEvent::HardwareProfileSessionRefreshed { session } => {
                 #[cfg(feature = "hardware")]
                 self.refresh_active_hardware_profile_session(session, cx);
@@ -1253,6 +1250,7 @@ impl WalletRoot {
         })
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(in crate::root) fn submit_public_send_authorized(
         &mut self,
         vault_password: Zeroizing<String>,
@@ -1519,6 +1517,7 @@ impl WalletRoot {
         })
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(in crate::root) fn submit_public_shield_authorized(
         &mut self,
         vault_password: Zeroizing<String>,

@@ -1,4 +1,13 @@
-use super::*;
+#[cfg(not(feature = "hardware"))]
+use super::HardwareWalletSyncIntent;
+use super::{
+    Arc, Context, Focusable, HardwareDeviceKind, PRIMARY_WALLET_LABEL, VaultError, VaultState,
+    WalletRoot, WalletSetupMode, WalletSource, Window, Zeroizing,
+    default_hardware_wallet_setup_intent, generate_opaque_id, generate_seed_material,
+    wallet_options_from_metadata,
+};
+#[cfg(feature = "hardware")]
+use super::{HardwareProfileUnlockPurpose, parse_hardware_wallet_restore_account_index};
 
 impl WalletRoot {
     pub(in crate::root) fn create_vault_from_inputs(
@@ -347,7 +356,7 @@ impl WalletRoot {
 
         match result {
             Ok((session, metadata)) => {
-                self.enter_new_wallet_view_unlocked(session, metadata, window, cx)
+                self.enter_new_wallet_view_unlocked(session, metadata, window, cx);
             }
             Err(error) => self.handle_vault_error(&error, cx),
         }

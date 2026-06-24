@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, VaultError};
 
 pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static str {
     match error {

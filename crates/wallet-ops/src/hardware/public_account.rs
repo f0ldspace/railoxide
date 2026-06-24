@@ -188,7 +188,7 @@ pub struct ConfirmedHardwarePublicAccount {
 
 impl ConfirmedHardwarePublicAccount {
     #[cfg(any(feature = "hardware", test))]
-    pub(super) fn new(descriptor: HardwarePublicAccountDescriptor, address: Address) -> Self {
+    pub(super) const fn new(descriptor: HardwarePublicAccountDescriptor, address: Address) -> Self {
         Self {
             descriptor,
             address,
@@ -207,7 +207,10 @@ impl ConfirmedHardwarePublicAccount {
 
     #[cfg(test)]
     #[must_use]
-    pub fn new_for_tests(descriptor: HardwarePublicAccountDescriptor, address: Address) -> Self {
+    pub const fn new_for_tests(
+        descriptor: HardwarePublicAccountDescriptor,
+        address: Address,
+    ) -> Self {
         Self::new(descriptor, address)
     }
 }

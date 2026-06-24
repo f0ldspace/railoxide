@@ -1,4 +1,12 @@
-use super::{helpers::*, relay::*, render::chain_label_for_caip2, *};
+use super::{
+    helpers::{
+        current_unix_seconds, parse_caip2_chain_id, walletconnect_await_before_request_expiry,
+        walletconnect_pending_request_expired,
+    },
+    relay::{publish_walletconnect_session_response, publish_walletconnect_session_response_ref},
+    render::chain_label_for_caip2,
+    *,
+};
 
 pub(super) async fn approve_walletconnect_request_task(
     request: WalletConnectRequestUi,
@@ -368,7 +376,7 @@ pub(super) fn walletconnect_request_dialog_nav(
     })
 }
 
-pub(super) fn walletconnect_request_matches_review_token(
+pub(super) const fn walletconnect_request_matches_review_token(
     request: &WalletConnectRequestUi,
     review_token: u64,
 ) -> bool {
@@ -459,7 +467,9 @@ pub(super) fn walletconnect_request_authorization_summary(
     )
 }
 
-pub(super) fn hardware_walletconnect_notice(method: WalletConnectSupportedMethod) -> &'static str {
+pub(super) const fn hardware_walletconnect_notice(
+    method: WalletConnectSupportedMethod,
+) -> &'static str {
     match method {
         WalletConnectSupportedMethod::EthSignTypedDataV4 => {
             "Confirm this EIP-712 typed-data request on the connected hardware wallet."

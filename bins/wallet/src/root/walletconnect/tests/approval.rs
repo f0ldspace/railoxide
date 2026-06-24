@@ -344,7 +344,7 @@ fn switch_chain_event_uses_eip1193_hex_chain_id() {
             }
         }),
     );
-    let relay_message = test_walletconnect_relay_message(&session, request);
+    let relay_message = test_walletconnect_relay_message(&session, &request);
 
     let outcome = process_walletconnect_session_message(
         &store,
@@ -394,7 +394,7 @@ fn malformed_send_transaction_params_return_invalid_params_error() {
             }
         }),
     );
-    let relay_message = test_walletconnect_relay_message(&session, request);
+    let relay_message = test_walletconnect_relay_message(&session, &request);
 
     let outcome = process_walletconnect_session_message(
         &store,

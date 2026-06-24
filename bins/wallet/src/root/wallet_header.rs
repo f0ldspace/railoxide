@@ -362,29 +362,32 @@ impl WalletRoot {
         hardware_wallet_display_info(wallet, self.active_hardware_profile_metadata(wallet))
     }
 
+    #[cfg(feature = "hardware")]
+    #[allow(clippy::unused_self)]
     fn active_hardware_profile_metadata(
         &self,
         wallet: &WalletMetadataBundle,
     ) -> Option<&HardwareProfileMetadata> {
-        #[cfg(feature = "hardware")]
-        {
-            let account = wallet.hardware_account.as_ref()?;
-            self.hardware_profile_unlock
-                .profile
-                .as_ref()
-                .filter(|profile| profile.profile_id == account.profile_id)
-                .or_else(|| {
-                    self.active_hardware_profile
-                        .as_ref()
-                        .filter(|profile| profile.profile_id == account.profile_id)
-                })
-        }
+        let account = wallet.hardware_account.as_ref()?;
+        self.hardware_profile_unlock
+            .profile
+            .as_ref()
+            .filter(|profile| profile.profile_id == account.profile_id)
+            .or_else(|| {
+                self.active_hardware_profile
+                    .as_ref()
+                    .filter(|profile| profile.profile_id == account.profile_id)
+            })
+    }
 
-        #[cfg(not(feature = "hardware"))]
-        {
-            let _ = wallet;
-            None
-        }
+    #[cfg(not(feature = "hardware"))]
+    #[allow(clippy::unused_self)]
+    const fn active_hardware_profile_metadata(
+        &self,
+        wallet: &WalletMetadataBundle,
+    ) -> Option<&HardwareProfileMetadata> {
+        let _ = wallet;
+        None
     }
 }
 

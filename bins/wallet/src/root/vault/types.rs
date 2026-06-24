@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, HardwareDeviceKind, WalletSource};
 
 pub(in crate::root) enum VaultState {
     CreateVault,

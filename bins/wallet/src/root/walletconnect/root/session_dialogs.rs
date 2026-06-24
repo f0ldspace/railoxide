@@ -403,7 +403,7 @@ impl WalletRoot {
                                 view_session.as_ref(),
                                 &session.session_uuid,
                             )
-                            .unwrap_or_else(|_| session);
+                            .unwrap_or(session);
                         if session.lifecycle_state == WalletConnectSessionLifecycleState::Active
                             && walletconnect_session_expired(&session, now)
                         {

@@ -93,7 +93,9 @@ impl HardwareEip712Model {
     }
 
     #[cfg(any(test, feature = "hardware"))]
-    pub(crate) fn type_definitions(&self) -> &BTreeMap<String, Vec<HardwareEip712FieldDefinition>> {
+    pub(crate) const fn type_definitions(
+        &self,
+    ) -> &BTreeMap<String, Vec<HardwareEip712FieldDefinition>> {
         &self.type_definitions
     }
 
@@ -182,7 +184,7 @@ impl HardwareEip712Type {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HardwareEip712PrimitiveType {
     Bool,
     Int(usize),
@@ -206,7 +208,7 @@ pub(crate) struct HardwareEip712ValuePath {
 }
 
 impl HardwareEip712ValuePath {
-    fn root(root: HardwareEip712Root) -> Self {
+    const fn root(root: HardwareEip712Root) -> Self {
         Self {
             root,
             segments: Vec::new(),
@@ -805,7 +807,7 @@ fn value_from_dyn(
         (DynSolType::Array(element_type), DynSolValue::Array(values)) => array_value(
             element_type,
             values,
-            path,
+            &path,
             HardwareEip712Value::DynamicArray,
         ),
         (DynSolType::FixedArray(element_type, expected_len), DynSolValue::FixedArray(values)) => {
@@ -814,7 +816,7 @@ fn value_from_dyn(
                     "fixed-array value length does not match type",
                 ));
             }
-            array_value(element_type, values, path, HardwareEip712Value::FixedArray)
+            array_value(element_type, values, &path, HardwareEip712Value::FixedArray)
         }
         (
             DynSolType::CustomStruct {
@@ -841,7 +843,7 @@ fn value_from_dyn(
 fn array_value(
     element_type: &DynSolType,
     values: &[DynSolValue],
-    path: HardwareEip712ValuePath,
+    path: &HardwareEip712ValuePath,
     wrap: impl FnOnce(Vec<HardwareEip712ArrayElement>) -> HardwareEip712Value,
 ) -> Result<HardwareEip712Value, HardwareEip712Error> {
     values
@@ -1193,9 +1195,8 @@ mod tests {
             }
         });
 
-        let error = match HardwareEip712Model::from_walletconnect_typed_data_json(payload) {
-            Ok(_) => panic!("unsupported function type was accepted"),
-            Err(error) => error,
+        let Err(error) = HardwareEip712Model::from_walletconnect_typed_data_json(payload) else {
+            panic!("unsupported function type was accepted")
         };
         let message = error.to_string();
 

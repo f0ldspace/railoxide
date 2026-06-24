@@ -107,7 +107,7 @@ impl KeyExportPasswordDialogContent {
 
         let kind = self.kind;
         let result = self.root.update(cx, |root, cx| {
-            root.reveal_key_export_secret(kind, password, cx)
+            root.reveal_key_export_secret(kind, &password, cx)
         });
         match result {
             Ok(()) => {
@@ -214,13 +214,12 @@ impl WalletRoot {
     }
 
     fn open_key_export_password_dialog(
-        &mut self,
         kind: KeyExportSecretKind,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        let content_root = root.clone();
+        let content_root = root;
         let content =
             cx.new(|cx| KeyExportPasswordDialogContent::new(content_root, kind, window, cx));
         let focus_content = content.clone();
@@ -248,7 +247,7 @@ impl WalletRoot {
     fn reveal_key_export_secret(
         &mut self,
         kind: KeyExportSecretKind,
-        password: Zeroizing<String>,
+        password: &Zeroizing<String>,
         cx: &mut Context<'_, Self>,
     ) -> Result<(), Arc<str>> {
         match kind {
@@ -261,7 +260,7 @@ impl WalletRoot {
 
     fn reveal_key_export_mnemonic(
         &mut self,
-        password: Zeroizing<String>,
+        password: &Zeroizing<String>,
         cx: &mut Context<'_, Self>,
     ) -> Result<(), Arc<str>> {
         if matches!(self.key_export.wallet_source, Some(source) if !key_export_mnemonic_available(source))
@@ -277,7 +276,7 @@ impl WalletRoot {
             return Err(Arc::from("Wallet vault storage is unavailable."));
         };
 
-        match store.export_wallet_mnemonic(&password, wallet_id.as_ref()) {
+        match store.export_wallet_mnemonic(password, wallet_id.as_ref()) {
             Ok(mnemonic) => {
                 self.key_export.mnemonic = Some(mnemonic);
                 cx.notify();
@@ -299,7 +298,7 @@ impl WalletRoot {
 
     fn reveal_key_export_shareable_viewing_key(
         &mut self,
-        password: Zeroizing<String>,
+        password: &Zeroizing<String>,
         cx: &mut Context<'_, Self>,
     ) -> Result<(), Arc<str>> {
         let Some(wallet_id) = self.key_export.wallet_id.clone() else {
@@ -312,11 +311,11 @@ impl WalletRoot {
         let result = match self.key_export.wallet_source {
             Some(source) if source.is_hardware_derived() => store
                 .export_hardware_wallet_shareable_viewing_key(
-                    &password,
+                    password,
                     wallet_id.as_ref(),
                     self.view_session.as_deref(),
                 ),
-            _ => store.export_wallet_shareable_viewing_key(&password, wallet_id.as_ref()),
+            _ => store.export_wallet_shareable_viewing_key(password, wallet_id.as_ref()),
         };
 
         match result {
@@ -426,11 +425,12 @@ fn render_key_export_reveal_row(
         .bg(rgb(theme::SURFACE))
         .child(app_strong_text(label))
         .child(render_key_export_value_field(
-            display_value.clone(),
+            display_value,
             revealed,
             copy_button_id,
         ));
-    let row = if revealed {
+
+    if revealed {
         row
     } else {
         row.child(
@@ -440,14 +440,13 @@ fn render_key_export_reveal_row(
                     .small()
                     .flex_none()
                     .on_click(move |_event, window, cx| {
-                        reveal_root.update(cx, |root, cx| {
-                            root.open_key_export_password_dialog(kind, window, cx);
+                        reveal_root.update(cx, |_root, cx| {
+                            WalletRoot::open_key_export_password_dialog(kind, window, cx);
                         });
                     }),
             ),
         )
-    };
-    row
+    }
 }
 
 fn render_key_export_unavailable_row(label: &'static str, message: &'static str) -> gpui::Div {
@@ -535,7 +534,7 @@ pub(in crate::root) const fn key_export_password_dialog_title(
     }
 }
 
-fn key_export_password_prompt_copy(kind: KeyExportSecretKind) -> &'static str {
+const fn key_export_password_prompt_copy(kind: KeyExportSecretKind) -> &'static str {
     match kind {
         KeyExportSecretKind::Mnemonic => {
             "Enter the vault password to reveal only the mnemonic seed for this wallet."
@@ -546,7 +545,7 @@ fn key_export_password_prompt_copy(kind: KeyExportSecretKind) -> &'static str {
     }
 }
 
-fn key_export_password_empty_message(kind: KeyExportSecretKind) -> &'static str {
+const fn key_export_password_empty_message(kind: KeyExportSecretKind) -> &'static str {
     match kind {
         KeyExportSecretKind::Mnemonic => "Enter the vault password to reveal the mnemonic seed.",
         KeyExportSecretKind::ShareableViewingKey => {
@@ -582,6 +581,6 @@ pub(in crate::root) fn key_export_error_message(
     }
 }
 
-fn key_export_warning_copy() -> &'static str {
+const fn key_export_warning_copy() -> &'static str {
     "Revealed keys can compromise wallet funds, balances, and transaction history. Clipboard contents may be visible outside the wallet app after copying. Only reveal keys on a trusted device and close this dialog when finished."
 }

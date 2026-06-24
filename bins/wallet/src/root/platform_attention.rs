@@ -3,13 +3,13 @@ pub(super) struct PlatformAttentionState {
 }
 
 impl PlatformAttentionState {
-    pub(super) fn new(window: &gpui::Window) -> Self {
+    pub(super) const fn new(window: &gpui::Window) -> Self {
         Self {
             native: imp::NativePlatformAttentionState::new(window),
         }
     }
 
-    pub(super) fn sync_badge_count(&mut self, count: usize) {
+    pub(super) fn sync_badge_count(&self, count: usize) {
         self.native.sync_badge_count(count);
     }
 
@@ -40,13 +40,14 @@ mod imp {
     }
 
     impl NativePlatformAttentionState {
-        pub(super) fn new(_window: &gpui::Window) -> Self {
+        pub(super) const fn new(_window: &gpui::Window) -> Self {
             Self {
                 attention_request_id: None,
             }
         }
 
-        pub(super) fn sync_badge_count(&mut self, count: usize) {
+        #[allow(clippy::unused_self)]
+        pub(super) fn sync_badge_count(&self, count: usize) {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
@@ -98,7 +99,7 @@ mod imp {
             }
         }
 
-        pub(super) fn sync_badge_count(&mut self, _count: usize) {}
+        pub(super) fn sync_badge_count(&self, _count: usize) {}
 
         pub(super) fn request_attention(&mut self) {
             let Some(hwnd) = self.hwnd else {
@@ -146,7 +147,7 @@ mod imp {
             Self
         }
 
-        pub(super) fn sync_badge_count(&mut self, _count: usize) {}
+        pub(super) fn sync_badge_count(&self, _count: usize) {}
 
         pub(super) fn request_attention(&mut self) {}
 

@@ -67,6 +67,7 @@ pub fn build_walletconnect_jsonrpc_error(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum WalletConnectParsedRequest {
     EthAccounts,
     EthRequestAccounts,
@@ -412,6 +413,7 @@ const fn walletconnect_approved_request_method_supported_for_account_support(
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_walletconnect_session_event(
     session: &WalletConnectSessionRecord,
     id: u64,
@@ -443,7 +445,7 @@ pub fn build_walletconnect_session_event(
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalletConnectLifecycleRequestOutcome {
     Delete {
         response: WalletConnectJsonRpcResponse<Value>,
@@ -454,6 +456,7 @@ pub enum WalletConnectLifecycleRequestOutcome {
     NotLifecycleRequest,
 }
 
+#[must_use]
 pub fn handle_walletconnect_lifecycle_request(
     id: u64,
     method: &str,
@@ -569,7 +572,7 @@ fn parse_switch_chain(params: &Value) -> Result<WalletConnectParsedRequest> {
     Ok(WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id })
 }
 
-fn request_account(request: &WalletConnectParsedRequest) -> Option<Address> {
+const fn request_account(request: &WalletConnectParsedRequest) -> Option<Address> {
     match request {
         WalletConnectParsedRequest::PersonalSign { account, .. }
         | WalletConnectParsedRequest::EthSignTypedDataV4 { account, .. } => Some(*account),
@@ -732,7 +735,7 @@ fn malformed_params(message: impl Into<String>) -> WalletConnectError {
     WalletConnectError::MalformedParams(message.into())
 }
 
-fn validate_session_request_expiry_timestamp(expiry_timestamp: u64, now: u64) -> Result<()> {
+const fn validate_session_request_expiry_timestamp(expiry_timestamp: u64, now: u64) -> Result<()> {
     let max_expiry = now.saturating_add(WC_SESSION_REQUEST_MAX_EXPIRY_INTERVAL_SECS);
     if expiry_timestamp <= now || expiry_timestamp > max_expiry {
         return Err(WalletConnectError::ExpiredUri);

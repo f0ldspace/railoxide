@@ -167,7 +167,7 @@ impl HardwarePublicEvmSigner {
             &self.descriptor,
             &hardware_session,
             self.take_trezor_app_passphrase(),
-            self.trezor_pin_matrix_provider.clone(),
+            self.trezor_pin_matrix_provider(),
             self.address,
             tx,
         )
@@ -182,7 +182,7 @@ impl HardwarePublicEvmSigner {
             &self.descriptor,
             &hardware_session,
             self.take_trezor_app_passphrase(),
-            self.trezor_pin_matrix_provider.clone(),
+            self.trezor_pin_matrix_provider(),
             self.address,
             message,
         )
@@ -220,7 +220,7 @@ impl HardwarePublicEvmSigner {
                 &self.descriptor,
                 &hardware_session,
                 self.take_trezor_app_passphrase(),
-                self.trezor_pin_matrix_provider.clone(),
+                self.trezor_pin_matrix_provider(),
                 self.address,
                 typed_data,
                 mode,
@@ -253,7 +253,7 @@ impl HardwarePublicEvmSigner {
             &self.descriptor,
             &hardware_session,
             self.take_trezor_app_passphrase(),
-            self.trezor_pin_matrix_provider.clone(),
+            self.trezor_pin_matrix_provider(),
             self.address,
         )
         .await?;
@@ -275,6 +275,16 @@ impl HardwarePublicEvmSigner {
             .lock()
             .map_err(|_| eyre!("hardware public signer session lock poisoned"))?;
         Ok(session.clone())
+    }
+
+    #[cfg(feature = "hardware")]
+    fn trezor_pin_matrix_provider(&self) -> Option<HardwareTrezorPinMatrixProvider> {
+        self.trezor_pin_matrix_provider.clone()
+    }
+
+    #[cfg(not(feature = "hardware"))]
+    const fn trezor_pin_matrix_provider(&self) -> Option<HardwareTrezorPinMatrixProvider> {
+        self.trezor_pin_matrix_provider
     }
 
     pub(super) fn replace_trezor_session_id_if_trezor(

@@ -54,37 +54,14 @@ pub enum DesktopWalletSyncStartPolicy {
 }
 
 impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
-    fn from(value: vault::WalletSource) -> Self {
-        match value {
-            vault::WalletSource::Generated => Self::ImportedHistoricalBackfill,
-            vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
-            vault::WalletSource::LedgerDerived | vault::WalletSource::TrezorDerived => {
-                Self::ImportedHistoricalBackfill
-            }
-        }
+    fn from(_value: vault::WalletSource) -> Self {
+        Self::ImportedHistoricalBackfill
     }
 }
 
 impl From<&vault::WalletMetadataBundle> for DesktopWalletSyncStartPolicy {
-    fn from(value: &vault::WalletMetadataBundle) -> Self {
-        match value.source {
-            vault::WalletSource::Generated => Self::ImportedHistoricalBackfill,
-            vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
-            vault::WalletSource::LedgerDerived | vault::WalletSource::TrezorDerived => {
-                match value
-                    .hardware_descriptor
-                    .as_ref()
-                    .map(|descriptor| descriptor.sync_intent)
-                {
-                    Some(hardware::HardwareWalletSyncIntent::CreateNew) => {
-                        Self::ImportedHistoricalBackfill
-                    }
-                    Some(hardware::HardwareWalletSyncIntent::RecoverExisting) | None => {
-                        Self::ImportedHistoricalBackfill
-                    }
-                }
-            }
-        }
+    fn from(_value: &vault::WalletMetadataBundle) -> Self {
+        Self::ImportedHistoricalBackfill
     }
 }
 

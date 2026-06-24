@@ -223,205 +223,6 @@ pub(super) fn desktop_native_top_up_plan_from_unshield_fields(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{fs, path::PathBuf};
-
-    use local_db::{DbConfig, DbStore};
-
-    const TEST_PASSWORD: &str = "correct horse battery staple";
-    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-
-    fn temp_db_root() -> PathBuf {
-        let dir = std::env::temp_dir().join("railoxide-wallet-ops-private-tx-tests");
-        fs::create_dir_all(&dir).expect("create temp db parent");
-        let pid = std::process::id();
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        dir.join(format!("db-{pid}-{nanos}"))
-    }
-
-    fn test_utxo(token: Address, value: U256) -> Utxo {
-        Utxo::new(
-            Note::new_unshield(Address::ZERO, token, value),
-            0,
-            0,
-            UtxoSource {
-                tx_hash: FixedBytes::ZERO,
-                block_number: 0,
-                block_timestamp: 0,
-            },
-            UtxoCommitmentKind::Transact,
-        )
-    }
-
-    fn test_chain_config(wrapped_native: Address) -> EffectiveDesktopChainConfig {
-        EffectiveDesktopChainConfig {
-            rpc_urls: Vec::new(),
-            railgun_contract: Address::ZERO,
-            relay_adapt_contract: Address::ZERO,
-            wrapped_native_token: Some(wrapped_native),
-            gas: settings::EffectiveChainGasSettings {
-                gas_limit_buffer: GAS_LIMIT_BUFFER,
-                gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
-                gas_price_buffer_denominator: GAS_PRICE_BUFFER_DENOMINATOR as u64,
-            },
-        }
-    }
-
-    #[test]
-    fn native_top_up_estimate_rejects_unwrap_as_unsupported() {
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
-        let chain = test_chain_config(wrapped_native);
-        let top_up = DesktopNativeTopUpRequest {
-            public_account_uuid: "pub-1".to_string(),
-            native_balance: U256::ZERO,
-        };
-        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
-
-        let error = desktop_native_top_up_plan_for_estimate(
-            1,
-            &chain,
-            wrapped_native,
-            Address::from([0x52; 20]),
-            true,
-            &top_up,
-            policy.offer_threshold,
-        )
-        .expect_err("unwrap-to-native cannot be combined with native top-up");
-        assert_eq!(
-            error.to_string(),
-            "native top-up cannot be combined with unwrap-to-native output"
-        );
-    }
-
-    #[test]
-    fn native_top_up_plan_validation_counts_wrapped_native_broadcaster_fee() {
-        let root_dir = temp_db_root();
-        let db = Arc::new(
-            DbStore::open(DbConfig {
-                root_dir: root_dir.clone(),
-            })
-            .expect("open db"),
-        );
-        let store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
-        store
-            .create_vault_with_params(TEST_PASSWORD, vault::KdfParams::new(1024, 1, 1))
-            .expect("create vault");
-        let wallet_id = "wallet-1";
-        let metadata = store
-            .new_wallet_metadata(
-                TEST_PASSWORD,
-                wallet_id,
-                0,
-                vault::WalletSource::Generated,
-                "Wallet",
-            )
-            .expect("wallet metadata");
-        store
-            .import_wallet_mnemonic_with_metadata(
-                TEST_PASSWORD,
-                wallet_id,
-                0,
-                "english",
-                TEST_MNEMONIC,
-                &metadata,
-            )
-            .expect("store wallet");
-        let view_session = store
-            .load_view_session(TEST_PASSWORD, wallet_id)
-            .expect("load view session");
-        let account = store
-            .import_public_account(
-                TEST_PASSWORD,
-                &view_session,
-                "0x0101010101010101010101010101010101010101010101010101010101010101",
-                Some("Recipient"),
-                true,
-            )
-            .expect("import public account");
-        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
-        let token = Address::from([0x51; 20]);
-        let receiver_amount = U256::from(25_u64);
-        let top_up = DesktopNativeTopUpRequest {
-            public_account_uuid: account.public_account_uuid.clone(),
-            native_balance: U256::ZERO,
-        };
-        let chain = test_chain_config(wrapped_native);
-        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
-        let required_without_fee = native_top_up_required_wrapped_native_amount(
-            token,
-            wrapped_native,
-            receiver_amount,
-            policy.top_up_amount,
-        );
-        let utxos = vec![test_utxo(wrapped_native, required_without_fee)];
-
-        let unwrap_error = desktop_native_top_up_plan_from_unshield_fields(
-            1,
-            &chain,
-            &view_session,
-            &store,
-            wrapped_native,
-            account.address,
-            true,
-            &top_up,
-            policy.offer_threshold,
-            None,
-            U256::ZERO,
-            &utxos,
-        )
-        .expect_err("unwrap-to-native cannot be combined with native top-up");
-        assert_eq!(
-            unwrap_error.to_string(),
-            "native top-up cannot be combined with unwrap-to-native output"
-        );
-
-        desktop_native_top_up_plan_from_unshield_fields(
-            1,
-            &chain,
-            &view_session,
-            &store,
-            token,
-            account.address,
-            false,
-            &top_up,
-            receiver_amount,
-            Some(wrapped_native),
-            U256::ZERO,
-            &utxos,
-        )
-        .expect("zero wrapped-native broadcaster fee fits available balance");
-
-        let fee_amount = U256::from(1_u64);
-        let error = desktop_native_top_up_plan_from_unshield_fields(
-            1,
-            &chain,
-            &view_session,
-            &store,
-            token,
-            account.address,
-            false,
-            &top_up,
-            receiver_amount,
-            Some(wrapped_native),
-            fee_amount,
-            &utxos,
-        )
-        .expect_err("wrapped-native broadcaster fee should require additional balance");
-        let expected_required = required_without_fee.saturating_add(fee_amount);
-        let message = error.to_string();
-        assert!(message.contains("native top-up wrapped-native max spendable"));
-        assert!(message.contains(&format!("required: {expected_required}")));
-
-        drop(store);
-        drop(db);
-        fs::remove_dir_all(root_dir).expect("remove temp db dir");
-    }
-}
-
 pub(super) fn desktop_native_top_up_plan_for_estimate(
     chain_id: u64,
     chain: &EffectiveDesktopChainConfig,
@@ -1635,4 +1436,203 @@ pub async fn submit_desktop_send_self_broadcast(
         http,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    use local_db::{DbConfig, DbStore};
+
+    const TEST_PASSWORD: &str = "correct horse battery staple";
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn temp_db_root() -> PathBuf {
+        let dir = std::env::temp_dir().join("railoxide-wallet-ops-private-tx-tests");
+        fs::create_dir_all(&dir).expect("create temp db parent");
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        dir.join(format!("db-{pid}-{nanos}"))
+    }
+
+    fn test_utxo(token: Address, value: U256) -> Utxo {
+        Utxo::new(
+            Note::new_unshield(Address::ZERO, token, value),
+            0,
+            0,
+            UtxoSource {
+                tx_hash: FixedBytes::ZERO,
+                block_number: 0,
+                block_timestamp: 0,
+            },
+            UtxoCommitmentKind::Transact,
+        )
+    }
+
+    fn test_chain_config(wrapped_native: Address) -> EffectiveDesktopChainConfig {
+        EffectiveDesktopChainConfig {
+            rpc_urls: Vec::new(),
+            railgun_contract: Address::ZERO,
+            relay_adapt_contract: Address::ZERO,
+            wrapped_native_token: Some(wrapped_native),
+            gas: settings::EffectiveChainGasSettings {
+                gas_limit_buffer: GAS_LIMIT_BUFFER,
+                gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
+                gas_price_buffer_denominator: GAS_PRICE_BUFFER_DENOMINATOR as u64,
+            },
+        }
+    }
+
+    #[test]
+    fn native_top_up_estimate_rejects_unwrap_as_unsupported() {
+        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let chain = test_chain_config(wrapped_native);
+        let top_up = DesktopNativeTopUpRequest {
+            public_account_uuid: "pub-1".to_string(),
+            native_balance: U256::ZERO,
+        };
+        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
+
+        let error = desktop_native_top_up_plan_for_estimate(
+            1,
+            &chain,
+            wrapped_native,
+            Address::from([0x52; 20]),
+            true,
+            &top_up,
+            policy.offer_threshold,
+        )
+        .expect_err("unwrap-to-native cannot be combined with native top-up");
+        assert_eq!(
+            error.to_string(),
+            "native top-up cannot be combined with unwrap-to-native output"
+        );
+    }
+
+    #[test]
+    fn native_top_up_plan_validation_counts_wrapped_native_broadcaster_fee() {
+        let root_dir = temp_db_root();
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
+        store
+            .create_vault_with_params(TEST_PASSWORD, vault::KdfParams::new(1024, 1, 1))
+            .expect("create vault");
+        let wallet_id = "wallet-1";
+        let metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                0,
+                vault::WalletSource::Generated,
+                "Wallet",
+            )
+            .expect("wallet metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                0,
+                "english",
+                TEST_MNEMONIC,
+                &metadata,
+            )
+            .expect("store wallet");
+        let view_session = store
+            .load_view_session(TEST_PASSWORD, wallet_id)
+            .expect("load view session");
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                "0x0101010101010101010101010101010101010101010101010101010101010101",
+                Some("Recipient"),
+                true,
+            )
+            .expect("import public account");
+        let wrapped_native = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let token = Address::from([0x51; 20]);
+        let receiver_amount = U256::from(25_u64);
+        let top_up = DesktopNativeTopUpRequest {
+            public_account_uuid: account.public_account_uuid.clone(),
+            native_balance: U256::ZERO,
+        };
+        let chain = test_chain_config(wrapped_native);
+        let policy = native_top_up_policy_for_chain(1).expect("ethereum native top-up policy");
+        let required_without_fee = native_top_up_required_wrapped_native_amount(
+            token,
+            wrapped_native,
+            receiver_amount,
+            policy.top_up_amount,
+        );
+        let utxos = vec![test_utxo(wrapped_native, required_without_fee)];
+
+        let unwrap_error = desktop_native_top_up_plan_from_unshield_fields(
+            1,
+            &chain,
+            &view_session,
+            &store,
+            wrapped_native,
+            account.address,
+            true,
+            &top_up,
+            policy.offer_threshold,
+            None,
+            U256::ZERO,
+            &utxos,
+        )
+        .expect_err("unwrap-to-native cannot be combined with native top-up");
+        assert_eq!(
+            unwrap_error.to_string(),
+            "native top-up cannot be combined with unwrap-to-native output"
+        );
+
+        desktop_native_top_up_plan_from_unshield_fields(
+            1,
+            &chain,
+            &view_session,
+            &store,
+            token,
+            account.address,
+            false,
+            &top_up,
+            receiver_amount,
+            Some(wrapped_native),
+            U256::ZERO,
+            &utxos,
+        )
+        .expect("zero wrapped-native broadcaster fee fits available balance");
+
+        let fee_amount = U256::from(1_u64);
+        let error = desktop_native_top_up_plan_from_unshield_fields(
+            1,
+            &chain,
+            &view_session,
+            &store,
+            token,
+            account.address,
+            false,
+            &top_up,
+            receiver_amount,
+            Some(wrapped_native),
+            fee_amount,
+            &utxos,
+        )
+        .expect_err("wrapped-native broadcaster fee should require additional balance");
+        let expected_required = required_without_fee.saturating_add(fee_amount);
+        let message = error.to_string();
+        assert!(message.contains("native top-up wrapped-native max spendable"));
+        assert!(message.contains(&format!("required: {expected_required}")));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
 }

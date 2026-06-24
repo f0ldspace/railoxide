@@ -1,3 +1,6 @@
+#[cfg(not(feature = "hardware"))]
+use super::WalletRoot;
+#[cfg(feature = "hardware")]
 use super::*;
 
 #[cfg(feature = "hardware")]

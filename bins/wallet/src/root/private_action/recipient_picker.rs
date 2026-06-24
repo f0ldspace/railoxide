@@ -262,7 +262,7 @@ pub(in crate::root) fn render_recipient_picker(
 
 impl RenderOnce for RecipientPicker {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let RecipientPicker {
+        let Self {
             root,
             key,
             kind,
@@ -279,7 +279,7 @@ impl RenderOnce for RecipientPicker {
             cx,
             |_, _| RecipientPickerLayoutState::default(),
         );
-        let picker_bounds = layout_state.read(cx).bounds.clone();
+        let picker_bounds = layout_state.read(cx).bounds;
         let keyboard_root = root.clone();
         let escape_root = root.clone();
         let outside_root = root.clone();
@@ -357,14 +357,14 @@ impl RenderOnce for RecipientPicker {
                     .child(
                         canvas(
                             {
-                                let layout_state = layout_state.clone();
+                                let layout_state = layout_state;
                                 move |bounds, _window, cx| {
                                     layout_state.update(cx, |state, _cx| {
                                         state.bounds = Some(bounds);
                                     });
                                 }
                             },
-                            |_, _, _, _| {},
+                            |_, (), _, _| {},
                         )
                         .absolute()
                         .size_full(),

@@ -1,4 +1,7 @@
+#[cfg(feature = "hardware")]
 use super::*;
+#[cfg(not(feature = "hardware"))]
+use super::{Context, HardwareWalletSyncIntent, WalletRoot};
 
 pub(super) mod creation;
 pub(super) mod dialog;

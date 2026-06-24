@@ -39,7 +39,7 @@ impl WalletConnectEnvelope {
             return Err(WalletConnectError::Crypto);
         }
         let mut nonce = [0u8; WALLETCONNECT_NONCE_LEN];
-        nonce.copy_from_slice(&bytes[1..1 + WALLETCONNECT_NONCE_LEN]);
+        nonce.copy_from_slice(&bytes[1..=WALLETCONNECT_NONCE_LEN]);
         Ok(Self {
             envelope_type: bytes[0],
             nonce,
@@ -134,10 +134,12 @@ pub fn derive_walletconnect_session_sym_key(
     Ok(output)
 }
 
+#[must_use]
 pub fn derive_walletconnect_session_topic(sym_key: &[u8; 32]) -> String {
     hash_walletconnect_key(sym_key)
 }
 
+#[must_use]
 pub fn hash_walletconnect_key(key: &[u8; 32]) -> String {
     hex::encode(Sha256::digest(key))
 }

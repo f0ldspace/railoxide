@@ -227,10 +227,11 @@ impl HardwareTypedDataSessionCapability {
         session: &HardwareProfileSession,
         descriptor: &HardwarePublicAccountDescriptor,
     ) -> bool {
+        let public_account_path_matches = self.public_account_path == descriptor.path;
         self.device_kind == session.device_kind
             && self.profile_id == session.profile_id
             && self.binding == session.binding
-            && self.public_account_path == descriptor.path
+            && public_account_path_matches
             && self.trezor_session_id == session.trezor_session_id
     }
 }

@@ -877,7 +877,7 @@ pub(super) async fn estimate_public_broadcaster_fee_from_rpc_pool(
         {
             Ok(result) => return Ok(result),
             Err(error) => {
-                let rpc = crate::http::redact_url_for_display(&provider_handle.url);
+                let rpc = http::redact_url_for_display(&provider_handle.url);
                 tracing::warn!(%error, %rpc, "estimate public broadcaster gas failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
                 last_error = Some(error);

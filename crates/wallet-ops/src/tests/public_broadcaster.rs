@@ -1065,7 +1065,7 @@ fn public_broadcaster_bound_min_gas_price_is_zero_on_arbitrum() {
     assert_eq!(public_broadcaster_bound_min_gas_price(42161, 21_000_000), 0);
     assert_eq!(public_broadcaster_bound_min_gas_price(42170, 21_000_000), 0);
     assert_eq!(
-        public_broadcaster_bound_min_gas_price(421614, 21_000_000),
+        public_broadcaster_bound_min_gas_price(421_614, 21_000_000),
         0
     );
     assert_eq!(

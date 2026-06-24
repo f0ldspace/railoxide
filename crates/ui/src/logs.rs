@@ -212,19 +212,16 @@ fn redact_log_urls(value: &str) -> String {
         let candidate = &rest[offset..];
         let end = url_candidate_end(candidate);
         let url_text = &candidate[..end];
-        match Url::parse(url_text) {
-            Ok(url) => {
-                redacted.push_str(&redact_url_for_log(&url));
-                rest = &candidate[end..];
-            }
-            Err(_) => {
-                let mut chars = candidate.chars();
-                if let Some(ch) = chars.next() {
-                    redacted.push(ch);
-                    rest = chars.as_str();
-                } else {
-                    rest = "";
-                }
+        if let Ok(url) = Url::parse(url_text) {
+            redacted.push_str(&redact_url_for_log(&url));
+            rest = &candidate[end..];
+        } else {
+            let mut chars = candidate.chars();
+            if let Some(ch) = chars.next() {
+                redacted.push(ch);
+                rest = chars.as_str();
+            } else {
+                rest = "";
             }
         }
 

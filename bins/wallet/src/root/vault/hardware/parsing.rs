@@ -1,4 +1,12 @@
+#[cfg(not(feature = "hardware"))]
+use super::HardwareWalletSyncIntent;
+#[cfg(feature = "hardware")]
 use super::*;
+
+#[cfg(any(feature = "hardware", test))]
+use wallet_ops::hardware::HARDENED_BIP32_INDEX;
+#[cfg(any(feature = "hardware", test))]
+use wallet_ops::vault::TrezorPassphraseMode;
 
 #[cfg(feature = "hardware")]
 const TREZOR_APP_PASSPHRASE_REQUIRED_ERROR_TEXT: &str =

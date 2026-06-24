@@ -1,4 +1,17 @@
-use super::*;
+use super::{
+    DesktopVaultStore, DesktopViewSession, EncryptedRecord, PRIVATE_ADDRESS_BOOK_PREFIX,
+    PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry, PublicAddressBookEntry, VaultError,
+    ViewUnlock, WalletStatus, ensure_private_address_book_address_available,
+    ensure_private_address_book_address_available_for_update,
+    ensure_public_address_book_address_available,
+    ensure_public_address_book_address_available_for_update, generate_opaque_id,
+    next_private_address_book_display_order, next_public_address_book_display_order,
+    private_address_book_record_entry, private_address_book_record_key,
+    public_address_book_record_entry, public_address_book_record_key,
+    sort_private_address_book_entries, sort_public_address_book_entries,
+    validate_address_book_label, validate_private_address_book_address,
+    validate_public_address_book_address,
+};
 
 impl DesktopVaultStore {
     pub fn list_private_address_book_entries_for_session(

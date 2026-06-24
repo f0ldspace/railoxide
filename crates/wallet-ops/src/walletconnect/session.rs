@@ -10,7 +10,7 @@ pub const WC_SESSION_SETTLE: &str = "wc_sessionSettle";
 pub const WC_SESSION_PROPOSE_RESPONSE_TAG: u32 = 1101;
 pub const WC_SESSION_SETTLE_REQUEST_TAG: u32 = 1102;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletConnectApprovalMessages {
     pub proposal_response: WalletConnectJsonRpcResponse<Value>,
     pub settle_request: super::relay::WalletConnectJsonRpcRequest<Value>,

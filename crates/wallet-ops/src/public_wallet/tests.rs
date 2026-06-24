@@ -734,9 +734,8 @@ fn walletconnect_effective_public_chain_config_rejects_disabled_chain() {
         },
     };
 
-    let error = match public_chain_runtime_config(1, Some(&effective)) {
-        Ok(_) => panic!("disabled chain was accepted"),
-        Err(error) => error,
+    let Err(error) = public_chain_runtime_config(1, Some(&effective)) else {
+        panic!("disabled chain was accepted")
     };
 
     assert!(error.to_string().contains("disabled"));

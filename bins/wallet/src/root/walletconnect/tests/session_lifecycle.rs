@@ -100,7 +100,7 @@ fn paused_scoped_session_request_rejects_unauthorized() {
     let mut session = test_walletconnect_session("paused-session-topic");
     session.session_uuid = "paused-session".to_owned();
     session.selected_public_account_uuid = scoped.public_account_uuid.clone();
-    session.selected_public_account_scope = scoped.scope.clone();
+    session.selected_public_account_scope = scoped.scope;
     session.owning_private_wallet_uuid = Some(first_session.wallet_id().to_owned());
     session.lifecycle_state = WalletConnectSessionLifecycleState::TemporarilyPaused;
     session.expiry_timestamp = current_unix_seconds() + 300;
@@ -161,7 +161,7 @@ fn lifecycle_responses_use_method_specific_irn_metadata() {
         "wc_sessionDelete",
         json!({ "code": 6000, "message": "User disconnected" }),
     );
-    let delete_message = test_walletconnect_relay_message(&session, delete);
+    let delete_message = test_walletconnect_relay_message(&session, &delete);
     let delete_outcome = process_walletconnect_session_message(
         &store,
         &view_session,
@@ -186,7 +186,7 @@ fn lifecycle_responses_use_method_specific_irn_metadata() {
     assert_eq!(removed_session.as_deref(), Some("lifecycle-session"));
 
     let ping = WalletConnectJsonRpcRequest::new(92, "wc_sessionPing", json!({}));
-    let ping_message = test_walletconnect_relay_message(&session, ping);
+    let ping_message = test_walletconnect_relay_message(&session, &ping);
     let ping_outcome = process_walletconnect_session_message(
         &store,
         &view_session,

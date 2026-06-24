@@ -96,7 +96,7 @@ pub(super) fn private_asset_display_amounts(
     }
 }
 
-pub(super) fn private_send_action_tooltip(
+pub(super) const fn private_send_action_tooltip(
     can_send: bool,
     actions_available: bool,
     syncing: bool,
@@ -112,7 +112,7 @@ pub(super) fn private_send_action_tooltip(
     )
 }
 
-pub(super) fn private_unshield_action_tooltip(
+pub(super) const fn private_unshield_action_tooltip(
     can_unshield: bool,
     actions_available: bool,
     syncing: bool,
@@ -128,7 +128,7 @@ pub(super) fn private_unshield_action_tooltip(
     )
 }
 
-fn private_action_tooltip(
+const fn private_action_tooltip(
     can_act: bool,
     actions_available: bool,
     syncing: bool,

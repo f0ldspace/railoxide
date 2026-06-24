@@ -92,7 +92,7 @@ pub(super) fn test_walletconnect_session(topic: &str) -> WalletConnectSessionRec
 
 pub(super) fn test_walletconnect_relay_message(
     session: &WalletConnectSessionRecord,
-    request: WalletConnectJsonRpcRequest<Value>,
+    request: &WalletConnectJsonRpcRequest<Value>,
 ) -> WalletConnectRelayMessage {
     let plaintext = serde_json::to_vec(&request).expect("request json");
     let message = encode_walletconnect_message(&session.keys.sym_key, &plaintext)

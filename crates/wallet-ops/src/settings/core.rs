@@ -188,6 +188,8 @@ impl WalletSettings {
         if !errors.is_empty() {
             return Err(WalletSettingsValidationError::new(errors));
         }
-        Ok(Url::parse(&self.poi.proxy.rpc_url).expect("validated POI RPC URL"))
+        Url::parse(&self.poi.proxy.rpc_url).map_err(|error| {
+            WalletSettingsValidationError::new(vec![format!("invalid POI RPC URL: {error}")])
+        })
     }
 }

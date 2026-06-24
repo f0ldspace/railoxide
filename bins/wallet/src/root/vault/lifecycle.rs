@@ -1,4 +1,20 @@
-use super::*;
+#[cfg(not(feature = "hardware"))]
+use super::hardware_device_wallet_select_label;
+use super::{
+    Arc, BroadcasterActivityTab, ChainUtxoState, Context, DesktopViewSession, ParentElement,
+    SearchableVec, Styled, VaultError, VaultState, ViewUnlock, WalletMetadataBundle, WalletRoot,
+    WalletSetupMode, WalletTab, Window, WindowExt, Zeroizing, app_strong_text,
+    default_wallet_label_for_metadata, dialog_content_max_height, dialog_max_height,
+    hardware_device_kind_from_wallet_select_value, px, scrollable_dialog_content,
+    secondary_dialog_content_width, vault_error_kind, vault_error_message,
+    wallet_options_from_metadata, wallet_select_items_from_metadata,
+    wallet_select_value_for_selected_wallet,
+};
+#[cfg(feature = "hardware")]
+use super::{
+    HardwareProfileMetadata, HardwareProfileUnlockPurpose, HardwareProfileUnlockState,
+    hardware_device_kind_from_source,
+};
 
 impl WalletRoot {
     pub(in crate::root) fn select_wallet(

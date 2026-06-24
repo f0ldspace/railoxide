@@ -242,7 +242,7 @@ impl WalletRoot {
         let reject_root = root.clone();
         let selected_label = selected_account.map_or_else(
             || "No active Public account selected".to_owned(),
-            |account| public_account_walletconnect_label(account),
+            public_account_walletconnect_label,
         );
         let mut card = walletconnect_subpanel("Session proposal")
             .child(walletconnect_metadata_block(
@@ -354,7 +354,7 @@ impl WalletRoot {
 
     fn approve_walletconnect_proposal_with_current_support(
         &mut self,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.walletconnect.approving_proposal {
@@ -527,27 +527,34 @@ impl WalletRoot {
         cx.notify();
     }
 
+    #[cfg(feature = "hardware")]
+    #[allow(clippy::unused_self)]
     fn walletconnect_proposal_needs_hardware_typed_data_probe(
         &self,
         proposal: &WalletConnectSessionProposal,
         selected_account: &PublicAccountMetadata,
         view_session: &DesktopViewSession,
     ) -> bool {
-        #[cfg(feature = "hardware")]
-        {
-            selected_account.source == PublicAccountSource::HardwareDerived
-                && walletconnect_proposal_requests_hardware_typed_data(proposal)
-                && !walletconnect_namespace_account_support(selected_account, Some(view_session))
-                    .hardware_typed_data_signing_mode
-                    .is_supported()
-        }
-        #[cfg(not(feature = "hardware"))]
-        {
-            let _ = (proposal, selected_account, view_session);
-            false
-        }
+        selected_account.source == PublicAccountSource::HardwareDerived
+            && walletconnect_proposal_requests_hardware_typed_data(proposal)
+            && !walletconnect_namespace_account_support(selected_account, Some(view_session))
+                .hardware_typed_data_signing_mode
+                .is_supported()
     }
 
+    #[cfg(not(feature = "hardware"))]
+    #[allow(clippy::unused_self)]
+    const fn walletconnect_proposal_needs_hardware_typed_data_probe(
+        &self,
+        proposal: &WalletConnectSessionProposal,
+        selected_account: &PublicAccountMetadata,
+        view_session: &DesktopViewSession,
+    ) -> bool {
+        let _ = (proposal, selected_account, view_session);
+        false
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)]
     fn probe_hardware_typed_data_for_proposal_then_approve(
         &mut self,
         proposal_ui: WalletConnectProposalUi,
@@ -575,7 +582,7 @@ impl WalletRoot {
         ));
         let typed_data_required =
             walletconnect_proposal_requests_required_typed_data(&proposal_ui.proposal);
-        let selected_account_uuid = selected_account.public_account_uuid.clone();
+        let selected_account_uuid = selected_account.public_account_uuid;
         let public_account_uuid = selected_account_uuid.clone();
         let join = self.runtime.spawn(async move {
             walletconnect_probe_hardware_typed_data_signing_mode(

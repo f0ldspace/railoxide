@@ -3,7 +3,7 @@ use super::*;
 impl WalletRoot {
     pub(in crate::root::walletconnect) fn walletconnect_client_context(
         &mut self,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) -> Result<WalletConnectClientContext, Arc<str>> {
         let Some(store) = self.vault_store.as_ref() else {
             return Err(Arc::from("Wallet vault storage is unavailable"));
@@ -20,17 +20,17 @@ impl WalletRoot {
             })?;
         let client = walletconnect_client_from_identity(
             self.walletconnect_effective_project_id(cx),
-            identity,
+            &identity,
         );
         let http = self.http.clone();
-        let worker = self.ensure_walletconnect_relay_worker(client.clone(), http.clone(), cx);
+        let worker = self.ensure_walletconnect_relay_worker(client, http, cx);
         Ok(WalletConnectClientContext { worker })
     }
 
     pub(in crate::root::walletconnect) fn walletconnect_client_context_for_session(
         &mut self,
         session: &WalletConnectSessionRecord,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) -> Result<WalletConnectClientContext, Arc<str>> {
         let Some(store) = self.vault_store.as_ref() else {
             return Err(Arc::from("Wallet vault storage is unavailable"));
@@ -53,10 +53,10 @@ impl WalletRoot {
             })?;
         let client = walletconnect_client_from_identity(
             self.walletconnect_effective_project_id(cx),
-            identity,
+            &identity,
         );
         let http = self.http.clone();
-        let worker = self.ensure_walletconnect_relay_worker(client.clone(), http.clone(), cx);
+        let worker = self.ensure_walletconnect_relay_worker(client, http, cx);
         Ok(WalletConnectClientContext { worker })
     }
 
@@ -81,7 +81,7 @@ impl WalletRoot {
         &mut self,
         client: WalletConnectRelayClient,
         http: HttpContext,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) -> WalletConnectRelayWorkerHandle {
         let client_id = client.auth().client_id.clone();
         let project_id = client.project_id().to_owned();
@@ -304,7 +304,7 @@ impl WalletRoot {
 
     pub(in crate::root::walletconnect) fn sync_walletconnect_relay_workers(
         &mut self,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) -> bool {
         let Some(store) = self.vault_store.clone() else {
             tracing::debug!(
@@ -365,9 +365,8 @@ impl WalletRoot {
             };
             let client_id = identity.client_id.clone();
             let sessions = sessions_by_client_id.remove(&client_id).unwrap_or_default();
-            let client = walletconnect_client_from_identity(project_id.clone(), identity);
-            let worker =
-                self.ensure_walletconnect_relay_worker(client.clone(), self.http.clone(), cx);
+            let client = walletconnect_client_from_identity(project_id.clone(), &identity);
+            let worker = self.ensure_walletconnect_relay_worker(client, self.http.clone(), cx);
             active_client_ids.insert(client_id);
             worker.set_topics(walletconnect_relay_target_topics(&pairings, &sessions));
         }
@@ -396,7 +395,7 @@ impl WalletRoot {
                     continue;
                 }
             };
-            let client = walletconnect_client_from_identity(project_id.clone(), identity);
+            let client = walletconnect_client_from_identity(project_id.clone(), &identity);
             let worker =
                 self.ensure_walletconnect_relay_worker(client.clone(), self.http.clone(), cx);
             active_client_ids.insert(client_id);
@@ -416,7 +415,7 @@ impl WalletRoot {
 
     pub(in crate::root::walletconnect) fn ensure_walletconnect_pending_request_expiry_timer(
         &mut self,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) {
         if self.walletconnect.pending_requests.is_empty()
             || self.walletconnect.request_expiry_timer_active
@@ -458,7 +457,7 @@ impl WalletRoot {
 
     pub(in crate::root::walletconnect) fn ensure_walletconnect_session_expiry_timer(
         &mut self,
-        cx: &mut Context<'_, Self>,
+        cx: &Context<'_, Self>,
     ) {
         let now = current_unix_seconds();
         let deadline = self

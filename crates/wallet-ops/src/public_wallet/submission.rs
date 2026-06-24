@@ -46,7 +46,7 @@ pub(super) enum PublicActionPreflightMode {
 }
 
 impl PublicActionPreflightMode {
-    fn needs_fee_quote(self, tx_req: &TransactionRequest) -> bool {
+    const fn needs_fee_quote(self, tx_req: &TransactionRequest) -> bool {
         match self {
             Self::Managed => true,
             Self::PreserveRequestFields => {
@@ -789,7 +789,7 @@ pub(super) fn emit_refreshed_public_action_hardware_session(
         ),
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(%error, "failed to read refreshed hardware public signer session")
+            tracing::warn!(%error, "failed to read refreshed hardware public signer session");
         }
     }
 }

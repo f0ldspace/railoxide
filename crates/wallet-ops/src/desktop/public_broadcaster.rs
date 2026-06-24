@@ -448,6 +448,7 @@ pub(super) struct PreparedDesktopUnshieldPlan {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum DesktopUnshieldPreparedPlan {
     Single(UnshieldPlan),
     Composite(CompositeUnshieldPlan),
@@ -468,7 +469,7 @@ impl DesktopUnshieldPreparedPlan {
         }
     }
 
-    pub(super) fn call_to(&self) -> Address {
+    pub(super) const fn call_to(&self) -> Address {
         match self {
             Self::Single(plan) => plan.call.to,
             Self::Composite(plan) => plan.call.to,
@@ -729,7 +730,7 @@ pub async fn resolve_source_tx_origin(
                 ));
             }
             Err(error) => {
-                let rpc = crate::http::redact_url_for_display(&provider_handle.url);
+                let rpc = http::redact_url_for_display(&provider_handle.url);
                 tracing::warn!(%error, %rpc, "fetch source transaction failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
                 last_error = Some(Report::new(error));
@@ -1500,7 +1501,7 @@ pub(crate) async fn buffered_gas_price_from_rpc_pool(
         {
             Ok(gas_price) => return Ok(gas_price),
             Err(error) => {
-                let rpc = crate::http::redact_url_for_display(&provider_handle.url);
+                let rpc = http::redact_url_for_display(&provider_handle.url);
                 tracing::warn!(%error, %rpc, "fetch gas price failed");
                 query_rpc_pool.mark_bad_provider(&provider_handle);
                 last_error = Some(error);

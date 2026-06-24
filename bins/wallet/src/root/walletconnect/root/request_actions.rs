@@ -51,7 +51,7 @@ impl WalletRoot {
             ))
             .child(walletconnect_kv_row(
                 "Public account",
-                short_address(&request.item.account).to_string(),
+                short_address(&request.item.account),
             ));
         if let Some(summary) = request.item.decoded_summary.as_ref() {
             card = card.child(walletconnect_kv_row(
@@ -187,6 +187,7 @@ impl WalletRoot {
         }
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(in crate::root) fn submit_walletconnect_request_authorized(
         &mut self,
         request_key: &str,
@@ -241,8 +242,8 @@ impl WalletRoot {
                     };
                 self.publish_invalid_walletconnect_pending_request(
                     request_key,
-                    request,
-                    error,
+                    &request,
+                    &error,
                     context,
                     window,
                     cx,
@@ -507,7 +508,8 @@ impl WalletRoot {
                 );
             }
             PublicActionSessionEvent::StepFailed { message, .. }
-            | PublicActionSessionEvent::AttemptRejected { message, .. } => {
+            | PublicActionSessionEvent::AttemptRejected { message, .. }
+            | PublicActionSessionEvent::HardwareApprovalFailed { message } => {
                 self.discard_active_trezor_session_if_stale(&message, cx);
                 self.walletconnect
                     .fail_request_approval_progress(request_key, generation, message);
@@ -539,11 +541,6 @@ impl WalletRoot {
                     None,
                     None,
                 );
-            }
-            PublicActionSessionEvent::HardwareApprovalFailed { message } => {
-                self.discard_active_trezor_session_if_stale(&message, cx);
-                self.walletconnect
-                    .fail_request_approval_progress(request_key, generation, message);
             }
             PublicActionSessionEvent::HardwareProfileSessionRefreshed { session } => {
                 #[cfg(feature = "hardware")]
@@ -618,7 +615,7 @@ impl WalletRoot {
             None,
             now,
         )
-        .map_err(walletconnect_session_request_failure_from_error)?;
+        .map_err(|error| walletconnect_session_request_failure_from_error(&error))?;
         self.ensure_walletconnect_chain_enabled(&request.item.chain_id)?;
         if let WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } =
             &validation.request
@@ -645,10 +642,10 @@ impl WalletRoot {
     pub(in crate::root::walletconnect) fn publish_invalid_walletconnect_pending_request(
         &mut self,
         request_key: &str,
-        request: WalletConnectRequestUi,
-        failure: WalletConnectSessionRequestFailure,
+        request: &WalletConnectRequestUi,
+        failure: &WalletConnectSessionRequestFailure,
         context: WalletConnectClientContext,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         let response = build_walletconnect_jsonrpc_error(
@@ -700,7 +697,7 @@ impl WalletRoot {
     pub(in crate::root::walletconnect) fn reject_walletconnect_request(
         &mut self,
         request_key: &str,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.walletconnect.request_actions.contains(request_key) {

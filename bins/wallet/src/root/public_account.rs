@@ -1036,7 +1036,10 @@ impl WalletRoot {
     ) -> gpui::Div {
         match kind {
             PublicAccountDialogKind::Derive => {
+                #[cfg(feature = "hardware")]
                 let add_root = root.clone();
+                #[cfg(not(feature = "hardware"))]
+                let add_root = root;
                 let next_index = self.public_form.next_derived_index.map_or_else(
                     || "Next index unavailable".to_string(),
                     |index| format!("Next derived index: {index}"),

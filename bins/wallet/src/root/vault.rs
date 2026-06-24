@@ -13,8 +13,6 @@ use gpui_component::{WindowExt, input::InputState, select::SearchableVec};
 #[cfg(feature = "hardware")]
 use tokio::{sync::mpsc, time::sleep};
 use ui::controls::app_strong_text;
-#[cfg(any(feature = "hardware", test))]
-use wallet_ops::hardware::HARDENED_BIP32_INDEX;
 #[cfg(feature = "hardware")]
 use wallet_ops::hardware::{
     DEFAULT_HARDWARE_DERIVATION_PATH, HardwareDerivationDescriptor, HardwareDerivationError,
@@ -28,11 +26,10 @@ use wallet_ops::hardware::{
     },
 };
 use wallet_ops::hardware::{HardwareDeviceKind, HardwareWalletSyncIntent};
-#[cfg(any(feature = "hardware", test))]
-use wallet_ops::vault::TrezorPassphraseMode;
 #[cfg(feature = "hardware")]
 use wallet_ops::vault::{
     DesktopVaultStore, HardwareProfileBindingKind, HardwareProfileSession, HardwareWalletProfile,
+    TrezorPassphraseMode,
 };
 use wallet_ops::vault::{
     DesktopViewSession, HardwareProfileMetadata, HardwareRailgunAccountMetadata,

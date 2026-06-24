@@ -25,7 +25,7 @@ fn approval_relay_steps_fetch_subscribe_then_publish_both_messages() {
         json!({
             "relay": { "protocol": "irn" },
             "namespaces": {},
-            "expiry": 1700000600,
+            "expiry": 1_700_000_600,
         }),
     );
     let steps = messages

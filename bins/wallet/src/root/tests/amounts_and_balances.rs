@@ -913,7 +913,7 @@ fn walletconnect_account_selector_defaulting_preserves_valid_selection() {
         Some("public-1")
     );
     assert_eq!(
-        normalized_walletconnect_account_uuid(Some(&selected), &[first.clone(), second]).as_deref(),
+        normalized_walletconnect_account_uuid(Some(&selected), &[first, second]).as_deref(),
         Some("public-2")
     );
 }

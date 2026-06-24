@@ -1,4 +1,15 @@
-use super::{helpers::*, requests::*, *};
+use super::{
+    helpers::{
+        current_unix_seconds, ensure_walletconnect_chain_id_enabled, ethereum_chain_id_hex,
+        walletconnect_error_message, walletconnect_is_transient_relay_error,
+        walletconnect_namespace_account_support, walletconnect_pairing_expired,
+        walletconnect_request_id_seed, walletconnect_request_key_log_label,
+        walletconnect_session_expired, walletconnect_session_relay_processable,
+        walletconnect_session_request_expiry_timestamp, walletconnect_topic_log_label,
+    },
+    requests::walletconnect_request_key,
+    *,
+};
 
 pub(super) fn stop_stale_walletconnect_relay_workers(
     relay_workers: &mut BTreeMap<String, WalletConnectRelayWorkerHandle>,
@@ -649,11 +660,8 @@ pub(super) async fn walletconnect_relay_worker_handle_connected_command(
                 .as_ref()
                 .err()
                 .is_some_and(|error| walletconnect_is_transient_relay_error(error));
-            if should_reconnect {
-                if let Err(error) = &result {
-                    let _ =
-                        event_tx.send(WalletConnectRelayWorkerEvent::Reconnecting(error.clone()));
-                }
+            if should_reconnect && let Err(error) = &result {
+                let _ = event_tx.send(WalletConnectRelayWorkerEvent::Reconnecting(error.clone()));
             }
             if let Ok(output) = &mut result {
                 for topic in unsubscribe_topics {
@@ -858,7 +866,7 @@ pub(super) async fn process_walletconnect_relay_output(
                         dapp = request.item.dapp_name.as_str(),
                         "received walletconnect request"
                     );
-                    result.pending_requests.push(request);
+                    result.pending_requests.push(*request);
                 }
                 Ok(SessionMessageOutcome::Respond {
                     topic,
@@ -879,7 +887,7 @@ pub(super) async fn process_walletconnect_relay_output(
                         worker,
                         topic.clone(),
                         &sym_key,
-                        response,
+                        *response,
                         response_ttl,
                         response_tag,
                     )
@@ -927,11 +935,11 @@ pub(super) async fn process_walletconnect_relay_output(
 }
 
 pub(super) enum SessionMessageOutcome {
-    Pending(WalletConnectRequestUi),
+    Pending(Box<WalletConnectRequestUi>),
     Respond {
         topic: String,
         sym_key: [u8; 32],
-        response: WalletConnectJsonRpcResponse<Value>,
+        response: Box<WalletConnectJsonRpcResponse<Value>>,
         response_ttl: u64,
         response_tag: u32,
         post_response_requests: Vec<WalletConnectJsonRpcRequest<Value>>,
@@ -980,7 +988,7 @@ pub(super) fn process_walletconnect_session_message(
             return Ok(SessionMessageOutcome::Respond {
                 topic: session.session_topic.clone(),
                 sym_key: session.keys.sym_key,
-                response,
+                response: Box::new(response),
                 response_ttl: WALLETCONNECT_SESSION_DELETE_TTL_SECS,
                 response_tag: WC_SESSION_DELETE_RESPONSE_TAG,
                 post_response_requests: Vec::new(),
@@ -1008,7 +1016,7 @@ pub(super) fn process_walletconnect_session_message(
             return Ok(SessionMessageOutcome::Respond {
                 topic: session.session_topic.clone(),
                 sym_key: session.keys.sym_key,
-                response,
+                response: Box::new(response),
                 response_ttl: WALLETCONNECT_SESSION_PING_TTL_SECS,
                 response_tag: WC_SESSION_PING_RESPONSE_TAG,
                 post_response_requests: Vec::new(),
@@ -1049,11 +1057,11 @@ pub(super) fn process_walletconnect_session_message(
             return Ok(SessionMessageOutcome::Respond {
                 topic: session.session_topic.clone(),
                 sym_key: session.keys.sym_key,
-                response: build_walletconnect_jsonrpc_error(
+                response: Box::new(build_walletconnect_jsonrpc_error(
                     request.id,
                     failure.kind,
                     failure.message,
-                ),
+                )),
                 response_ttl: WALLETCONNECT_RELAY_TTL_SECS,
                 response_tag: WC_SESSION_REQUEST_RESPONSE_TAG,
                 post_response_requests: Vec::new(),
@@ -1099,7 +1107,7 @@ pub(super) fn process_walletconnect_session_request_message(
     let expiry_timestamp =
         walletconnect_session_request_expiry_timestamp(request_params, request_payload)?;
     let parsed = parse_walletconnect_session_request(request_id, method, method_params)
-        .map_err(walletconnect_session_request_failure_from_error)?;
+        .map_err(|error| walletconnect_session_request_failure_from_error(&error))?;
     ensure_walletconnect_chain_id_enabled(chain_id, enabled_chain_ids)?;
     if let WalletConnectParsedRequest::WalletSwitchEthereumChain {
         chain_id: switch_chain,
@@ -1146,7 +1154,7 @@ pub(super) fn process_walletconnect_session_request_message(
         expiry_timestamp,
         now,
     )
-    .map_err(walletconnect_session_request_failure_from_error)?;
+    .map_err(|error| walletconnect_session_request_failure_from_error(&error))?;
     if let Some(item) = validation.approval_item {
         tracing::info!(
             target: "wallet::root::walletconnect",
@@ -1157,14 +1165,16 @@ pub(super) fn process_walletconnect_session_request_message(
             dapp = session.peer_metadata.name.as_str(),
             "walletconnect request requires approval"
         );
-        return Ok(SessionMessageOutcome::Pending(WalletConnectRequestUi {
-            key: walletconnect_request_key(&message.topic, request_id),
-            review_token: walletconnect_request_id_seed(),
-            session: session.clone(),
-            parsed,
-            item,
-            account_source,
-        }));
+        return Ok(SessionMessageOutcome::Pending(Box::new(
+            WalletConnectRequestUi {
+                key: walletconnect_request_key(&message.topic, request_id),
+                review_token: walletconnect_request_id_seed(),
+                session: session.clone(),
+                parsed,
+                item,
+                account_source,
+            },
+        )));
     }
     let mut post_response_requests = Vec::new();
     let result = match validation.request {
@@ -1202,12 +1212,12 @@ pub(super) fn process_walletconnect_session_request_message(
     Ok(SessionMessageOutcome::Respond {
         topic: session.session_topic.clone(),
         sym_key: session.keys.sym_key,
-        response: WalletConnectJsonRpcResponse {
+        response: Box::new(WalletConnectJsonRpcResponse {
             id: request_id,
             jsonrpc: "2.0".to_owned(),
             result: Some(result),
             error: None,
-        },
+        }),
         response_ttl: WALLETCONNECT_RELAY_TTL_SECS,
         response_tag: WC_SESSION_REQUEST_RESPONSE_TAG,
         post_response_requests,
@@ -1244,7 +1254,7 @@ pub(super) fn walletconnect_jsonrpc_response_shape(value: &Value) -> bool {
 
 pub(super) fn walletconnect_client_from_identity(
     project_id: String,
-    identity: WalletConnectRelayIdentity,
+    identity: &WalletConnectRelayIdentity,
 ) -> WalletConnectRelayClient {
     WalletConnectRelayClient::new(
         WalletConnectRelayConfig { project_id },
@@ -1253,9 +1263,9 @@ pub(super) fn walletconnect_client_from_identity(
 }
 
 pub(super) fn walletconnect_session_request_failure_from_error(
-    error: WalletConnectError,
+    error: &WalletConnectError,
 ) -> WalletConnectSessionRequestFailure {
-    let kind = match &error {
+    let kind = match error {
         WalletConnectError::ExpiredUri => WalletConnectRequestErrorKind::ExpiredRequest,
         WalletConnectError::UnsupportedMethod(_) => {
             WalletConnectRequestErrorKind::UnsupportedMethod
@@ -1282,7 +1292,7 @@ pub(super) fn walletconnect_session_request_failure_from_error(
     };
     WalletConnectSessionRequestFailure {
         kind,
-        message: walletconnect_error_message(&error),
+        message: walletconnect_error_message(error),
     }
 }
 
@@ -1530,7 +1540,7 @@ pub(super) fn relay_fetch_response_has_more(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn walletconnect_fetch_page_limit_exhausted(page: usize, has_more: bool) -> bool {
+pub(super) const fn walletconnect_fetch_page_limit_exhausted(page: usize, has_more: bool) -> bool {
     has_more && page.saturating_add(1) == WALLETCONNECT_FETCH_MAX_PAGES
 }
 

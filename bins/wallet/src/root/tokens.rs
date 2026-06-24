@@ -105,7 +105,7 @@ pub(super) fn format_native_top_up_recipient_suffix(chain_id: u64, amount: U256)
 }
 
 pub(super) fn format_recipient_amount_with_native_top_up(
-    recipient_amount: String,
+    recipient_amount: &str,
     chain_id: u64,
     native_amount: U256,
 ) -> String {

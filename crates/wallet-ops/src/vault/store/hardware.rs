@@ -1,4 +1,15 @@
-use super::*;
+use super::{
+    BTreeSet, DesktopVaultStore, DesktopViewSession, EncryptedRecord, HARDWARE_PROFILE_PREFIX,
+    HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareDerivationDescriptor, HardwareDeviceKind,
+    HardwareProfileBinding, HardwareProfileBindingKind, HardwareProfileMetadata,
+    HardwareProfileSession, HardwareRailgunAccountIdentity, HardwareRailgunAccountMetadata,
+    HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HardwareWalletProfile,
+    MAX_HARDWARE_RECOVERY_RANGE_COUNT, SoftwareRailgunSpendSigner, StoredHardwareWalletRecord,
+    VaultError, VaultRecordEntries, ViewUnlock, WalletKeys, WalletMetadataBundle, WalletSource,
+    WalletViewBundle, generate_opaque_id, hardware_profile_record_entry,
+    hardware_wallet_account_index_record_entry, sort_hardware_profile_metadata, unlock_view,
+    wallet_metadata_record_entry, wallet_metadata_record_key, wallet_view_record_key,
+};
 
 fn hardware_wallet_receive_address(wallet: &WalletKeys) -> Result<String, VaultError> {
     wallet

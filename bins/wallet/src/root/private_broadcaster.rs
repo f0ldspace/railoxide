@@ -1157,7 +1157,7 @@ pub(in crate::root) fn self_broadcast_composite_output_rows(
             || output.to_string(),
             |top_up| {
                 format_recipient_amount_with_native_top_up(
-                    output.to_string(),
+                    output.as_ref(),
                     result.chain_id,
                     top_up.native_amount,
                 )

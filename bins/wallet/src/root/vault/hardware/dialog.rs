@@ -1,4 +1,7 @@
+#[cfg(feature = "hardware")]
 use super::*;
+#[cfg(not(feature = "hardware"))]
+use super::{Context, WalletRoot};
 
 impl WalletRoot {
     #[cfg(feature = "hardware")]
@@ -226,7 +229,8 @@ impl WalletRoot {
     }
 
     #[cfg(not(feature = "hardware"))]
-    pub(in crate::root) fn drop_trezor_pin_matrix_prompt(&mut self) {}
+    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+    pub(in crate::root) const fn drop_trezor_pin_matrix_prompt(&mut self) {}
 
     #[cfg(feature = "hardware")]
     pub(in crate::root) fn clear_trezor_pin_matrix_prompt(&mut self, cx: &mut Context<'_, Self>) {
@@ -235,7 +239,12 @@ impl WalletRoot {
     }
 
     #[cfg(not(feature = "hardware"))]
-    pub(in crate::root) fn clear_trezor_pin_matrix_prompt(&mut self, _cx: &mut Context<'_, Self>) {}
+    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+    pub(in crate::root) const fn clear_trezor_pin_matrix_prompt(
+        &mut self,
+        _cx: &mut Context<'_, Self>,
+    ) {
+    }
 
     #[cfg(feature = "hardware")]
     pub(in crate::root::vault) fn read_trezor_app_passphrase_for_profile_operation(
@@ -387,12 +396,14 @@ impl WalletRoot {
     }
 
     #[cfg(not(feature = "hardware"))]
+    #[allow(clippy::unused_self)]
     pub(in crate::root) const fn current_session_needs_trezor_app_passphrase(&self) -> bool {
         false
     }
 
     #[cfg(not(feature = "hardware"))]
-    pub(in crate::root) fn discard_active_trezor_session_if_stale(
+    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
+    pub(in crate::root) const fn discard_active_trezor_session_if_stale(
         &mut self,
         _message: &str,
         _cx: &mut Context<'_, Self>,

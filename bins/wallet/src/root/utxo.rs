@@ -418,7 +418,7 @@ impl WalletRoot {
         let trezor_pin_matrix_provider = None;
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         Self::watch_blocked_shield_refund_events(utxo_id, event_rx, window, cx);
-        self.show_blocked_shield_refund_progress_dialog(utxo_id, window, cx);
+        Self::show_blocked_shield_refund_progress_dialog(utxo_id, window, cx);
         let request = BlockedShieldRescueSelfBroadcastRequest {
             chain_id: self.selected_chain,
             effective_chain: self
@@ -523,7 +523,6 @@ impl WalletRoot {
     }
 
     fn show_blocked_shield_refund_progress_dialog(
-        &mut self,
         utxo_id: BlockedShieldRescueUtxoId,
         window: &mut Window,
         cx: &mut Context<'_, Self>,

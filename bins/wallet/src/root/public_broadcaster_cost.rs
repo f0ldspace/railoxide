@@ -187,7 +187,7 @@ fn format_exact_candidate_token_amount(
 }
 
 impl<'a> PublicBroadcasterCostDisplay<'a> {
-    pub(super) fn from_result(
+    pub(super) const fn from_result(
         result: &'a PublicBroadcasterSubmissionResult,
         fee_anchor_rate: Option<U256>,
         registry: Option<&'a EffectiveTokenRegistry>,
@@ -213,7 +213,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         }
     }
 
-    pub(super) fn from_estimate(
+    pub(super) const fn from_estimate(
         asset: &UnshieldAsset,
         estimate: &'a PublicBroadcasterCostEstimate,
         fee_anchor_rate: Option<U256>,
@@ -222,7 +222,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         Self::from_estimate_chain(asset.chain_id, estimate, fee_anchor_rate, registry)
     }
 
-    pub(super) fn from_estimate_chain(
+    pub(super) const fn from_estimate_chain(
         chain_id: u64,
         estimate: &'a PublicBroadcasterCostEstimate,
         fee_anchor_rate: Option<U256>,

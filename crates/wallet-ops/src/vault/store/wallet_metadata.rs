@@ -1,4 +1,14 @@
-use super::*;
+use super::{
+    BTreeSet, DesktopVaultStore, DesktopViewSession, EncryptedRecord, HardwareDerivationDescriptor,
+    HardwareRailgunAccountMetadata, LoadedWalletMetadata, PublicAccountScope, VaultError,
+    ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WalletMetadataBundle, WalletSource,
+    WalletSpendSource, WalletStatus, assign_missing_display_orders,
+    default_wallet_label_for_metadata, generate_opaque_id,
+    hardware_wallet_account_index_record_entry, next_wallet_display_order,
+    public_account_metadata_record_key, public_account_secret_record_key, sort_wallet_metadata,
+    validate_wallet_label, wallet_cache_row_prefix, wallet_metadata_record_entry,
+    wallet_metadata_record_key, wallet_spend_record_key, wallet_view_record_key,
+};
 
 impl DesktopVaultStore {
     pub fn store_wallet_metadata(

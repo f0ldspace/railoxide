@@ -480,7 +480,7 @@ impl WalletConnectCompletedRequestUi {
     }
 }
 
-fn walletconnect_completed_request_status(
+const fn walletconnect_completed_request_status(
     outcome: &WalletConnectRequestApprovalOutcome,
 ) -> WalletConnectCompletedRequestStatus {
     if outcome.relay_error.is_some() {
@@ -694,7 +694,7 @@ struct WalletConnectRequestApprovalOutcome {
 }
 
 impl WalletConnectRequestApprovalOutcome {
-    fn expired(
+    const fn expired(
         response_published: bool,
         relay_error: Option<String>,
         submitted_tx_hash: Option<String>,
@@ -711,7 +711,7 @@ impl WalletConnectRequestApprovalOutcome {
         }
     }
 
-    fn hash_fallback_confirmation_required(
+    const fn hash_fallback_confirmation_required(
         refreshed_hardware_session: Option<HardwareProfileSession>,
     ) -> Self {
         Self {

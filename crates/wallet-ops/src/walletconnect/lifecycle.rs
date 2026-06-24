@@ -56,7 +56,7 @@ impl WalletConnectRelayLifecycle {
         self.local_processing_active = true;
     }
 
-    pub fn pause_for_lock_or_shutdown(&mut self) -> Vec<WalletConnectRelayRpc> {
+    pub const fn pause_for_lock_or_shutdown(&mut self) -> Vec<WalletConnectRelayRpc> {
         self.local_processing_active = false;
         Vec::new()
     }

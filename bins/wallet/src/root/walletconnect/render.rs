@@ -1,4 +1,4 @@
-use super::{helpers::*, *};
+use super::{helpers::parse_caip2_chain_id, *};
 
 pub(super) fn walletconnect_title_row(label: impl Into<SharedString>) -> gpui::Div {
     div()

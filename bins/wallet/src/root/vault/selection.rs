@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Arc, HardwareDeviceKind, HardwareProfileMetadata, HardwareRailgunAccountMetadata,
+    WalletMetadataBundle, WalletOption, WalletSelectItem, WalletSource, sort_wallet_metadata,
+};
 
 pub(in crate::root) fn wallet_options_from_metadata(
     mut metadata: Vec<WalletMetadataBundle>,

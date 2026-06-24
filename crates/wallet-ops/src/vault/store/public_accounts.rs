@@ -1,4 +1,16 @@
-use super::*;
+use super::{
+    ConfirmedHardwarePublicAccount, DesktopVaultStore, DesktopViewSession, EncryptedRecord,
+    KEY_LEN, PUBLIC_ACCOUNT_METADATA_PREFIX, PublicAccountMetadata, PublicAccountScope,
+    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, SpendGrant, VaultError,
+    ViewUnlock, Zeroizing, derive_public_evm_address_from_entropy,
+    derive_public_evm_private_key_from_entropy, ensure_public_account_address_available,
+    generate_opaque_id, next_derived_public_account_index, next_public_account_display_order,
+    normalize_public_account_label, parse_public_evm_private_key,
+    public_account_metadata_record_entry, public_account_metadata_record_key,
+    public_account_secret_record_entry, public_account_secret_record_key,
+    public_evm_address_from_private_key, sort_public_account_metadata, unlock_spend, unlock_view,
+    wallet_spend_record_key,
+};
 
 impl DesktopVaultStore {
     pub fn list_active_public_accounts_for_session(

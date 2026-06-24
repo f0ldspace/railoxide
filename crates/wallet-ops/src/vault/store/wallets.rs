@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, SoftwareRailgunSpendSigner,
+    SpendGrant, StoredWalletRecord, VaultError, VaultRecordEntries, ViewUnlock, WALLET_VIEW_PREFIX,
+    WalletKeys, WalletMetadataBundle, WalletSpendBundle, WalletViewBundle, Zeroizing,
+    bip39_entropy_from_mnemonic, initial_derived_public_account,
+    public_account_metadata_record_entry, unlock_spend, unlock_view, wallet_metadata_record_key,
+    wallet_spend_record_key, wallet_view_record_key,
+};
 
 impl DesktopVaultStore {
     pub fn store_wallet_from_entropy(

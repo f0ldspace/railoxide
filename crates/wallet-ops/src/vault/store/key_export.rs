@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    DesktopVaultStore, DesktopViewSession, HardwareRailgunAccountIdentity, KEY_LEN, Serialize,
+    U256, VaultError, ViewingKeyData, Zeroizing, bip39_mnemonic_from_entropy,
+    wallet_spend_record_key,
+};
 
 #[derive(Serialize)]
 struct ShareableViewingKeyPayload<'a> {

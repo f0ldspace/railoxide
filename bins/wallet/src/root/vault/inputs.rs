@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Context, Entity, Focusable, InputState, PRIMARY_WALLET_LABEL, VaultState, WalletRoot,
+    WalletSetupMode, Window, Zeroizing,
+};
 
 impl WalletRoot {
     pub(in crate::root) fn set_wallet_name_input(
@@ -68,7 +71,8 @@ impl WalletRoot {
     }
 
     #[cfg(not(feature = "hardware"))]
-    pub(in crate::root) fn clear_trezor_app_passphrase_input(
+    #[allow(clippy::unused_self)]
+    pub(in crate::root) const fn clear_trezor_app_passphrase_input(
         &self,
         _window: &mut Window,
         _cx: &mut Context<'_, Self>,

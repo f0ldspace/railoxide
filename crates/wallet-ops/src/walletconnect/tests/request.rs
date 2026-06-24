@@ -134,7 +134,7 @@ fn hardware_typed_data_request_validation_allows_unknown_capability_probe() {
     let request = parse_walletconnect_session_request(
         33,
         "eth_signTypedData_v4",
-        &json!([account.address.to_string(), typed_data_payload(json!(1))]),
+        &json!([account.address.to_string(), typed_data_payload(&json!(1))]),
     )
     .expect("typed-data request");
 
@@ -511,7 +511,7 @@ fn rejects_transaction_and_typed_data_chain_mismatches_before_approval() {
         "eth_signTypedData_v4",
         &json!([
             account.address.to_string(),
-            typed_data_payload(json!("0xa"))
+            typed_data_payload(&json!("0xa"))
         ]),
     )
     .unwrap();
@@ -534,7 +534,7 @@ fn rejects_transaction_and_typed_data_chain_mismatches_before_approval() {
         "eth_signTypedData_v4",
         &json!([
             account.address.to_string(),
-            typed_data_payload(json!(
+            typed_data_payload(&json!(
                 "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
             ))
         ]),
@@ -565,7 +565,7 @@ fn rejects_malformed_typed_data_domain_chain_id_before_approval() {
             "eth_signTypedData_v4",
             &json!([
                 account.address.to_string(),
-                typed_data_payload(json!("0x10000000000000000000000000000000000000000000000000000000000000000"))
+                typed_data_payload(&json!("0x10000000000000000000000000000000000000000000000000000000000000000"))
             ]),
         ),
         Err(WalletConnectError::MalformedParams(message)) if message.contains("domain.chainId")

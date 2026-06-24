@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    DesktopVaultStore, DesktopViewSession, EncryptedRecord, VaultError,
+    WALLET_CHAIN_METADATA_PREFIX, WalletChainMetadataBundle, deserialize_wallet_utxo,
+    generate_opaque_id, serialize_wallet_utxo, vault_error_from_wallet_cache,
+    wallet_cache_row_prefix, wallet_cache_row_record_key, wallet_chain_metadata_record_key,
+    wallet_utxo_stable_identity,
+};
 
 impl DesktopVaultStore {
     pub fn store_wallet_chain_metadata(

@@ -406,7 +406,7 @@ impl WalletRoot {
                     progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
-                    submit_desktop_send_public_broadcaster(request, &http)
+                    Box::pin(submit_desktop_send_public_broadcaster(request, &http))
                         .await
                         .map(|result| SendResult::PublicBroadcaster(Box::new(result)))
                 })
@@ -1001,14 +1001,14 @@ impl WalletRoot {
                     fee_mode,
                     recipient,
                     unwrap,
-                    native_top_up: native_top_up_request.clone(),
+                    native_top_up: native_top_up_request,
                     verify_proof: true,
                     progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
                     prepare_desktop_unshield_calldata(request, &http)
                         .await
-                        .map(UnshieldResult::Manual)
+                        .map(|result| UnshieldResult::Manual(Box::new(result)))
                 })
             }
             DeliveryMode::PublicBroadcaster => {
@@ -1024,7 +1024,7 @@ impl WalletRoot {
                     amount,
                     recipient,
                     unwrap,
-                    native_top_up: native_top_up_request.clone(),
+                    native_top_up: native_top_up_request,
                     verify_proof: true,
                     fee_rows,
                     selection: Self::public_broadcaster_submission_selection(
@@ -1041,7 +1041,7 @@ impl WalletRoot {
                     progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
-                    submit_desktop_unshield_public_broadcaster(request, &http)
+                    Box::pin(submit_desktop_unshield_public_broadcaster(request, &http))
                         .await
                         .map(|result| UnshieldResult::PublicBroadcaster(Box::new(result)))
                 })

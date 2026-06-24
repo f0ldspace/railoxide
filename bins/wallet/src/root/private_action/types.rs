@@ -146,7 +146,7 @@ pub(in crate::root) enum SendResult {
 }
 
 pub(in crate::root) enum UnshieldResult {
-    Manual(PreparedUnshieldCall),
+    Manual(Box<PreparedUnshieldCall>),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
     SelfBroadcast(Box<DesktopSelfBroadcastResult>),
 }
@@ -369,7 +369,7 @@ fn private_unshield_recipient_amount_label(draft: &UnshieldSpendDraft) -> String
             );
         let amount = private_amount_label(recipient_amount, &draft.asset, false);
         return super::format_recipient_amount_with_native_top_up(
-            amount,
+            &amount,
             draft.asset.chain_id,
             top_up.native_amount,
         );

@@ -123,7 +123,7 @@ pub fn negotiate_walletconnect_namespaces_with_account_support(
                     item: key.clone(),
                     reason: "required namespace has no supported chains, methods, or events"
                         .to_owned(),
-                })
+                });
             }
         }
     }
@@ -260,12 +260,10 @@ fn negotiate_namespace(
             } else {
                 unsupported
             })
+        } else if unsupported.is_empty() {
+            NamespaceNegotiation::Excluded
         } else {
-            if unsupported.is_empty() {
-                NamespaceNegotiation::Excluded
-            } else {
-                NamespaceNegotiation::Unsupported(unsupported)
-            }
+            NamespaceNegotiation::Unsupported(unsupported)
         };
     }
 
@@ -369,7 +367,7 @@ fn merge_optional_approved_namespace(
     approved: WalletConnectApprovedNamespace,
 ) {
     if approved_namespaces.contains_key(key) {
-        merge_approved_namespace_per_chain(approved_namespaces, approved);
+        merge_approved_namespace_per_chain(approved_namespaces, &approved);
     } else {
         merge_approved_namespace(approved_namespaces, key, approved);
     }
@@ -377,7 +375,7 @@ fn merge_optional_approved_namespace(
 
 fn merge_approved_namespace_per_chain(
     approved_namespaces: &mut BTreeMap<String, WalletConnectApprovedNamespace>,
-    approved: WalletConnectApprovedNamespace,
+    approved: &WalletConnectApprovedNamespace,
 ) {
     for chain in &approved.chains {
         let account_prefix = format!("{chain}:");

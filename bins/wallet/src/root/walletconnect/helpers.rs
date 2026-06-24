@@ -70,11 +70,10 @@ pub(super) fn walletconnect_hardware_typed_data_mode_for_request(
                 && account.status == PublicAccountStatus::Active
                 && account.scope == request.session.selected_public_account_scope
         })
-        .map(|account| {
+        .map_or(HardwareTypedDataSigningMode::Unsupported, |account| {
             walletconnect_namespace_account_support(account, view_session)
                 .hardware_typed_data_signing_mode
         })
-        .unwrap_or(HardwareTypedDataSigningMode::Unsupported)
 }
 
 pub(super) fn walletconnect_proposal_requests_required_typed_data(

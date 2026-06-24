@@ -32,7 +32,7 @@ pub(super) fn valid_uri_without_methods(extra: &str) -> String {
     format!("wc:{TOPIC}@2?relay-protocol=irn&symKey={SYM_KEY}{extra}")
 }
 
-pub(super) fn typed_data_payload(chain_id: Value) -> Value {
+pub(super) fn typed_data_payload(chain_id: &Value) -> Value {
     json!({
         "types": {
             "EIP712Domain": [

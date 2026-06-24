@@ -1,4 +1,4 @@
-use super::*;
+use super::{WalletRoot, Window, walletconnect_attention_transition};
 
 impl WalletRoot {
     pub(in crate::root) fn sync_walletconnect_attention(&mut self) {

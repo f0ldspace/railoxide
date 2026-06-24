@@ -168,7 +168,7 @@ impl From<&str> for WalletConnectJsonRpcId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletConnectJsonRpcResponse<R = Value, I = u64> {
     pub id: I,
     pub jsonrpc: String,
@@ -310,7 +310,7 @@ pub enum WalletConnectRelayRpc {
 
 impl WalletConnectRelayRpc {
     #[must_use]
-    pub fn method(&self) -> &'static str {
+    pub const fn method(&self) -> &'static str {
         match self {
             Self::Publish { .. } => "irn_publish",
             Self::FetchMessages { .. } => "irn_fetchMessages",
@@ -345,10 +345,10 @@ impl WalletConnectRelayRpc {
                 "ttl": ttl,
                 "tag": tag,
             }),
-            Self::FetchMessages { topic } => json!({ "topic": topic }),
-            Self::BatchFetchMessages { topics } => json!({ "topics": topics }),
-            Self::Subscribe { topic } => json!({ "topic": topic }),
-            Self::BatchSubscribe { topics } => json!({ "topics": topics }),
+            Self::FetchMessages { topic } | Self::Subscribe { topic } => json!({ "topic": topic }),
+            Self::BatchFetchMessages { topics } | Self::BatchSubscribe { topics } => {
+                json!({ "topics": topics })
+            }
             Self::Unsubscribe { topic, id } => json!({
                 "topic": topic,
                 "id": id,
@@ -517,11 +517,10 @@ impl WalletConnectRelaySocket {
             }
             let message = match timeout(deadline - now, self.websocket.try_next()).await {
                 Ok(Ok(Some(message))) => message,
-                Ok(Ok(None)) => return Ok(self.drain_subscription_messages()),
+                Ok(Ok(None)) | Err(_) => return Ok(self.drain_subscription_messages()),
                 Ok(Err(error)) => {
                     return Err(relay_transport_error("read relay subscription", error));
                 }
-                Err(_) => return Ok(self.drain_subscription_messages()),
             };
             let Some(value) = websocket_message_json(message)? else {
                 continue;
@@ -613,6 +612,7 @@ fn relay_websocket_client(http: &HttpContext) -> Result<reqwest::Client> {
         .map_err(|error| relay_transport_error("build relay websocket client", error))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn relay_websocket_error(error: reqwest_websocket::Error) -> WalletConnectError {
     let safe_error = sanitize_walletconnect_relay_error_message(&format!("{error:?}"));
     tracing::warn!(
@@ -807,8 +807,7 @@ fn relay_subscription_id_log_label(value: &Value) -> String {
         .as_str()
         .or_else(|| value.get("subscriptionId").and_then(Value::as_str))
         .or_else(|| value.get("id").and_then(Value::as_str))
-        .map(short_log_value)
-        .unwrap_or_else(|| "<missing>".to_owned())
+        .map_or_else(|| "<missing>".to_owned(), short_log_value)
 }
 
 fn topic_log_label(topic: &str) -> String {
@@ -870,7 +869,7 @@ fn starts_with_url_scheme(value: &str) -> bool {
         || value.starts_with("http://")
 }
 
-fn is_url_delimiter(ch: char) -> bool {
+const fn is_url_delimiter(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}' | ',')
 }
 
@@ -918,7 +917,7 @@ fn sensitive_query_key_len(value: &str) -> Option<usize> {
         .find_map(|key| value.starts_with(key).then_some(key.len()))
 }
 
-fn is_query_value_delimiter(ch: char) -> bool {
+const fn is_query_value_delimiter(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,

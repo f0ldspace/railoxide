@@ -212,7 +212,7 @@ fn relay_subscription_request_accepts_string_jsonrpc_id_and_aave_metadata() {
                 "topic": "5d144cf02e8bdcfc0c2cc59600f99c336a41aa28a385c54deb4d2d6a34aea64b",
                 "message": "encrypted-approve-payload",
                 "tag": 1108,
-                "publishedAt": 1700000000u64,
+                "publishedAt": 1_700_000_000_u64,
                 "attestation": {
                     "origin": "https://app.aave.com"
                 }
@@ -246,7 +246,7 @@ fn relay_subscription_request_accepts_walletconnect_data_shape() {
             "data": {
                 "topic": "topic-b",
                 "message": "payload-b",
-                "publishedAt": 1700000000u64
+                "publishedAt": 1_700_000_000_u64
             }
         }
     });

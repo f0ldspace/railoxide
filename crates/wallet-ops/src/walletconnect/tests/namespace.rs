@@ -351,7 +351,7 @@ fn hardware_optional_typed_data_approval_and_request_validation_stay_in_sync() {
     let request = parse_walletconnect_session_request(
         31,
         "eth_signTypedData_v4",
-        &json!([account.address.to_string(), typed_data_payload(json!(1))]),
+        &json!([account.address.to_string(), typed_data_payload(&json!(1))]),
     )
     .expect("typed-data request");
 

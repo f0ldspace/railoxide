@@ -125,7 +125,7 @@ pub(super) enum SpendAuthorizationIntent {
 }
 
 impl SpendAuthorizationIntent {
-    fn uses_private_wallet(&self) -> bool {
+    const fn uses_private_wallet(&self) -> bool {
         matches!(
             self,
             Self::PrivateSend(_) | Self::PrivateUnshield(_) | Self::BlockedShieldRefund(_)
@@ -282,6 +282,7 @@ impl HardwareSpendAuthorizationDialogContent {
         cx.notify();
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)]
     fn start(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.pending {
             return;

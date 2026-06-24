@@ -45,7 +45,7 @@ impl WalletRoot {
                 self.walletconnect.request_dialog_deferred_logged = true;
             }
             return;
-        };
+        }
         self.walletconnect.request_dialog_deferred_logged = false;
         tracing::info!(
             target: "wallet::root::walletconnect",
@@ -178,7 +178,7 @@ impl WalletRoot {
                     return;
                 };
                 keyboard_root.update(cx, |root, cx| {
-                    root.navigate_walletconnect_request_dialog(target_key, cx);
+                    root.navigate_walletconnect_request_dialog(&target_key, cx);
                 });
                 cx.stop_propagation();
             });
@@ -203,7 +203,7 @@ impl WalletRoot {
             walletconnect_request_dialog_nav(&self.walletconnect.pending_requests, request_key)
             && nav.total > 1
         {
-            content = content.child(self.render_walletconnect_request_dialog_nav(root, nav));
+            content = content.child(Self::render_walletconnect_request_dialog_nav(root, &nav));
         }
         match self.walletconnect.pending_requests.get(request_key) {
             Some(request) => content.child(self.render_walletconnect_request(root, request)),
@@ -214,9 +214,8 @@ impl WalletRoot {
     }
 
     pub(in crate::root::walletconnect) fn render_walletconnect_request_dialog_nav(
-        &self,
         root: &Entity<Self>,
-        nav: WalletConnectRequestDialogNav,
+        nav: &WalletConnectRequestDialogNav,
     ) -> gpui::Div {
         let previous_key = nav.previous_key.clone();
         let next_key = nav.next_key.clone();
@@ -239,7 +238,7 @@ impl WalletRoot {
                             return;
                         };
                         previous_root.update(cx, |root, cx| {
-                            root.navigate_walletconnect_request_dialog(key, cx);
+                            root.navigate_walletconnect_request_dialog(&key, cx);
                         });
                     }),
             )
@@ -259,7 +258,7 @@ impl WalletRoot {
                             return;
                         };
                         next_root.update(cx, |root, cx| {
-                            root.navigate_walletconnect_request_dialog(key, cx);
+                            root.navigate_walletconnect_request_dialog(&key, cx);
                         });
                     }),
             )
@@ -267,13 +266,13 @@ impl WalletRoot {
 
     pub(in crate::root::walletconnect) fn navigate_walletconnect_request_dialog(
         &mut self,
-        request_key: String,
+        request_key: &str,
         cx: &mut Context<'_, Self>,
     ) {
         if !self
             .walletconnect
             .pending_requests
-            .contains_key(&request_key)
+            .contains_key(request_key)
         {
             return;
         }
@@ -283,7 +282,7 @@ impl WalletRoot {
         {
             self.walletconnect.dismiss_request_dialog(current_key);
         }
-        self.walletconnect.request_dialog_key = Some(Arc::from(request_key.as_str()));
+        self.walletconnect.request_dialog_key = Some(Arc::from(request_key));
         self.walletconnect.request_dialog_open = true;
         self.walletconnect.request_dialog_deferred_logged = false;
         cx.notify();
@@ -331,7 +330,7 @@ impl WalletRoot {
             ))
             .child(walletconnect_kv_row(
                 "Public account",
-                short_address(&completed.request.item.account).to_string(),
+                short_address(&completed.request.item.account),
             ));
         if let Some(tx_hash) = completed.submitted_tx_hash.as_ref() {
             card = card.child(walletconnect_completed_tx_hash_row(

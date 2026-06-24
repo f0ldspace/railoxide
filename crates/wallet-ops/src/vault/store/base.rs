@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Arc, CreatedVault, DbConfig, DbStore, DesktopVaultStore, KdfParams, PathBuf, SpendGrant,
+    VAULT_METADATA_KEY, VaultError, VaultMetadata, ViewUnlock, create_spend_grant,
+    create_with_params, current_vault_version, unlock_view,
+};
 
 impl DesktopVaultStore {
     pub fn open(db_path: PathBuf) -> Result<Self, VaultError> {

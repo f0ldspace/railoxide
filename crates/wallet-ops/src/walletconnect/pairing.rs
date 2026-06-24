@@ -127,12 +127,10 @@ pub fn decode_walletconnect_session_proposal(
     if request.method != "wc_sessionPropose" {
         return Err(WalletConnectError::UnsupportedMethod(request.method));
     }
-    let relay_protocol = request
-        .params
-        .relays
-        .first()
-        .map(|relay| relay.protocol.clone())
-        .unwrap_or_else(|| WALLETCONNECT_IRN_RELAY_PROTOCOL.to_owned());
+    let relay_protocol = request.params.relays.first().map_or_else(
+        || WALLETCONNECT_IRN_RELAY_PROTOCOL.to_owned(),
+        |relay| relay.protocol.clone(),
+    );
     if relay_protocol != WALLETCONNECT_IRN_RELAY_PROTOCOL {
         return Err(WalletConnectError::InvalidUri(
             "session proposal relay protocol must be irn".to_owned(),
@@ -152,7 +150,7 @@ pub fn decode_walletconnect_session_proposal(
     })
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletConnectSessionApproval {
     pub negotiation: WalletConnectNamespaceNegotiation,
     pub session: WalletConnectSessionRecord,
@@ -305,6 +303,7 @@ impl WalletConnectProposalRejectionReason {
     }
 }
 
+#[must_use]
 pub fn reject_walletconnect_session_proposal(
     proposal_id: u64,
     reason: WalletConnectProposalRejectionReason,
