@@ -144,6 +144,8 @@ pub(super) fn effective_chain_config_with_rpc_endpoints(
             .quick_sync_endpoint
             .as_ref()
             .map(ToString::to_string),
+        indexed_artifact_source_mode: crate::settings::IndexedArtifactSourceModeSetting::Disabled,
+        indexed_artifact_source: None,
         indexed_wallet_block_range: defaults.indexed_wallet_block_range,
         deployment_block,
         v2_start_block: defaults.v2_start_block,

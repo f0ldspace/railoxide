@@ -1,10 +1,11 @@
 use super::{
     Address, BTreeMap, DEFAULT_WAKU_CLUSTER_ID, DEFAULT_WAKU_MAX_PEERS,
     DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS, DEFAULT_WAKU_SHARD_ID, Deserialize,
-    GAS_LIMIT_BUFFER, GAS_PRICE_BUFFER_DENOMINATOR, GAS_PRICE_BUFFER_NUMERATOR, MAX_INTERVAL_SECS,
-    Serialize, U256, normalize_address_string, public_balance_refresh_interval_secs,
-    supported_chain_id, validate_address, validate_enr_tree, validate_optional_non_empty,
-    validate_range, validate_url_scheme, validate_waku_direct_peer,
+    GAS_LIMIT_BUFFER, GAS_PRICE_BUFFER_DENOMINATOR, GAS_PRICE_BUFFER_NUMERATOR,
+    IndexedArtifactSourceConfig, IndexedArtifactSourceModeSetting, MAX_INTERVAL_SECS, Serialize,
+    U256, normalize_address_string, public_balance_refresh_interval_secs, supported_chain_id,
+    validate_address, validate_enr_tree, validate_optional_non_empty, validate_range,
+    validate_url_scheme, validate_waku_direct_peer,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +311,8 @@ pub struct EffectiveChainConfig {
     pub archive_rpc_url: Option<String>,
     pub quick_sync_enabled: bool,
     pub quick_sync_endpoint: Option<String>,
+    pub indexed_artifact_source_mode: IndexedArtifactSourceModeSetting,
+    pub indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     pub indexed_wallet_block_range: u64,
     pub deployment_block: u64,
     pub v2_start_block: u64,

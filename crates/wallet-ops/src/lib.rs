@@ -60,7 +60,7 @@ use sync_service::{
 };
 pub use sync_service::{
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, PoiReadSource,
-    SyncProgressStage, SyncProgressUpdate,
+    SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
 };
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinSet;

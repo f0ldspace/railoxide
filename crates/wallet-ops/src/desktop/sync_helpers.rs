@@ -553,6 +553,26 @@ pub(crate) fn chain_config(
         finality_depth: effective_chain
             .map_or(defaults.finality_depth, |chain| chain.finality_depth),
         quick_sync_endpoint,
+        indexed_artifact_source: effective_chain
+            .and_then(|chain| chain.indexed_artifact_source.as_ref())
+            .map(|source| sync_service::IndexedArtifactSourceConfig {
+                trusted_publisher_pubkey: source.trusted_publisher_pubkey,
+                manifest_source: match &source.manifest_source {
+                    settings::IndexedArtifactManifestSource::Url(url) => {
+                        sync_service::IndexedArtifactManifestSource::Url(url.clone())
+                    }
+                    settings::IndexedArtifactManifestSource::Cid(cid) => {
+                        sync_service::IndexedArtifactManifestSource::Cid(cid.clone())
+                    }
+                    settings::IndexedArtifactManifestSource::IpnsName(name) => {
+                        sync_service::IndexedArtifactManifestSource::IpnsName(name.clone())
+                    }
+                },
+                gateway_urls: source.gateway_urls.clone(),
+                max_manifest_age: source.max_manifest_age,
+                concurrency: source.concurrency,
+                max_in_flight_bytes: source.max_in_flight_bytes,
+            }),
         anchor_interval: defaults.anchor_interval,
         anchor_retention: defaults.anchor_retention,
         http_client: Some(http.client.clone()),

@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use local_db::{DbConfig, DbStore};
 
 use super::{
+    DEFAULT_INDEXED_ARTIFACT_CONCURRENCY, DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
+    IndexedArtifactManifestSourceSetting, IndexedArtifactSourceModeSetting,
+    OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME,
+    OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY,
     OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
     OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PoiArtifactManifestSourceSetting, PoiReadSourceSetting,
     WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WakuDirectPeerSetting, WalletSettings,
@@ -57,6 +61,27 @@ fn missing_settings_synthesizes_official_indexed_artifact_defaults() {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
     );
+    assert_eq!(
+        settings.indexed_artifacts.source_mode,
+        IndexedArtifactSourceModeSetting::Official
+    );
+    assert_eq!(
+        settings.indexed_artifacts.publisher_pubkey.as_deref(),
+        Some(OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY)
+    );
+    assert_eq!(
+        settings.indexed_artifacts.manifest_source,
+        Some(IndexedArtifactManifestSourceSetting::IpnsName(
+            OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME.to_string()
+        ))
+    );
+    assert_eq!(
+        settings.indexed_artifacts.gateway_urls,
+        OFFICIAL_INDEXED_ARTIFACT_GATEWAYS
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
     assert!(
         store
             .get_app_settings_record(WALLET_SETTINGS_KEY)
@@ -66,6 +91,39 @@ fn missing_settings_synthesizes_official_indexed_artifact_defaults() {
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn indexed_artifact_official_preset_is_default_enabled() {
+    let official = super::IndexedArtifactSettings::official_preset();
+    let default = super::IndexedArtifactSettings::default();
+
+    assert_eq!(
+        official.source_mode,
+        IndexedArtifactSourceModeSetting::Official
+    );
+    assert_eq!(
+        official.publisher_pubkey.as_deref(),
+        Some(OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY)
+    );
+    assert_eq!(
+        official.manifest_source,
+        Some(IndexedArtifactManifestSourceSetting::IpnsName(
+            OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME.to_string()
+        ))
+    );
+    assert_eq!(
+        official.gateway_urls,
+        OFFICIAL_INDEXED_ARTIFACT_GATEWAYS
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        default.source_mode,
+        IndexedArtifactSourceModeSetting::Official
+    );
+    assert_eq!(default, official);
 }
 
 #[test]
@@ -128,14 +186,20 @@ fn validation_rejects_ambiguous_proxy_and_disabled_chains() {
 fn reset_helpers_restore_defaults() {
     let mut settings = WalletSettings::default();
     settings.network.mode = super::NetworkModeSetting::Direct;
+    settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
     settings.poi.artifact.gateway_urls.clear();
     settings.walletconnect.project_id_override = Some("custom-project".to_owned());
 
     settings.reset_network();
+    settings.reset_indexed_artifacts();
     settings.reset_poi();
     settings.reset_walletconnect();
 
     assert_eq!(settings.network, super::NetworkSettings::default());
+    assert_eq!(
+        settings.indexed_artifacts,
+        super::IndexedArtifactSettings::default()
+    );
     assert_eq!(settings.poi, super::PoiSettings::default());
     assert_eq!(
         settings.walletconnect,
@@ -218,6 +282,137 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     assert_eq!(
         ethereum.multicall_contract,
         defaults.multicall_contract.to_string()
+    );
+    assert_eq!(
+        ethereum.indexed_artifact_source_mode,
+        IndexedArtifactSourceModeSetting::Official
+    );
+    let source = ethereum
+        .indexed_artifact_source
+        .as_ref()
+        .expect("official indexed artifact source");
+    assert_eq!(
+        alloy::hex::encode(source.trusted_publisher_pubkey.as_slice()),
+        OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY.trim_start_matches("0x")
+    );
+    assert!(matches!(
+        &source.manifest_source,
+        super::IndexedArtifactManifestSource::IpnsName(name)
+            if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
+    ));
+    assert_eq!(
+        source.gateway_urls.len(),
+        OFFICIAL_INDEXED_ARTIFACT_GATEWAYS.len()
+    );
+}
+
+#[test]
+fn indexed_artifact_custom_source_builds_effective_config() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+    settings.indexed_artifacts.publisher_pubkey = Some(format!("0x{}", "11".repeat(32)));
+    settings.indexed_artifacts.manifest_source = Some(IndexedArtifactManifestSourceSetting::Url(
+        "https://artifacts.example/manifest.json".to_string(),
+    ));
+    settings.indexed_artifacts.gateway_urls = vec!["https://gateway.example".to_string()];
+    settings.indexed_artifacts.concurrency = Some(5);
+    settings.indexed_artifacts.max_in_flight_bytes = Some(8 * 1024 * 1024);
+    settings.indexed_artifacts.max_manifest_age_secs = Some(3_600);
+
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let ethereum = configs.get(&1).expect("ethereum config");
+    let source = ethereum
+        .indexed_artifact_source
+        .as_ref()
+        .expect("indexed artifact source");
+
+    assert_eq!(
+        ethereum.indexed_artifact_source_mode,
+        IndexedArtifactSourceModeSetting::Custom
+    );
+    assert_eq!(
+        alloy::hex::encode(source.trusted_publisher_pubkey.as_slice()),
+        "11".repeat(32)
+    );
+    assert!(matches!(
+        &source.manifest_source,
+        super::IndexedArtifactManifestSource::Url(url)
+            if url.as_str() == "https://artifacts.example/manifest.json"
+    ));
+    assert_eq!(source.gateway_urls[0].as_str(), "https://gateway.example/");
+    assert_eq!(source.concurrency, 5);
+    assert_eq!(source.max_in_flight_bytes, 8 * 1024 * 1024);
+    assert_eq!(
+        source.max_manifest_age,
+        Some(std::time::Duration::from_hours(1))
+    );
+}
+
+#[test]
+fn indexed_artifact_defaults_apply_to_custom_source_limits() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+    settings.indexed_artifacts.publisher_pubkey = Some(format!("0x{}", "22".repeat(32)));
+    settings.indexed_artifacts.manifest_source = Some(
+        IndexedArtifactManifestSourceSetting::IpnsName("k51qzi5uqu5custom".to_string()),
+    );
+    settings.indexed_artifacts.gateway_urls = vec!["https://gateway.example".to_string()];
+
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let source = configs
+        .get(&1)
+        .and_then(|config| config.indexed_artifact_source.as_ref())
+        .expect("indexed artifact source");
+
+    assert_eq!(source.concurrency, DEFAULT_INDEXED_ARTIFACT_CONCURRENCY);
+    assert_eq!(
+        source.max_in_flight_bytes,
+        DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES
+    );
+}
+
+#[test]
+fn indexed_artifact_custom_source_validation_rejects_missing_source() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+    settings.indexed_artifacts.publisher_pubkey = Some("not-hex".to_string());
+    settings.indexed_artifacts.manifest_source = Some(IndexedArtifactManifestSourceSetting::Url(
+        "ftp://artifacts.example/manifest.json".to_string(),
+    ));
+    settings.indexed_artifacts.gateway_urls.clear();
+    settings
+        .indexed_artifacts
+        .gateway_urls
+        .push("ftp://gateway.example".to_string());
+    settings.indexed_artifacts.concurrency = Some(0);
+    settings.indexed_artifacts.max_in_flight_bytes = Some(1024 * 1024 * 1024 + 1);
+
+    let err = settings
+        .validate()
+        .expect_err("bad indexed source rejected");
+
+    assert!(err.messages.iter().any(|message| {
+        message.contains("indexed_artifacts.publisher_pubkey") && message.contains("32-byte hex")
+    }));
+    assert!(
+        err.messages
+            .iter()
+            .any(|message| message.contains("indexed_artifacts.manifest_source"))
+    );
+    assert!(
+        err.messages
+            .iter()
+            .any(|message| message.contains("indexed_artifacts.gateway_urls"))
+    );
+    assert!(
+        err.messages
+            .iter()
+            .any(|message| message.contains("indexed_artifacts.concurrency"))
+    );
+    assert!(
+        err.messages
+            .iter()
+            .any(|message| message.contains("indexed_artifacts.max_in_flight_bytes"))
     );
 }
 

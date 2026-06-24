@@ -262,6 +262,8 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
         archive_rpc_url: Some("https://archive.example".to_string()),
         quick_sync_enabled: false,
         quick_sync_endpoint: Some("https://quick.example/graphql".to_string()),
+        indexed_artifact_source_mode: crate::settings::IndexedArtifactSourceModeSetting::Disabled,
+        indexed_artifact_source: None,
         indexed_wallet_block_range: 12_345,
         deployment_block: 12_000,
         v2_start_block: 13_000,
@@ -292,6 +294,7 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
     .expect("chain config");
 
     assert_eq!(cfg.quick_sync_endpoint, None);
+    assert!(cfg.indexed_artifact_source.is_none());
     assert_eq!(cfg.indexed_wallet_block_range, 12_345);
     assert_eq!(cfg.finality_depth, 99);
     assert_eq!(cfg.block_range, 2_000);
@@ -309,6 +312,66 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
     cfg.rpcs.mark_bad_provider(&first);
     let second = cfg.rpcs.random_provider().expect("fallback provider");
     assert_ne!(first.url, second.url);
+
+    drop(http);
+    let _ = fs::remove_dir_all(root_dir);
+}
+
+#[test]
+fn chain_config_threads_indexed_artifact_source() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let root_dir = temp_db_root();
+    let http = runtime
+        .block_on(crate::build_wallet_network_context(
+            crate::WalletNetworkConfig {
+                network_mode: Some(crate::WalletNetworkMode::Direct),
+                proxy: None,
+                data_dir: &root_dir,
+            },
+        ))
+        .expect("direct HTTP context");
+    let defaults = ChainConfigDefaults::for_chain(1).expect("ethereum defaults");
+    let mut effective = effective_chain_config_with_rpc_endpoints(
+        1,
+        vec!["https://rpc.example".to_string()],
+        defaults.deployment_block,
+    );
+    effective.indexed_artifact_source_mode =
+        crate::settings::IndexedArtifactSourceModeSetting::Custom;
+    effective.indexed_artifact_source = Some(crate::settings::IndexedArtifactSourceConfig {
+        trusted_publisher_pubkey: FixedBytes::from([0x42; 32]),
+        manifest_source: crate::settings::IndexedArtifactManifestSource::IpnsName(
+            "k51qzi5uqu5artifact".to_string(),
+        ),
+        gateway_urls: vec![reqwest::Url::parse("https://gateway.example").expect("url")],
+        max_manifest_age: Some(Duration::from_mins(10)),
+        concurrency: 5,
+        max_in_flight_bytes: 8 * 1024 * 1024,
+    });
+
+    let cfg =
+        crate::chain_config(&defaults, None, Some(&effective), &http, None).expect("chain config");
+    let source = cfg
+        .indexed_artifact_source
+        .as_ref()
+        .expect("indexed artifact source");
+
+    assert_eq!(
+        source.trusted_publisher_pubkey,
+        FixedBytes::from([0x42; 32])
+    );
+    assert!(matches!(
+        &source.manifest_source,
+        sync_service::IndexedArtifactManifestSource::IpnsName(name)
+            if name == "k51qzi5uqu5artifact"
+    ));
+    assert_eq!(source.gateway_urls[0].as_str(), "https://gateway.example/");
+    assert_eq!(source.max_manifest_age, Some(Duration::from_mins(10)));
+    assert_eq!(source.concurrency, 5);
+    assert_eq!(source.max_in_flight_bytes, 8 * 1024 * 1024);
 
     drop(http);
     let _ = fs::remove_dir_all(root_dir);

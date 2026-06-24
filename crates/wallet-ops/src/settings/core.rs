@@ -1,15 +1,15 @@
 use super::{
-    ChainSettings, Deserialize, Error, GasSettings, NetworkSettings, PoiReadSource,
-    PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings, RuntimeSettings, Serialize,
-    TokenSettings, Url, WakuSettings, WalletConnectSettings, WalletNetworkMode, fmt,
+    ChainSettings, Deserialize, Error, GasSettings, IndexedArtifactSettings, NetworkSettings,
+    PoiReadSource, PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings, RuntimeSettings,
+    Serialize, TokenSettings, Url, WakuSettings, WalletConnectSettings, WalletNetworkMode, fmt,
 };
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 1;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
-    "0x24b50dff3cd78a1f5f73b8c484eb4645207fdf00202f2e0f7baf17a11f6b24c9";
+    "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
 pub const OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
-    "k51qzi5uqu5dh3iwtu0o3o5d014fmgwaslfkody932y6owxn19o0cmhwbsjzyh";
+    "k51qzi5uqu5di629evs7ynhsqiy4uit6qt70tx62roace2ij6jc83uo9jseqit";
 pub const OFFICIAL_POI_ARTIFACT_GATEWAYS: &[&str] = &[
     "https://dweb.link",
     "https://ipfs.filebase.io",
@@ -69,6 +69,7 @@ pub struct WalletSettings {
     pub version: u32,
     pub network: NetworkSettings,
     pub chains: ChainSettings,
+    pub indexed_artifacts: IndexedArtifactSettings,
     pub poi: PoiSettings,
     pub broadcaster: PublicBroadcasterSettings,
     pub tokens: TokenSettings,
@@ -84,6 +85,7 @@ impl Default for WalletSettings {
             version: WALLET_SETTINGS_VERSION,
             network: NetworkSettings::default(),
             chains: ChainSettings::default(),
+            indexed_artifacts: IndexedArtifactSettings::default(),
             poi: PoiSettings::default(),
             broadcaster: PublicBroadcasterSettings::default(),
             tokens: TokenSettings::default(),
@@ -100,6 +102,7 @@ impl WalletSettings {
         let mut errors = Vec::new();
         self.network.validate(&mut errors);
         self.chains.validate(&mut errors);
+        self.indexed_artifacts.validate(&mut errors);
         self.poi.validate(&mut errors);
         self.broadcaster.validate(&mut errors);
         self.tokens.validate(&mut errors);
@@ -126,6 +129,10 @@ impl WalletSettings {
 
     pub fn reset_chains(&mut self) {
         self.chains = ChainSettings::default();
+    }
+
+    pub fn reset_indexed_artifacts(&mut self) {
+        self.indexed_artifacts = IndexedArtifactSettings::default();
     }
 
     pub fn reset_poi(&mut self) {

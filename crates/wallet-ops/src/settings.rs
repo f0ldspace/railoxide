@@ -3,7 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use alloy::hex;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
 use local_db::DbStore;
 use railgun_ui::TokenAnchorSource;
 use reqwest::Url;
@@ -21,6 +21,7 @@ use waku::{RAILGUN_TREE, parse_multiaddr, parse_peer_id};
 
 mod core;
 mod effective;
+mod indexed_artifacts;
 mod network_chains;
 mod poi_broadcaster;
 mod storage;
@@ -36,6 +37,7 @@ use validation::{
 
 pub use core::*;
 pub use effective::*;
+pub use indexed_artifacts::*;
 pub use network_chains::*;
 pub use poi_broadcaster::*;
 pub use storage::*;
