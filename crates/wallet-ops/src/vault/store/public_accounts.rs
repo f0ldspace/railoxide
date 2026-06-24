@@ -77,7 +77,7 @@ impl DesktopVaultStore {
     pub fn add_hardware_public_account(
         &self,
         view_session: &DesktopViewSession,
-        confirmed_account: ConfirmedHardwarePublicAccount,
+        confirmed_account: &ConfirmedHardwarePublicAccount,
         label: Option<&str>,
     ) -> Result<PublicAccountMetadata, VaultError> {
         let descriptor = confirmed_account.descriptor().clone();

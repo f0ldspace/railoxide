@@ -989,7 +989,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
     let confirmed =
         ConfirmedHardwarePublicAccount::new_for_tests(hardware_descriptor, hardware_address);
     assert!(matches!(
-        store.add_hardware_public_account(&view_session, confirmed, Some("Ledger Gas")),
+        store.add_hardware_public_account(&view_session, &confirmed, Some("Ledger Gas")),
         Err(VaultError::HardwareWalletViewRequiresDevice)
     ));
 
@@ -1049,7 +1049,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
     let hardware_public = store
         .add_hardware_public_account(
             &hardware_view_session,
-            ConfirmedHardwarePublicAccount::new_for_tests(
+            &ConfirmedHardwarePublicAccount::new_for_tests(
                 hardware_public_descriptor,
                 address!("0x3333333333333333333333333333333333333333"),
             ),

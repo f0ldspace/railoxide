@@ -220,7 +220,7 @@ pub(super) async fn create_hardware_public_account(
         }
     };
     let account = store
-        .add_hardware_public_account(view_session.as_ref(), confirmed_account, Some(&label))
+        .add_hardware_public_account(view_session.as_ref(), &confirmed_account, Some(&label))
         .map_err(|error| error.to_string())?;
     Ok((account, hardware_session))
 }

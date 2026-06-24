@@ -35,7 +35,7 @@ fn hardware_public_account_stores_descriptor_without_secret() {
     let confirmed =
         crate::hardware::ConfirmedHardwarePublicAccount::new_for_tests(descriptor.clone(), address);
     let account = store
-        .add_hardware_public_account(&view_session, confirmed, Some("Ledger 1"))
+        .add_hardware_public_account(&view_session, &confirmed, Some("Ledger 1"))
         .expect("add hardware public account");
 
     assert_eq!(account.source, PublicAccountSource::HardwareDerived);
@@ -83,7 +83,7 @@ fn hardware_public_account_requires_hardware_view_session() {
         crate::hardware::ConfirmedHardwarePublicAccount::new_for_tests(descriptor, address);
 
     assert!(matches!(
-        store.add_hardware_public_account(&view_session, confirmed, Some("Ledger bypass")),
+        store.add_hardware_public_account(&view_session, &confirmed, Some("Ledger bypass")),
         Err(VaultError::HardwareWalletViewRequiresDevice)
     ));
     assert!(
@@ -138,7 +138,7 @@ fn hardware_public_account_paths_partition_by_private_wallet_index() {
             address,
         );
         let account = store
-            .add_hardware_public_account(&view_session, confirmed, None)
+            .add_hardware_public_account(&view_session, &confirmed, None)
             .expect("add hardware public account");
 
         assert_eq!(account.derivation_index, Some(0));
