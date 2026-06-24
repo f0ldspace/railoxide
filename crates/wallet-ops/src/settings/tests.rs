@@ -8,12 +8,12 @@ use super::{
     DEFAULT_INDEXED_ARTIFACT_CONCURRENCY, DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
     IndexedArtifactManifestSourceSetting, IndexedArtifactSourceModeSetting,
     OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME,
-    OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY,
-    OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
-    OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PoiArtifactManifestSourceSetting, PoiReadSourceSetting,
-    WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WakuDirectPeerSetting, WalletSettings,
-    WalletSettingsError, build_effective_chain_configs, build_effective_token_registry,
-    decode_wallet_settings, encode_wallet_settings, load_wallet_settings, save_wallet_settings,
+    OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY, OFFICIAL_POI_ARTIFACT_GATEWAYS,
+    OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
+    PoiArtifactManifestSourceSetting, PoiReadSourceSetting, WALLET_SETTINGS_KEY,
+    WALLET_SETTINGS_VERSION, WakuDirectPeerSetting, WalletSettings, WalletSettingsError,
+    build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
+    encode_wallet_settings, load_wallet_settings, save_wallet_settings,
     should_show_chain_deployment_metadata_settings,
 };
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
@@ -346,6 +346,30 @@ fn indexed_artifact_custom_source_builds_effective_config() {
         source.max_manifest_age,
         Some(std::time::Duration::from_hours(1))
     );
+}
+
+#[test]
+fn indexed_artifact_ipns_source_is_trimmed_in_effective_config() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+    settings.indexed_artifacts.publisher_pubkey = Some(format!("0x{}", "22".repeat(32)));
+    settings.indexed_artifacts.manifest_source =
+        Some(IndexedArtifactManifestSourceSetting::IpnsName(format!(
+            "  {OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME}  "
+        )));
+    settings.indexed_artifacts.gateway_urls = vec!["https://gateway.example".to_string()];
+
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let source = configs
+        .get(&1)
+        .and_then(|config| config.indexed_artifact_source.as_ref())
+        .expect("indexed artifact source");
+
+    assert!(matches!(
+        &source.manifest_source,
+        super::IndexedArtifactManifestSource::IpnsName(name)
+            if name == OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME
+    ));
 }
 
 #[test]

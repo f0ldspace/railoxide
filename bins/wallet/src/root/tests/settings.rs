@@ -1,4 +1,10 @@
 use super::*;
+use crate::root::settings::{
+    add_indexed_artifact_gateway_url, apply_indexed_artifact_source_mode,
+    indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
+    remove_indexed_artifact_gateway_url, set_indexed_artifact_gateway_url,
+};
+use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSetting};
 
 #[test]
 fn private_tab_is_default_wallet_tab() {
@@ -148,6 +154,13 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
         SettingsApplyMode::NetworkingRestart
     );
 
+    let mut indexed_draft = saved.clone();
+    indexed_draft.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+    assert_eq!(
+        classify_settings_apply_mode(&saved, &indexed_draft),
+        SettingsApplyMode::NetworkingRestart
+    );
+
     let mut request_draft = saved.clone();
     request_draft.broadcaster.response_timeout_secs += 1;
     assert_eq!(
@@ -229,6 +242,13 @@ fn settings_restart_reuses_network_only_when_network_settings_are_unchanged() {
     let mut poi_draft = saved.clone();
     poi_draft.poi.read_source = PoiReadSourceSetting::PoiProxy;
     assert!(settings_restart_reuses_active_network(&saved, &poi_draft));
+
+    let mut indexed_draft = saved.clone();
+    indexed_draft.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+    assert!(settings_restart_reuses_active_network(
+        &saved,
+        &indexed_draft
+    ));
 
     let mut network_draft = saved.clone();
     network_draft.network.mode = NetworkModeSetting::Direct;
@@ -473,6 +493,62 @@ fn poi_gateway_settings_mutations_update_direct_list() {
             "https://added-gateway.example".to_string(),
         ]
     );
+}
+
+#[test]
+fn indexed_artifact_gateway_settings_mutations_do_not_touch_poi_gateways() {
+    let mut settings = WalletSettings::default();
+    settings.indexed_artifacts.gateway_urls = vec![
+        "https://indexed-one.example".to_string(),
+        "https://indexed-two.example".to_string(),
+    ];
+    settings.poi.artifact.gateway_urls = vec!["https://poi.example".to_string()];
+
+    set_indexed_artifact_gateway_url(&mut settings, 0, " https://indexed-edited.example ");
+    add_indexed_artifact_gateway_url(&mut settings, " https://indexed-added.example ");
+    remove_indexed_artifact_gateway_url(&mut settings, 1);
+    remove_indexed_artifact_gateway_url(&mut settings, 10);
+
+    assert_eq!(
+        settings.indexed_artifacts.gateway_urls,
+        vec![
+            "https://indexed-edited.example".to_string(),
+            "https://indexed-added.example".to_string(),
+        ]
+    );
+    assert_eq!(
+        settings.poi.artifact.gateway_urls,
+        vec!["https://poi.example".to_string()]
+    );
+}
+
+#[test]
+fn indexed_artifact_source_mode_helpers_apply_official_and_disabled_presets() {
+    let mut settings = WalletSettings::default();
+
+    apply_indexed_artifact_source_mode(&mut settings, "official");
+    assert_eq!(
+        indexed_artifact_source_mode_value(settings.indexed_artifacts.source_mode),
+        "official"
+    );
+    assert_eq!(
+        settings.indexed_artifacts,
+        IndexedArtifactSettings::official_preset()
+    );
+    assert!(indexed_artifact_source_status_message(&settings).contains("Official"));
+
+    apply_indexed_artifact_source_mode(&mut settings, "custom");
+    assert_eq!(
+        settings.indexed_artifacts.source_mode,
+        IndexedArtifactSourceModeSetting::Custom
+    );
+
+    apply_indexed_artifact_source_mode(&mut settings, "disabled");
+    assert_eq!(
+        settings.indexed_artifacts,
+        IndexedArtifactSettings::disabled_preset()
+    );
+    assert!(indexed_artifact_source_status_message(&settings).contains("disabled"));
 }
 
 #[test]

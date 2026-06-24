@@ -78,6 +78,90 @@ impl Render for WalletSettingsEditor {
             },
         );
         let poi_reset_editor = editor.clone();
+        let indexed_source_mode = Self::dropdown_field(
+            editor.clone(),
+            vec![
+                (
+                    SharedString::from("disabled"),
+                    SharedString::from("Disabled"),
+                ),
+                (
+                    SharedString::from("official"),
+                    SharedString::from("Official"),
+                ),
+                (SharedString::from("custom"), SharedString::from("Custom")),
+            ],
+            |settings| {
+                SharedString::from(indexed_artifact_source_mode_value(
+                    settings.indexed_artifacts.source_mode,
+                ))
+            },
+            |settings, value| apply_indexed_artifact_source_mode(settings, value.as_ref()),
+        );
+        let indexed_publisher = Self::shared_string_field(
+            "indexed-artifact-publisher-public-key",
+            editor.clone(),
+            |settings| {
+                settings
+                    .indexed_artifacts
+                    .publisher_pubkey
+                    .clone()
+                    .unwrap_or_default()
+            },
+            |settings, value| {
+                settings.indexed_artifacts.publisher_pubkey = non_empty_setting(&value);
+            },
+        );
+        let indexed_ipns = Self::shared_string_field(
+            "indexed-artifact-ipns-name",
+            editor.clone(),
+            |settings| match settings.indexed_artifacts.manifest_source.as_ref() {
+                Some(IndexedArtifactManifestSourceSetting::IpnsName(name)) => name.clone(),
+                _ => String::new(),
+            },
+            |settings, value| {
+                settings.indexed_artifacts.manifest_source = Some(
+                    IndexedArtifactManifestSourceSetting::IpnsName(value.trim().to_string()),
+                );
+            },
+        );
+        let indexed_concurrency_options = NumberFieldOptions {
+            min: 1.0,
+            max: 32.0,
+            step: 1.0,
+        };
+        let indexed_byte_budget_options = NumberFieldOptions {
+            min: 1.0,
+            max: f64::from(1024 * 1024 * 1024),
+            step: f64::from(1024 * 1024),
+        };
+        let indexed_concurrency = Self::number_field(
+            "indexed-artifact-concurrency",
+            editor.clone(),
+            indexed_concurrency_options,
+            |settings| {
+                settings
+                    .indexed_artifacts
+                    .concurrency
+                    .unwrap_or(wallet_ops::settings::DEFAULT_INDEXED_ARTIFACT_CONCURRENCY)
+                    as f64
+            },
+            |settings, value| settings.indexed_artifacts.concurrency = Some(value as usize),
+        );
+        let indexed_byte_budget = Self::number_field(
+            "indexed-artifact-byte-budget",
+            editor.clone(),
+            indexed_byte_budget_options,
+            |settings| {
+                settings
+                    .indexed_artifacts
+                    .max_in_flight_bytes
+                    .unwrap_or(wallet_ops::settings::DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES)
+                    as f64
+            },
+            |settings, value| settings.indexed_artifacts.max_in_flight_bytes = Some(value as u64),
+        );
+        let indexed_reset_editor = editor.clone();
         let waku_number_options = NumberFieldOptions {
             min: 0.0,
             max: f64::from(u32::MAX),
@@ -166,6 +250,44 @@ impl Render for WalletSettingsEditor {
             chain_group = chain_group.item(Self::chain_enabled_item(editor.clone(), chain_id));
         }
 
+        let indexed_gateway_kind = SettingsUrlListKind::IndexedArtifactGateway;
+        let indexed_gateway_endpoints = indexed_gateway_kind.endpoints(&self.draft);
+        let indexed_gateway_editor = editor.clone();
+        let indexed_artifact_status = indexed_artifact_source_status_message(&self.draft);
+        let indexed_artifact_group = settings_group()
+            .item(settings_section_header("Indexed artifacts"))
+            .item(SettingItem::render(move |_options, _window, _cx| {
+                settings_info_banner(indexed_artifact_status)
+            }))
+            .item(
+                SettingItem::new("Indexed artifact source", indexed_source_mode)
+                    .description("Controls chain-indexed data artifacts for wallet catch-up, public TXID cache, and Merkle quick-sync. Squid quick-sync endpoints stay configurable as fallback."),
+            )
+            .item(SettingItem::new("Publisher public key", indexed_publisher).layout(Axis::Vertical))
+            .item(SettingItem::new("IPNS name", indexed_ipns).layout(Axis::Vertical))
+            .item(SettingItem::new("Chunk concurrency", indexed_concurrency))
+            .item(SettingItem::new("In-flight byte budget", indexed_byte_budget))
+            .item(SettingItem::new(
+                "Reset official indexed artifacts",
+                SettingField::<SharedString>::render(move |_options, _window, _cx| {
+                    let reset_editor = indexed_reset_editor.clone();
+                    app_button("wallet-settings-indexed-artifact-official-preset", "Reset to official")
+                        .on_click(move |_event, _window, cx| {
+                            reset_editor.update(cx, |editor, cx| {
+                                editor.draft.indexed_artifacts =
+                                    IndexedArtifactSettings::official_preset();
+                                editor.programmatic_draft_changed(cx);
+                            });
+                        })
+                }),
+            ))
+            .item(Self::settings_url_list_item(
+                "Indexed artifact gateway URLs",
+                indexed_gateway_editor,
+                indexed_gateway_kind,
+                indexed_gateway_endpoints,
+            ));
+
         let poi_gateway_kind = SettingsUrlListKind::PoiGateway;
         let poi_gateway_endpoints = poi_gateway_kind.endpoints(&self.draft);
         let poi_gateway_editor = editor.clone();
@@ -178,7 +300,9 @@ impl Render for WalletSettingsEditor {
                 poi_gateway_endpoints,
             ));
 
-        let mut chains_page = SettingPage::new("Chains").group(chain_group);
+        let mut chains_page = SettingPage::new("Chains")
+            .group(indexed_artifact_group)
+            .group(chain_group);
         for chain_id in railgun_ui::DEFAULT_CHAINS {
             let chain_id = *chain_id;
             let label =

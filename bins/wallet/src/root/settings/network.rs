@@ -286,6 +286,74 @@ pub(in crate::root) fn remove_poi_gateway_url(settings: &mut WalletSettings, ind
     }
 }
 
+pub(in crate::root) fn set_indexed_artifact_gateway_url(
+    settings: &mut WalletSettings,
+    index: usize,
+    value: &str,
+) {
+    if let Some(gateway) = settings.indexed_artifacts.gateway_urls.get_mut(index) {
+        *gateway = value.trim().to_string();
+    }
+}
+
+pub(in crate::root) fn add_indexed_artifact_gateway_url(
+    settings: &mut WalletSettings,
+    value: &str,
+) {
+    settings
+        .indexed_artifacts
+        .gateway_urls
+        .push(value.trim().to_string());
+}
+
+pub(in crate::root) fn remove_indexed_artifact_gateway_url(
+    settings: &mut WalletSettings,
+    index: usize,
+) {
+    if index < settings.indexed_artifacts.gateway_urls.len() {
+        settings.indexed_artifacts.gateway_urls.remove(index);
+    }
+}
+
+pub(in crate::root) const fn indexed_artifact_source_mode_value(
+    mode: IndexedArtifactSourceModeSetting,
+) -> &'static str {
+    match mode {
+        IndexedArtifactSourceModeSetting::Disabled => "disabled",
+        IndexedArtifactSourceModeSetting::Official => "official",
+        IndexedArtifactSourceModeSetting::Custom => "custom",
+    }
+}
+
+pub(in crate::root) fn apply_indexed_artifact_source_mode(
+    settings: &mut WalletSettings,
+    value: &str,
+) {
+    match value {
+        "official" => settings.indexed_artifacts = IndexedArtifactSettings::official_preset(),
+        "custom" => {
+            settings.indexed_artifacts.source_mode = IndexedArtifactSourceModeSetting::Custom;
+        }
+        _ => settings.indexed_artifacts = IndexedArtifactSettings::disabled_preset(),
+    }
+}
+
+pub(in crate::root) const fn indexed_artifact_source_status_message(
+    settings: &WalletSettings,
+) -> &'static str {
+    match settings.indexed_artifacts.source_mode {
+        IndexedArtifactSourceModeSetting::Disabled => {
+            "Indexed artifacts are disabled. Squid quick-sync remains the indexed-data fallback, with RPC/archive RPC used when indexed sources are unavailable."
+        }
+        IndexedArtifactSourceModeSetting::Official => {
+            "Official indexed artifacts are preferred for indexed data. Squid quick-sync and RPC/archive RPC remain available as fallback paths."
+        }
+        IndexedArtifactSourceModeSetting::Custom => {
+            "Custom indexed artifacts are preferred for indexed data. Squid quick-sync and RPC/archive RPC remain available as fallback paths."
+        }
+    }
+}
+
 pub(in crate::root) const fn network_mode_value(mode: NetworkModeSetting) -> &'static str {
     match mode {
         NetworkModeSetting::Tor => "tor",

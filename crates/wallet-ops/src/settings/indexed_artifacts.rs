@@ -197,8 +197,10 @@ impl IndexedArtifactManifestSourceSetting {
             Self::Url(url) => IndexedArtifactManifestSource::Url(
                 Url::parse(url).expect("validated indexed artifact manifest URL"),
             ),
-            Self::Cid(cid) => IndexedArtifactManifestSource::Cid(cid.clone()),
-            Self::IpnsName(name) => IndexedArtifactManifestSource::IpnsName(name.clone()),
+            Self::Cid(cid) => IndexedArtifactManifestSource::Cid(cid.trim().to_string()),
+            Self::IpnsName(name) => {
+                IndexedArtifactManifestSource::IpnsName(name.trim().to_string())
+            }
         }
     }
 }

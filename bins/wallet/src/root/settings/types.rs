@@ -128,6 +128,7 @@ pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables emb
 #[derive(Clone)]
 pub(in crate::root) enum SettingsUrlListKind {
     ChainRpc { chain_id: u64, chain_label: String },
+    IndexedArtifactGateway,
     PoiGateway,
     WakuDnsEnrTree,
     WakuDohFallback,
@@ -137,6 +138,7 @@ impl SettingsUrlListKind {
     pub(in crate::root) const fn empty_text(&self) -> &'static str {
         match self {
             Self::ChainRpc { .. } => "No RPC endpoints configured.",
+            Self::IndexedArtifactGateway => "No indexed artifact gateways configured.",
             Self::PoiGateway => "No artifact gateways configured.",
             Self::WakuDnsEnrTree => "No DNS ENR trees configured. DNS bootstrap is disabled.",
             Self::WakuDohFallback => "No DoH fallback endpoints configured.",
@@ -146,6 +148,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) const fn dialog_help(&self) -> &'static str {
         match self {
             Self::ChainRpc { .. } => "Enter an HTTP(S) RPC endpoint for this chain.",
+            Self::IndexedArtifactGateway => {
+                "Enter an HTTP(S) gateway URL for chain-indexed artifact reads."
+            }
             Self::PoiGateway => "Enter an HTTP(S) gateway URL for indexed POI artifact reads.",
             Self::WakuDnsEnrTree => "Enter an enrtree:// DNS discovery tree URL.",
             Self::WakuDohFallback => "Enter an HTTP(S) DNS-over-HTTPS fallback endpoint.",
@@ -155,6 +160,9 @@ impl SettingsUrlListKind {
     pub(in crate::root) fn add_id(&self) -> SharedString {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => format!("wallet-settings-rpc-add-{chain_id}"),
+            Self::IndexedArtifactGateway => {
+                "wallet-settings-indexed-artifact-gateway-add".to_string()
+            }
             Self::PoiGateway => "wallet-settings-poi-gateway-add".to_string(),
             Self::WakuDnsEnrTree => "wallet-settings-waku-dns-enr-tree-add".to_string(),
             Self::WakuDohFallback => "wallet-settings-waku-doh-fallback-add".to_string(),
@@ -165,6 +173,9 @@ impl SettingsUrlListKind {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => {
                 format!("wallet-settings-rpc-row-{chain_id}-{index}")
+            }
+            Self::IndexedArtifactGateway => {
+                format!("wallet-settings-indexed-artifact-gateway-row-{index}")
             }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-row-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-row-{index}"),
@@ -177,6 +188,9 @@ impl SettingsUrlListKind {
             Self::ChainRpc { chain_id, .. } => {
                 format!("wallet-settings-rpc-edit-{chain_id}-{index}")
             }
+            Self::IndexedArtifactGateway => {
+                format!("wallet-settings-indexed-artifact-gateway-edit-{index}")
+            }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-edit-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-edit-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-edit-{index}"),
@@ -187,6 +201,9 @@ impl SettingsUrlListKind {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => {
                 format!("wallet-settings-rpc-remove-{chain_id}-{index}")
+            }
+            Self::IndexedArtifactGateway => {
+                format!("wallet-settings-indexed-artifact-gateway-remove-{index}")
             }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-remove-{index}"),
             Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-remove-{index}"),
@@ -201,6 +218,13 @@ impl SettingsUrlListKind {
                     format!("Edit {chain_label} RPC")
                 } else {
                     format!("Add {chain_label} RPC")
+                }
+            }
+            Self::IndexedArtifactGateway => {
+                if is_edit {
+                    "Edit indexed artifact gateway".to_string()
+                } else {
+                    "Add indexed artifact gateway".to_string()
                 }
             }
             Self::PoiGateway => {
@@ -230,6 +254,7 @@ impl SettingsUrlListKind {
     pub(in crate::root) fn endpoints(&self, settings: &WalletSettings) -> Vec<String> {
         match self {
             Self::ChainRpc { chain_id, .. } => display_chain_rpc_endpoints(settings, *chain_id),
+            Self::IndexedArtifactGateway => settings.indexed_artifacts.gateway_urls.clone(),
             Self::PoiGateway => settings.poi.artifact.gateway_urls.clone(),
             Self::WakuDnsEnrTree => display_waku_dns_enr_trees(settings),
             Self::WakuDohFallback => display_waku_doh_fallback_endpoints(settings),
@@ -246,6 +271,9 @@ impl SettingsUrlListKind {
             Self::ChainRpc { chain_id, .. } => {
                 set_chain_rpc_endpoint(settings, *chain_id, index, value);
             }
+            Self::IndexedArtifactGateway => {
+                set_indexed_artifact_gateway_url(settings, index, value);
+            }
             Self::PoiGateway => set_poi_gateway_url(settings, index, value),
             Self::WakuDnsEnrTree => set_waku_dns_enr_tree(settings, index, value),
             Self::WakuDohFallback => set_waku_doh_fallback_endpoint(settings, index, value),
@@ -255,6 +283,7 @@ impl SettingsUrlListKind {
     pub(in crate::root) fn add_endpoint(&self, settings: &mut WalletSettings, value: &str) {
         match self {
             Self::ChainRpc { chain_id, .. } => add_chain_rpc_endpoint(settings, *chain_id, value),
+            Self::IndexedArtifactGateway => add_indexed_artifact_gateway_url(settings, value),
             Self::PoiGateway => add_poi_gateway_url(settings, value),
             Self::WakuDnsEnrTree => add_waku_dns_enr_tree(settings, value),
             Self::WakuDohFallback => add_waku_doh_fallback_endpoint(settings, value),
@@ -266,6 +295,7 @@ impl SettingsUrlListKind {
             Self::ChainRpc { chain_id, .. } => {
                 remove_chain_rpc_endpoint(settings, *chain_id, index);
             }
+            Self::IndexedArtifactGateway => remove_indexed_artifact_gateway_url(settings, index),
             Self::PoiGateway => remove_poi_gateway_url(settings, index),
             Self::WakuDnsEnrTree => remove_waku_dns_enr_tree(settings, index),
             Self::WakuDohFallback => remove_waku_doh_fallback_endpoint(settings, index),

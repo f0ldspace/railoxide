@@ -28,6 +28,7 @@ pub(in crate::root) fn classify_settings_apply_mode(
     }
     if draft.network != saved.network
         || draft.chains != saved.chains
+        || draft.indexed_artifacts != saved.indexed_artifacts
         || draft.poi != saved.poi
         || draft.waku != saved.waku
     {
