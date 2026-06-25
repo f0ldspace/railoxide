@@ -2053,6 +2053,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
+name = "beef"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2399,7 +2405,7 @@ dependencies = [
 [[package]]
 name = "broadcaster-core"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -7430,7 +7436,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "local-db"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -7457,6 +7463,72 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 dependencies = [
  "serde_core",
  "value-bag",
+]
+
+[[package]]
+name = "logos"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff472f899b4ec2d99161c51f60ff7075eeb3097069a36050d8037a6325eb8154"
+dependencies = [
+ "logos-derive 0.15.1",
+]
+
+[[package]]
+name = "logos"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb2c55a318a87600ea870ff8c2012148b44bf18b74fad48d0f835c38c7d07c5f"
+dependencies = [
+ "logos-derive 0.16.1",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "192a3a2b90b0c05b27a0b2c43eecdb7c415e29243acc3f89cc8247a5b693045c"
+dependencies = [
+ "beef",
+ "fnv",
+ "lazy_static",
+ "proc-macro2",
+ "quote",
+ "regex-syntax",
+ "rustc_version 0.4.1",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58b3ffaa284e1350d017a57d04ada118c4583cf260c8fb01e0fe28a2e9cf8970"
+dependencies = [
+ "fnv",
+ "proc-macro2",
+ "quote",
+ "regex-automata",
+ "regex-syntax",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "605d9697bcd5ef3a42d38efc51541aa3d6a4a25f7ab6d1ed0da5ac632a26b470"
+dependencies = [
+ "logos-codegen 0.15.1",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d3a9855747c17eaf4383823f135220716ab49bea5fbea7dd42cc9a92f8aa31"
+dependencies = [
+ "logos-codegen 0.16.1",
 ]
 
 [[package]]
@@ -7723,7 +7795,7 @@ dependencies = [
 [[package]]
 name = "merkletree"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -7764,6 +7836,28 @@ dependencies = [
  "log",
  "objc",
  "paste",
+]
+
+[[package]]
+name = "miette"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
+dependencies = [
+ "cfg-if",
+ "miette-derive",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "miette-derive"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db5b29714e950dbb20d5e6f74f9dcec4edbcc1067bb7f8ed198c097b8c1a818b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -9099,7 +9193,7 @@ dependencies = [
 [[package]]
 name = "poi"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -9422,6 +9516,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-reflect"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "590aa145fee8f7a26b5a6055365e7c5e89a5c1caae9869de76ec0ee73181a2f9"
+dependencies = [
+ "logos 0.16.1",
+ "miette",
+ "prost",
+ "prost-types",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9448,6 +9554,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "protox"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f25a07a73c6717f0b9bbbd685918f5df9815f7efba450b83d9c9dea41f0e3a1"
+dependencies = [
+ "bytes",
+ "miette",
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "protox-parse",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "protox-parse"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "072eee358134396a4643dff81cfff1c255c9fbd3fb296be14bdb6a26f9156366"
+dependencies = [
+ "logos 0.15.1",
+ "miette",
+ "prost-types",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -9503,7 +9636,7 @@ dependencies = [
 [[package]]
 name = "public-broadcaster-protocol"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -9685,7 +9818,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "railgun-indexed-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy-primitives",
  "ed25519-dalek",
@@ -9706,7 +9839,7 @@ dependencies = [
 [[package]]
 name = "railgun-wallet"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -12084,7 +12217,7 @@ dependencies = [
 [[package]]
 name = "sync-service"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "alloy-provider",
@@ -14346,7 +14479,7 @@ checksum = "317211a0dc0ceedd78fb2ca9a44aed3d7b9b26f81870d485c07122b4350673b7"
 [[package]]
 name = "waku"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "ahash",
  "alloy-rlp",
@@ -14366,6 +14499,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "prost-build",
+ "protox",
  "rand 0.10.1",
  "regex",
  "reqwest",
@@ -14382,7 +14516,7 @@ dependencies = [
 [[package]]
 name = "waku-relay"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=104c898d70d6af56b16e47fa8c32cda6f5eaaa9a#104c898d70d6af56b16e47fa8c32cda6f5eaaa9a"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=ab195593a7719b7c158e6e2d7f0f74d7cba00978#ab195593a7719b7c158e6e2d7f0f74d7cba00978"
 dependencies = [
  "alloy",
  "base64 0.22.1",

@@ -123,8 +123,7 @@ function Refresh-Path {
     $extraPaths = @(
         "C:\Program Files\LLVM\bin",
         "C:\Program Files\Git\cmd",
-        "C:\Program Files\CMake\bin",
-        "C:\Program Files\protobuf\bin"
+        "C:\Program Files\CMake\bin"
     )
     $env:Path = (@($machinePath, $userPath) + $extraPaths | Where-Object { $_ }) -join ";"
 }
@@ -184,7 +183,6 @@ function Ensure-Dependencies {
     if (-not (Test-Command "git")) { $missing.Add("Git") }
     if (-not (Test-Command "rustup")) { $missing.Add("Rustup") }
     if (-not (Test-Command "cmake")) { $missing.Add("CMake") }
-    if (-not (Test-Command "protoc")) { $missing.Add("Protobuf") }
     if (-not (Test-Command "clang")) { $missing.Add("LLVM") }
     if (-not (Get-VsDevCmdPath)) { $missing.Add("Visual Studio Build Tools") }
 
@@ -213,9 +211,6 @@ function Ensure-Dependencies {
     if ($missing -contains "CMake") {
         Install-WingetPackage "Kitware.CMake" "CMake"
     }
-    if ($missing -contains "Protobuf") {
-        Install-WingetPackage "Google.Protobuf" "Protobuf"
-    }
     if ($missing -contains "LLVM") {
         Install-WingetPackage "LLVM.LLVM" "LLVM"
     }
@@ -229,7 +224,7 @@ function Ensure-Dependencies {
 
 function Ensure-RequiredTools {
     Refresh-Path
-    foreach ($tool in @("git", "rustup", "cmake", "protoc", "clang")) {
+    foreach ($tool in @("git", "rustup", "cmake", "clang")) {
         if (-not (Test-Command $tool)) {
             Stop-Install "$tool is required; install it or rerun without -NoDeps"
         }

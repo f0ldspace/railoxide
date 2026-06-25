@@ -1,6 +1,6 @@
 This guide builds the RailOxide desktop wallet binary from source on macOS with Ledger and Trezor support enabled.
 
-The commands below were verified on macOS 26.5.1 on Apple Silicon with Xcode Command Line Tools 26.5, Rust 1.91.0, and `protoc` 35.0.
+The commands below were verified on macOS 26.5.1 on Apple Silicon with Xcode Command Line Tools 26.5 and Rust 1.91.0.
 
 ## Install Command Line Tools
 
@@ -33,31 +33,6 @@ cargo --version
 ```
 
 Both version commands should report `1.91.0` or higher.
-
-## Install Protoc
-
-RailOxide's Waku dependency generates Rust code from protobuf files during the build, so `protoc` must be available.
-
-With Homebrew:
-
-```bash
-brew install protobuf
-protoc --version
-```
-
-Without Homebrew, install the official Apple Silicon binary in your home directory:
-
-```bash
-mkdir -p "$HOME/.local/protoc-35.0"
-curl -L \
-  "https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-osx-aarch_64.zip" \
-  -o "$HOME/.local/protoc-35.0/protoc.zip"
-ditto -x -k "$HOME/.local/protoc-35.0/protoc.zip" "$HOME/.local/protoc-35.0"
-export PATH="$HOME/.local/protoc-35.0/bin:$PATH"
-protoc --version
-```
-
-Intel Macs can use `protoc-35.0-osx-x86_64.zip` instead.
 
 ## Clone The Repository
 
@@ -173,12 +148,6 @@ If `cargo` is not found after installing Rust, load rustup's environment:
 
 ```bash
 . "$HOME/.cargo/env"
-```
-
-If the build cannot find `protoc`, install protobuf with Homebrew or put the local protobuf `bin` directory on `PATH`:
-
-```bash
-export PATH="$HOME/.local/protoc-35.0/bin:$PATH"
 ```
 
 If the build fails because `metal` or `metallib` is missing, build with `--features hardware,gpui/runtime_shaders` or install full Xcode and select it as the active developer directory.

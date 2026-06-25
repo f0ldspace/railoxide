@@ -18,7 +18,6 @@ sudo apt-get install -y \
   lld \
   llvm \
   pkg-config \
-  protobuf-compiler \
   libasound2-dev \
   libfontconfig-dev \
   libglib2.0-dev \
@@ -37,7 +36,7 @@ sudo apt-get install -y \
   xdg-desktop-portal
 ```
 
-These packages cover the Rust native build chain, `protoc`, OpenSSL, GPUI's Linux desktop dependencies, and the USB libraries used by hardware-wallet support.
+These packages cover the Rust native build chain, OpenSSL, GPUI's Linux desktop dependencies, and the USB libraries used by hardware-wallet support.
 
 ## Install Rust 1.91
 
@@ -154,8 +153,6 @@ If `cargo` is not found after installing Rust, load rustup's environment:
 ```bash
 . "$HOME/.cargo/env"
 ```
-
-If the build cannot find `protoc`, install `protobuf-compiler`.
 
 If `openssl-sys` fails, install `pkg-config` and `libssl-dev`.
 

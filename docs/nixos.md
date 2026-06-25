@@ -61,7 +61,7 @@ The flake provides a development shell with the Rust toolchain and all build dep
 nix develop
 ```
 
-This drops you into a shell with `rustc`, `cargo`, `protoc`, `clang`, and all required system libraries. You can then build from source as usual:
+This drops you into a shell with `rustc`, `cargo`, `clang`, and all required system libraries. You can then build from source as usual:
 
 ```bash
 cargo build --release -p wallet

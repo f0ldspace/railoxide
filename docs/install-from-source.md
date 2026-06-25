@@ -48,7 +48,7 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 
 ## macOS
 
-The installer checks for Apple Command Line Tools, `protoc`, Rust, and Git.
+The installer checks for Apple Command Line Tools, Rust, and Git.
 
 If full Xcode and the Metal tools are available, the installer builds with build-time Metal shader compilation. If full Xcode is installed but the Metal tools are missing, it asks before running:
 
@@ -93,7 +93,7 @@ It also installs a desktop entry and icon under `~/.local/share`.
 
 ## Windows
 
-The Windows installer uses `winget` to install missing dependencies from [`build-wallet-windows.md`](build-wallet-windows.md), including Git, Rustup, CMake, Protobuf, LLVM, and Visual Studio Build Tools.
+The Windows installer uses `winget` to install missing dependencies from [`build-wallet-windows.md`](build-wallet-windows.md), including Git, Rustup, CMake, LLVM, and Visual Studio Build Tools.
 
 It builds the x64 MSVC target:
 

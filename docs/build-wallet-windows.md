@@ -10,7 +10,6 @@ Run the dependency installation commands from PowerShell. Visual Studio Build To
 winget install --id Git.Git --exact --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
 winget install --id Rustlang.Rustup --exact --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
 winget install --id Kitware.CMake --exact --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
-winget install --id Google.Protobuf --exact --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
 winget install --id LLVM.LLVM --exact --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
 winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --source winget --silent --accept-source-agreements --accept-package-agreements --disable-interactivity --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.26100 --add Microsoft.VisualStudio.Component.VC.CMake.Project --add Microsoft.VisualStudio.Component.VC.Redist.14.Latest"
 ```
@@ -22,7 +21,6 @@ $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [En
 git --version
 rustup --version
 cmake --version
-protoc --version
 clang --version
 ```
 
@@ -124,7 +122,7 @@ Current hardware-wallet support is hardware-derived software custody. The device
 
 ## Troubleshooting
 
-If `cargo`, `protoc`, `cmake`, or `clang` is not found after installing tools, refresh `PATH` in the current shell:
+If `cargo`, `cmake`, or `clang` is not found after installing tools, refresh `PATH` in the current shell:
 
 ```powershell
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\Program Files\LLVM\bin"

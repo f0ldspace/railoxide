@@ -63,7 +63,6 @@
 
         nativeBuildInputs = with pkgs; [
           pkg-config
-          protobuf
           cmake
           clang
           libclang.lib
@@ -123,7 +122,6 @@
           packages = [
             rustToolchain
             pkgs.pkg-config
-            pkgs.protobuf
             pkgs.cmake
             pkgs.clang
             pkgs.libclang.lib

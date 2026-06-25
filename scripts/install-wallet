@@ -5,7 +5,6 @@ repo_url="https://github.com/triamazikamno/railoxide.git"
 repo_api_url="https://api.github.com/repos/triamazikamno/railoxide"
 branch="main"
 toolchain="1.91.0"
-protobuf_version="35.0"
 
 prefix="$HOME/.local"
 source_dir="$HOME/.local/src/railoxide"
@@ -332,46 +331,6 @@ ensure_macos_command_line_tools() {
   die "Apple Command Line Tools are required to build RailOxide"
 }
 
-install_macos_protoc() {
-  local arch archive_arch url protoc_root zip_path
-  arch="$(uname -m)"
-  case "$arch" in
-    arm64) archive_arch="osx-aarch_64" ;;
-    x86_64) archive_arch="osx-x86_64" ;;
-    *) die "unsupported macOS architecture for protoc: $arch" ;;
-  esac
-
-  protoc_root="$prefix/protoc-$protobuf_version"
-  zip_path="$protoc_root/protoc.zip"
-  url="https://github.com/protocolbuffers/protobuf/releases/download/v$protobuf_version/protoc-$protobuf_version-$archive_arch.zip"
-
-  log "installing protoc $protobuf_version under $protoc_root"
-  run mkdir -p "$protoc_root"
-  run curl -fL "$url" -o "$zip_path"
-  run ditto -x -k "$zip_path" "$protoc_root"
-  export PATH="$protoc_root/bin:$PATH"
-}
-
-ensure_macos_protoc() {
-  if command_exists protoc; then
-    return
-  fi
-
-  local protoc_root="$prefix/protoc-$protobuf_version"
-  if [[ -x "$protoc_root/bin/protoc" ]]; then
-    export PATH="$protoc_root/bin:$PATH"
-    return
-  fi
-
-  [[ "$install_deps" -eq 1 ]] || die 'protoc is missing and --no-deps was provided'
-
-  if confirm "Download protoc $protobuf_version into $protoc_root?"; then
-    install_macos_protoc
-  else
-    die 'protoc is required to build RailOxide'
-  fi
-}
-
 full_xcode_developer_dir() {
   if [[ -n "${DEVELOPER_DIR:-}" && -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
     printf '%s\n' "$DEVELOPER_DIR"
@@ -494,7 +453,6 @@ ensure_linux_packages() {
     lld
     llvm
     pkg-config
-    protobuf-compiler
     libasound2-dev
     libfontconfig-dev
     libglib2.0-dev
@@ -794,7 +752,6 @@ main() {
     ensure_macos_command_line_tools
     ensure_common_tools
     choose_source_ref
-    ensure_macos_protoc
     ensure_rust
     ensure_source_checkout
     log "building source commit $(current_source_commit)"
