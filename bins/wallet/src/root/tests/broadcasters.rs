@@ -461,6 +461,29 @@ fn random_submission_selection_uses_estimated_broadcaster() {
 }
 
 #[test]
+fn picker_estimated_fee_uses_exact_estimate_fee_for_matching_broadcaster() {
+    let token = Address::from([0x65; 20]);
+    let policy = BroadcasterFeePolicy::default();
+    let candidates = public_broadcaster_candidates_for_asset(
+        &[fee_row(1, token, "estimated")],
+        1,
+        token,
+        None,
+        policy,
+        None,
+    )
+    .expect("candidates");
+    let candidate = candidates[0].clone();
+    let mut estimate = public_broadcaster_cost_estimate(candidate.clone());
+    estimate.fee_amount = uint!(12345_U256);
+
+    assert_eq!(
+        broadcaster_candidate_estimated_fee_amount_for_estimate(&candidate, &estimate),
+        Some(estimate.fee_amount)
+    );
+}
+
+#[test]
 fn random_submission_selection_remains_random_without_estimate() {
     assert_eq!(
         WalletRoot::public_broadcaster_submission_selection(&BroadcasterChoice::Random, None),

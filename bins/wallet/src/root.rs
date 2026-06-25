@@ -127,7 +127,8 @@ use wallet_header::{ChainSelectItem, WalletSelectItem};
 
 #[cfg(test)]
 use broadcaster_picker::{
-    BroadcasterChoice, broadcaster_choice_supported_by_candidates,
+    BroadcasterChoice, broadcaster_candidate_estimated_fee_amount_for_estimate,
+    broadcaster_choice_supported_by_candidates,
     should_preserve_estimate_after_broadcaster_policy_change,
 };
 #[cfg(test)]

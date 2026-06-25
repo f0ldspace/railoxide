@@ -1098,7 +1098,8 @@ pub(crate) fn broadcaster_fee_covers(available_fee: U256, required_fee: U256) ->
     available_fee >= required_fee
 }
 
-pub(crate) fn buffered_public_broadcaster_fee(required_fee: U256) -> U256 {
+#[must_use]
+pub fn buffered_public_broadcaster_fee(required_fee: U256) -> U256 {
     let buffer = required_fee / PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR;
     required_fee
         + if buffer.is_zero() {
