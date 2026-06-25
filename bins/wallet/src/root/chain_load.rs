@@ -389,6 +389,13 @@ impl WalletRoot {
         force: bool,
         cx: &mut Context<'_, Self>,
     ) {
+        let Some(view_session) = self.view_session.clone() else {
+            tracing::debug!(
+                chain_id,
+                "skipping wallet sync without active wallet session"
+            );
+            return;
+        };
         if matches!(
             self.chain_states.get(&chain_id),
             Some(
@@ -425,18 +432,6 @@ impl WalletRoot {
             .insert(chain_id, ChainUtxoState::Loading { progress: None });
         self.sync_utxo_table(cx);
 
-        let Some(view_session) = self.view_session.clone() else {
-            self.chain_states.insert(
-                chain_id,
-                ChainUtxoState::Error {
-                    message: Arc::from("wallet vault is locked"),
-                    start_block: previous_start_block,
-                },
-            );
-            self.sync_utxo_table(cx);
-            cx.notify();
-            return;
-        };
         let active_wallet_id: Arc<str> = Arc::from(view_session.wallet_id().to_owned());
         let active_wallet_generation = self.active_wallet_generation;
         let (progress_tx, mut progress_rx) = watch::channel(None);
@@ -757,6 +752,8 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
+        self.ui_state.last_chain_id = Some(chain_id);
+        self.save_ui_state();
         self.sync_broadcaster_monitor_chain_filter(chain_id, window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -776,7 +773,9 @@ impl WalletRoot {
         ) {
             self.focus_utxo_table_on_render = true;
         }
-        self.ensure_chain_load(chain_id, cx);
+        if self.view_session.is_some() {
+            self.ensure_chain_load(chain_id, cx);
+        }
         cx.notify();
     }
 

@@ -701,6 +701,9 @@ impl WalletRoot {
         root: &Entity<Self>,
         window: &Window,
     ) -> impl IntoElement {
+        if self.view_session.is_none() {
+            return centered_message("Choose a wallet to view activity");
+        }
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Error { message, .. }) => {
                 self.render_chain_error_body(root, message.as_ref())

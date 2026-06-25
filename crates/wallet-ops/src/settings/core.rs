@@ -6,6 +6,8 @@ use super::{
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 1;
+pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
+pub const WALLET_UI_STATE_VERSION: u32 = 1;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
 pub const OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
@@ -43,6 +45,18 @@ pub enum WalletSettingsError {
     Validation(#[from] WalletSettingsValidationError),
 }
 
+#[derive(Debug, Error)]
+pub enum WalletUiStateError {
+    #[error(transparent)]
+    Db(#[from] local_db::DbError),
+    #[error("encode wallet UI state: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("decode wallet UI state: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
+    #[error("unsupported wallet UI state version {version}")]
+    UnsupportedVersion { version: u32 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletSettingsValidationError {
     pub messages: Vec<String>,
@@ -77,6 +91,24 @@ pub struct WalletSettings {
     pub runtime: RuntimeSettings,
     pub waku: WakuSettings,
     pub walletconnect: WalletConnectSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalletUiState {
+    pub version: u32,
+    pub last_wallet_id: Option<String>,
+    pub last_chain_id: Option<u64>,
+}
+
+impl Default for WalletUiState {
+    fn default() -> Self {
+        Self {
+            version: WALLET_UI_STATE_VERSION,
+            last_wallet_id: None,
+            last_chain_id: None,
+        }
+    }
 }
 
 impl Default for WalletSettings {

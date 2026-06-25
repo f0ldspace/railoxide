@@ -112,6 +112,11 @@ impl WalletRoot {
             cx.notify();
             return false;
         }
+        if self.view_session.is_none() {
+            self.repair_cache_error = Some(Arc::from("Choose a wallet before repairing the cache"));
+            cx.notify();
+            return false;
+        }
 
         let raw_block = self.repair_cache_block_input.read(cx).value();
         let rewind_from = match parse_repair_cache_block(raw_block.as_ref()) {
@@ -219,7 +224,7 @@ impl WalletRoot {
         let disabled = matches!(
             self.chain_states.get(&self.selected_chain),
             Some(state) if state.is_syncing()
-        );
+        ) || self.view_session.is_none();
         let add_root = root.clone();
         let manage_root = root.clone();
         let export_root = root.clone();

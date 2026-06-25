@@ -17,6 +17,16 @@ pub(in crate::root) fn wallet_options_from_metadata(
         .collect()
 }
 
+pub(in crate::root) fn remembered_wallet_option<'a>(
+    wallet_options: &'a [WalletOption],
+    remembered_wallet_id: Option<&str>,
+) -> Option<&'a WalletOption> {
+    let remembered_wallet_id = remembered_wallet_id?;
+    wallet_options
+        .iter()
+        .find(|wallet| wallet.wallet_id.as_ref() == remembered_wallet_id)
+}
+
 pub(in crate::root) const fn hardware_device_wallet_select_value(
     device_kind: HardwareDeviceKind,
 ) -> &'static str {

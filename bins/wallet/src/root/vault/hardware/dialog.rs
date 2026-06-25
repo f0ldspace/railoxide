@@ -80,7 +80,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.next_hardware_profile_action_generation();
-        self.hardware_profile_unlock = HardwareProfileUnlockState::default();
+        dismiss_hardware_profile_unlock_state(&mut self.hardware_profile_unlock);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
         cx.notify();
     }
@@ -542,6 +542,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         window.close_all_dialogs(cx);
+        self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
         self.next_hardware_profile_action_generation();
         self.hardware_profile_unlock
             .reset_for_device(device_kind, wallet_id, purpose);

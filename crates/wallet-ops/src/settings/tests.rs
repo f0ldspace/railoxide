@@ -11,10 +11,11 @@ use super::{
     OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY, OFFICIAL_POI_ARTIFACT_GATEWAYS,
     OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
     PoiArtifactManifestSourceSetting, PoiReadSourceSetting, WALLET_SETTINGS_KEY,
-    WALLET_SETTINGS_VERSION, WakuDirectPeerSetting, WalletSettings, WalletSettingsError,
+    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WakuDirectPeerSetting,
+    WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
     build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
-    encode_wallet_settings, load_wallet_settings, save_wallet_settings,
-    should_show_chain_deployment_metadata_settings,
+    decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
+    save_wallet_settings, save_wallet_ui_state, should_show_chain_deployment_metadata_settings,
 };
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
 use sync_service::ChainConfigDefaults;
@@ -140,6 +141,104 @@ fn settings_roundtrip_through_local_db() {
     save_wallet_settings(&store, &settings).expect("save settings");
     let loaded = load_wallet_settings(&store).expect("load settings");
     assert_eq!(loaded, settings);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn missing_ui_state_defaults_to_empty_without_persisting() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+
+    let state = load_wallet_ui_state(&store).expect("load UI state");
+    assert_eq!(state, WalletUiState::default());
+    assert!(
+        store
+            .get_app_settings_record(WALLET_UI_STATE_KEY)
+            .expect("load raw UI state")
+            .is_none()
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn ui_state_roundtrip_through_local_db() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let state = WalletUiState {
+        version: 0,
+        last_wallet_id: Some("wallet-123".to_owned()),
+        last_chain_id: Some(137),
+    };
+
+    save_wallet_ui_state(&store, &state).expect("save UI state");
+    let loaded = load_wallet_ui_state(&store).expect("load UI state");
+
+    assert_eq!(
+        loaded,
+        WalletUiState {
+            version: WALLET_UI_STATE_VERSION,
+            last_wallet_id: Some("wallet-123".to_owned()),
+            last_chain_id: Some(137),
+        }
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn unsupported_future_ui_state_version_falls_back_to_empty() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let state = WalletUiState {
+        version: WALLET_UI_STATE_VERSION + 1,
+        last_wallet_id: Some("wallet-123".to_owned()),
+        last_chain_id: Some(137),
+    };
+    let data = rmp_serde::to_vec_named(&state).expect("encode future UI state");
+    store
+        .put_app_settings_record(WALLET_UI_STATE_KEY, &data)
+        .expect("store future UI state");
+
+    let err = decode_wallet_ui_state(&data).expect_err("future version rejected");
+    assert!(matches!(
+        err,
+        WalletUiStateError::UnsupportedVersion { version }
+            if version == WALLET_UI_STATE_VERSION + 1
+    ));
+    let loaded = load_wallet_ui_state(&store).expect("load UI state");
+    assert_eq!(loaded, WalletUiState::default());
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn corrupt_ui_state_falls_back_to_empty() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    store
+        .put_app_settings_record(WALLET_UI_STATE_KEY, &[0xc1])
+        .expect("store corrupt UI state");
+
+    let loaded = load_wallet_ui_state(&store).expect("load UI state");
+    assert_eq!(loaded, WalletUiState::default());
 
     drop(store);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

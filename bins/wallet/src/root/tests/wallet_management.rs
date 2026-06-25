@@ -1,6 +1,10 @@
 use super::*;
 use crate::root::manage_wallets::wallet_management_switch_requires_device;
 
+const RESTORE_TEST_PASSWORD: &str = "restore test password";
+const RESTORE_TEST_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
 fn hardware_wallet_metadata(
     wallet_uuid: &str,
     label: &str,
@@ -53,6 +57,74 @@ fn hardware_wallet_metadata(
     wallet
 }
 
+#[cfg(feature = "hardware")]
+fn hardware_account_picker_row(
+    wallet_uuid: &str,
+    label: &str,
+    account_index: u32,
+    supported: bool,
+) -> HardwareAccountPickerRow {
+    let wallet = hardware_wallet_metadata(
+        wallet_uuid,
+        label,
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+        WalletStatus::Active,
+        account_index,
+        account_index,
+        "ledger:evm:0x1111111111111111111111111111111111111111",
+    );
+    HardwareAccountPickerRow {
+        wallet_id: Arc::from(wallet.wallet_uuid),
+        label: Arc::from(label),
+        account_index,
+        account: wallet.hardware_account.expect("hardware account"),
+        supported,
+        active: false,
+    }
+}
+
+fn restore_test_wallet_options(
+    name: &str,
+) -> (PathBuf, DesktopVaultStore, ViewUnlock, Vec<WalletOption>) {
+    let root = temp_wallet_db_root(name);
+    let store = DesktopVaultStore::open(root.clone()).expect("open wallet store");
+    store
+        .create_vault_with_params(
+            RESTORE_TEST_PASSWORD,
+            wallet_ops::vault::KdfParams::new(1024, 1, 1),
+        )
+        .expect("create vault");
+    for (wallet_id, label) in [("wallet-a", "Alpha"), ("wallet-b", "Beta")] {
+        let metadata = store
+            .new_wallet_metadata(
+                RESTORE_TEST_PASSWORD,
+                wallet_id,
+                0,
+                WalletSource::Imported,
+                label,
+            )
+            .expect("wallet metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                RESTORE_TEST_PASSWORD,
+                wallet_id,
+                0,
+                "english",
+                RESTORE_TEST_MNEMONIC,
+                &metadata,
+            )
+            .expect("import wallet");
+    }
+    let view = store
+        .unlock_view(RESTORE_TEST_PASSWORD)
+        .expect("unlock view");
+    let metadata = store
+        .list_wallet_metadata_with_view_unlock(&view, true)
+        .expect("list metadata");
+    let options = wallet_options_from_metadata(metadata);
+    (root, store, view, options)
+}
+
 #[test]
 fn wallet_options_hide_inactive_and_sort_active_metadata() {
     let options = wallet_options_from_metadata(vec![
@@ -83,6 +155,145 @@ fn wallet_options_hide_inactive_and_sort_active_metadata() {
     assert_eq!(options[0].wallet_id.as_ref(), "wallet-a");
     assert_eq!(options[0].source, WalletSource::Generated);
     assert_eq!(options[1].wallet_id.as_ref(), "wallet-b");
+}
+
+#[test]
+fn remembered_wallet_option_resolves_only_active_wallet_options() {
+    let options = wallet_options_from_metadata(vec![
+        wallet_metadata(
+            "wallet-hidden",
+            "Hidden",
+            WalletSource::Imported,
+            WalletStatus::Inactive,
+            0,
+        ),
+        wallet_metadata(
+            "wallet-b",
+            "Beta",
+            WalletSource::Imported,
+            WalletStatus::Active,
+            1,
+        ),
+    ]);
+
+    assert_eq!(
+        remembered_wallet_option(&options, Some("wallet-b"))
+            .expect("remembered active wallet")
+            .wallet_id
+            .as_ref(),
+        "wallet-b"
+    );
+    assert!(remembered_wallet_option(&options, Some("wallet-hidden")).is_none());
+    assert!(remembered_wallet_option(&options, None).is_none());
+}
+
+#[test]
+fn remembered_software_wallet_restore_prefers_remembered_wallet() {
+    let (root, store, view, options) = restore_test_wallet_options("remembered-restore");
+
+    let session = load_preferred_password_unlockable_wallet_session(
+        &store,
+        &view,
+        &options,
+        Some("wallet-b"),
+    )
+    .expect("load preferred wallet")
+    .expect("session");
+
+    assert_eq!(session.wallet_id(), "wallet-b");
+
+    drop(session);
+    drop(store);
+    fs::remove_dir_all(root).expect("remove temp wallet db");
+}
+
+#[test]
+fn missing_remembered_wallet_falls_back_to_first_loadable_wallet() {
+    let (root, store, view, options) = restore_test_wallet_options("remembered-missing");
+
+    let session = load_preferred_password_unlockable_wallet_session(
+        &store,
+        &view,
+        &options,
+        Some("missing-wallet"),
+    )
+    .expect("load fallback wallet")
+    .expect("session");
+
+    assert_eq!(session.wallet_id(), "wallet-a");
+
+    drop(session);
+    drop(store);
+    fs::remove_dir_all(root).expect("remove temp wallet db");
+}
+
+#[test]
+fn no_remembered_wallet_falls_back_to_first_loadable_wallet() {
+    let (root, store, view, options) = restore_test_wallet_options("remembered-none");
+
+    let session = load_preferred_password_unlockable_wallet_session(&store, &view, &options, None)
+        .expect("load fallback wallet")
+        .expect("session");
+
+    assert_eq!(session.wallet_id(), "wallet-a");
+
+    drop(session);
+    drop(store);
+    fs::remove_dir_all(root).expect("remove temp wallet db");
+}
+
+#[cfg(feature = "hardware")]
+#[test]
+fn targeted_hardware_restore_auto_opens_only_remembered_account() {
+    let mut state = HardwareProfileUnlockState::default();
+    state.purpose = HardwareProfileUnlockPurpose::OpenWallet;
+    state.device_kind = Some(wallet_ops::hardware::HardwareDeviceKind::Ledger);
+    state.target_wallet_id = Some(Arc::from("wallet-b"));
+    state.accounts = vec![
+        hardware_account_picker_row("wallet-a", "Alpha", 0, true),
+        hardware_account_picker_row("wallet-b", "Beta", 1, true),
+    ];
+
+    let auto_open = hardware_profile_auto_open_wallet_id(&state)
+        .expect("target should resolve")
+        .expect("target wallet");
+
+    assert_eq!(auto_open.as_ref(), "wallet-b");
+}
+
+#[cfg(feature = "hardware")]
+#[test]
+fn dismissed_hardware_restore_clears_unlock_progress_state() {
+    let mut state = HardwareProfileUnlockState::default();
+    state.purpose = HardwareProfileUnlockPurpose::OpenWallet;
+    state.device_kind = Some(wallet_ops::hardware::HardwareDeviceKind::Ledger);
+    state.target_wallet_id = Some(Arc::from("wallet-b"));
+    state.in_progress = true;
+    state.action_label = Some(Arc::from("Opening account"));
+    state.error = Some(Arc::from("temporary error"));
+    state.accounts = vec![hardware_account_picker_row("wallet-b", "Beta", 1, true)];
+    let step = state
+        .progress_steps
+        .iter_mut()
+        .find(|step| step.step == HardwareProfileStep::UnlockDevice)
+        .expect("unlock-device step");
+    step.status = HardwareProfileStepStatus::Pending;
+    step.message = Some(Arc::from("waiting"));
+
+    dismiss_hardware_profile_unlock_state(&mut state);
+
+    assert!(state.target_wallet_id.is_none());
+    assert!(state.device_kind.is_none());
+    assert!(state.accounts.is_empty());
+    assert!(!state.in_progress);
+    assert!(state.action_label.is_none());
+    assert!(state.error.is_none());
+    assert!(
+        state
+            .progress_steps
+            .iter()
+            .all(|step| step.status == HardwareProfileStepStatus::NotStarted)
+    );
 }
 
 #[test]

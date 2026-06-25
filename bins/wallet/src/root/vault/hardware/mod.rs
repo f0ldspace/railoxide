@@ -57,6 +57,7 @@ pub(in crate::root) use types::{
     HardwareAccountPickerRow, HardwareProfileApprovalPrompt, HardwareProfilePickerView,
     HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus,
     HardwareProfileUnlockPurpose, HardwareProfileUnlockState, TrezorPinMatrixPromptState,
+    dismiss_hardware_profile_unlock_state,
 };
 #[cfg(feature = "hardware")]
 use types::{

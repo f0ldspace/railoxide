@@ -28,7 +28,7 @@ use wallet_ops::{
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletSettings,
         build_effective_chain_configs, build_effective_token_registry, default_waku_direct_peers,
-        load_wallet_settings, save_wallet_settings,
+        load_wallet_settings, load_wallet_ui_state, save_wallet_settings,
     },
     spawn_token_anchor_refresh_worker,
     vault::DesktopVaultStore,
@@ -47,6 +47,8 @@ struct WalletStartupReady {
     waku_worker_shutdown: watch::Sender<bool>,
     vault_store: Arc<DesktopVaultStore>,
     chain_ids: Vec<u64>,
+    initial_chain_id: u64,
+    ui_state: wallet_ops::settings::WalletUiState,
     effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
     effective_token_registry: EffectiveTokenRegistry,
     public_balance_refresh_interval: Duration,
@@ -216,7 +218,7 @@ impl WalletStartupRoot {
             move |chain_id, token| public_broadcaster_anchor_cache.cached_rate(chain_id, token)
         });
         let wallet_monitor_event_rx = event_rx.clone();
-        let initial_chain_id = enabled_chain_ids[0];
+        let initial_chain_id = ready.initial_chain_id;
         let monitor_default_fee_tokens = ready
             .effective_chain_configs
             .values()
@@ -249,6 +251,8 @@ impl WalletStartupRoot {
                 ready.waku_worker_shutdown,
                 ready.vault_store,
                 &enabled_chain_ids,
+                initial_chain_id,
+                ready.ui_state,
                 ready.effective_chain_configs,
                 ready.effective_token_registry,
                 ready.public_balance_refresh_interval,
@@ -675,6 +679,8 @@ async fn build_wallet_startup(
     vault_store: Arc<DesktopVaultStore>,
 ) -> eyre::Result<WalletStartupReady> {
     let settings = load_validated_startup_settings(&vault_store)?;
+    let ui_state =
+        load_wallet_ui_state(vault_store.db().as_ref()).wrap_err("load wallet UI state")?;
     let proxy_url = settings
         .network
         .proxy_url
@@ -683,6 +689,7 @@ async fn build_wallet_startup(
         .transpose()
         .wrap_err("parse wallet settings proxy URL")?;
     let chain_ids = settings.chains.enabled_chain_ids();
+    let initial_chain_id = resolve_initial_chain_id(&chain_ids, ui_state.last_chain_id);
     let effective_chain_configs = build_effective_chain_configs(&settings)
         .map_err(|error| eyre::eyre!("wallet chain settings are invalid: {error}"))?;
     let effective_token_registry = build_effective_token_registry(&settings)
@@ -772,6 +779,8 @@ async fn build_wallet_startup(
         waku_worker_shutdown,
         vault_store,
         chain_ids,
+        initial_chain_id,
+        ui_state,
         effective_chain_configs,
         effective_token_registry,
         public_balance_refresh_interval: Duration::from_secs(
@@ -857,4 +866,18 @@ pub(super) fn load_validated_startup_settings(
         .validate()
         .map_err(|error| eyre::eyre!("wallet settings are invalid: {error}"))?;
     Ok(settings)
+}
+
+pub(super) fn resolve_initial_chain_id(
+    enabled_chain_ids: &[u64],
+    remembered_chain_id: Option<u64>,
+) -> u64 {
+    remembered_chain_id
+        .filter(|chain_id| enabled_chain_ids.contains(chain_id))
+        .unwrap_or_else(|| {
+            enabled_chain_ids
+                .first()
+                .copied()
+                .expect("validated wallet settings must enable at least one chain")
+        })
 }

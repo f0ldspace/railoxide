@@ -416,10 +416,7 @@ impl WalletRoot {
 
     pub(super) fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
         if self.view_session.is_none() {
-            return centered_message(
-                "Hardware-derived private data is locked. Select a hardware wallet from the picker and unlock the matching device profile.",
-            )
-            .into_any_element();
+            return centered_message("Choose a wallet to continue").into_any_element();
         }
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Error { message, .. }) => self

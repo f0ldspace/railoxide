@@ -1,13 +1,110 @@
 #[cfg(not(feature = "hardware"))]
 use super::HardwareWalletSyncIntent;
 use super::{
-    Arc, Context, Focusable, HardwareDeviceKind, PRIMARY_WALLET_LABEL, VaultError, VaultState,
-    WalletRoot, WalletSetupMode, WalletSource, Window, Zeroizing,
-    default_hardware_wallet_setup_intent, generate_opaque_id, generate_seed_material,
-    wallet_options_from_metadata,
+    Arc, Context, DesktopViewSession, Focusable, HardwareDeviceKind, PRIMARY_WALLET_LABEL,
+    VaultError, VaultState, ViewUnlock, WalletOption, WalletRoot, WalletSetupMode, WalletSource,
+    Window, Zeroizing, default_hardware_wallet_setup_intent, generate_opaque_id,
+    generate_seed_material, remembered_wallet_option, wallet_options_from_metadata,
 };
 #[cfg(feature = "hardware")]
 use super::{HardwareProfileUnlockPurpose, parse_hardware_wallet_restore_account_index};
+
+struct VaultUnlockResult {
+    session: Option<DesktopViewSession>,
+    metadata: Vec<wallet_ops::vault::WalletMetadataBundle>,
+    vault_view_unlock: Arc<ViewUnlock>,
+    setup_password: Option<Zeroizing<String>>,
+    #[cfg(feature = "hardware")]
+    remembered_hardware_wallet_id: Option<Arc<str>>,
+}
+
+impl VaultUnlockResult {
+    fn new(
+        session: Option<DesktopViewSession>,
+        metadata: Vec<wallet_ops::vault::WalletMetadataBundle>,
+        vault_view_unlock: Arc<ViewUnlock>,
+        setup_password: Option<Zeroizing<String>>,
+    ) -> Self {
+        Self {
+            session,
+            metadata,
+            vault_view_unlock,
+            setup_password,
+            #[cfg(feature = "hardware")]
+            remembered_hardware_wallet_id: None,
+        }
+    }
+
+    #[cfg(feature = "hardware")]
+    fn remembered_hardware(
+        wallet_id: Arc<str>,
+        metadata: Vec<wallet_ops::vault::WalletMetadataBundle>,
+        vault_view_unlock: Arc<ViewUnlock>,
+    ) -> Self {
+        Self {
+            session: None,
+            metadata,
+            vault_view_unlock,
+            setup_password: None,
+            remembered_hardware_wallet_id: Some(wallet_id),
+        }
+    }
+}
+
+fn load_first_password_unlockable_wallet_session(
+    store: &wallet_ops::vault::DesktopVaultStore,
+    vault_view_unlock: &ViewUnlock,
+    active: &[WalletOption],
+    skip_wallet_id: Option<&str>,
+) -> Result<Option<DesktopViewSession>, VaultError> {
+    for wallet in active {
+        if skip_wallet_id == Some(wallet.wallet_id.as_ref()) {
+            continue;
+        }
+        match store.load_view_session_with_view_unlock(vault_view_unlock, wallet.wallet_id.as_ref())
+        {
+            Ok(session) => return Ok(Some(session)),
+            Err(
+                VaultError::HardwareWalletViewRequiresDevice
+                | VaultError::UnsupportedHardwareCustodyBackend(_),
+            ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+pub(in crate::root) fn load_preferred_password_unlockable_wallet_session(
+    store: &wallet_ops::vault::DesktopVaultStore,
+    vault_view_unlock: &ViewUnlock,
+    active: &[WalletOption],
+    remembered_wallet_id: Option<&str>,
+) -> Result<Option<DesktopViewSession>, VaultError> {
+    let mut skip_wallet_id = None;
+    if let Some(wallet) = remembered_wallet_option(active, remembered_wallet_id)
+        && !wallet.source.is_hardware_derived()
+    {
+        match store.load_view_session_with_view_unlock(vault_view_unlock, wallet.wallet_id.as_ref())
+        {
+            Ok(session) => return Ok(Some(session)),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    wallet_id = wallet.wallet_id.as_ref(),
+                    "remembered wallet could not be opened; falling back"
+                );
+                skip_wallet_id = Some(wallet.wallet_id.as_ref().to_owned());
+            }
+        }
+    }
+
+    load_first_password_unlockable_wallet_session(
+        store,
+        vault_view_unlock,
+        active,
+        skip_wallet_id.as_deref(),
+    )
+}
 
 impl WalletRoot {
     pub(in crate::root) fn create_vault_from_inputs(
@@ -69,6 +166,7 @@ impl WalletRoot {
         }
 
         let store = Arc::clone(store);
+        let remembered_wallet_id = self.ui_state.last_wallet_id.clone();
         self.unlock_in_progress = true;
         self.vault_error = None;
         cx.notify();
@@ -79,40 +177,75 @@ impl WalletRoot {
             let active = wallet_options_from_metadata(metadata.clone());
             let vault_view_unlock = Arc::new(view);
             if active.is_empty() {
-                return Ok((None, metadata, vault_view_unlock, Some(password)));
+                return Ok(VaultUnlockResult::new(
+                    None,
+                    metadata,
+                    vault_view_unlock,
+                    Some(password),
+                ));
             }
-            for wallet in &active {
-                match store.load_view_session_with_view_unlock(
-                    &vault_view_unlock,
-                    wallet.wallet_id.as_ref(),
-                ) {
-                    Ok(session) => return Ok((Some(session), metadata, vault_view_unlock, None)),
-                    Err(
-                        VaultError::HardwareWalletViewRequiresDevice
-                        | VaultError::UnsupportedHardwareCustodyBackend(_),
-                    ) => {}
-                    Err(error) => return Err(error),
+            if let Some(wallet) = remembered_wallet_option(&active, remembered_wallet_id.as_deref())
+            {
+                if wallet.source.is_hardware_derived() {
+                    #[cfg(feature = "hardware")]
+                    {
+                        return Ok(VaultUnlockResult::remembered_hardware(
+                            Arc::clone(&wallet.wallet_id),
+                            metadata,
+                            vault_view_unlock,
+                        ));
+                    }
+                    #[cfg(not(feature = "hardware"))]
+                    {
+                        tracing::warn!(
+                            wallet_id = wallet.wallet_id.as_ref(),
+                            "remembered hardware wallet cannot be opened in this build; falling back"
+                        );
+                    }
                 }
             }
-            Ok((None, metadata, vault_view_unlock, None))
+            let session = load_preferred_password_unlockable_wallet_session(
+                &store,
+                &vault_view_unlock,
+                &active,
+                remembered_wallet_id.as_deref(),
+            )?;
+            Ok(VaultUnlockResult::new(
+                session,
+                metadata,
+                vault_view_unlock,
+                None,
+            ))
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.unlock_in_progress = false;
                 match result {
-                    Ok(Ok((Some(session), metadata, vault_view_unlock, _setup_password))) => {
-                        root.vault_view_unlock = Some(vault_view_unlock);
-                        root.enter_view_unlocked(session, metadata, window, cx);
-                    }
-                    Ok(Ok((None, metadata, vault_view_unlock, setup_password))) => {
-                        root.enter_password_metadata_unlocked(
-                            metadata,
-                            vault_view_unlock,
-                            setup_password,
+                    Ok(Ok(unlock)) if unlock.session.is_some() => {
+                        root.vault_view_unlock = Some(unlock.vault_view_unlock);
+                        root.enter_view_unlocked(
+                            unlock.session.expect("checked above"),
+                            unlock.metadata,
                             window,
                             cx,
                         );
+                    }
+                    Ok(Ok(unlock)) => {
+                        root.enter_password_metadata_unlocked(
+                            unlock.metadata,
+                            unlock.vault_view_unlock,
+                            unlock.setup_password,
+                            window,
+                            cx,
+                        );
+                        #[cfg(feature = "hardware")]
+                        if let Some(wallet_id) = unlock.remembered_hardware_wallet_id {
+                            root.vault_error = None;
+                            root.open_hardware_profile_unlock_dialog_for_wallet(
+                                wallet_id, window, cx,
+                            );
+                        }
                     }
                     Ok(Err(error)) => {
                         root.focus_vault_input_on_render = true;

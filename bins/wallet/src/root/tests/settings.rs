@@ -80,6 +80,16 @@ fn startup_settings_invalid_record_is_recoverable_error() {
 }
 
 #[test]
+fn startup_initial_chain_restores_enabled_remembered_chain() {
+    assert_eq!(resolve_initial_chain_id(&[1, 56, 137], Some(137)), 137);
+}
+
+#[test]
+fn startup_initial_chain_falls_back_when_remembered_chain_disabled() {
+    assert_eq!(resolve_initial_chain_id(&[1, 56], Some(137)), 1);
+}
+
+#[test]
 fn wallet_app_options_preserve_cli_db_path() {
     let db_path = PathBuf::from("custom-wallet-db");
     let options = WalletAppOptions::try_from(crate::cli::Options {

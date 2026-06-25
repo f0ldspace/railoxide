@@ -155,6 +155,14 @@ impl Default for HardwareProfileUnlockState {
 }
 
 #[cfg(feature = "hardware")]
+pub(in crate::root) fn dismiss_hardware_profile_unlock_state(
+    state: &mut HardwareProfileUnlockState,
+) {
+    state.clear_sensitive();
+    *state = HardwareProfileUnlockState::default();
+}
+
+#[cfg(feature = "hardware")]
 impl HardwareProfileUnlockState {
     pub(super) fn clear_sensitive(&mut self) {
         self.vault_view_unlock = None;

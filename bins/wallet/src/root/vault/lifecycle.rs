@@ -122,7 +122,7 @@ impl WalletRoot {
             return;
         };
         let Some(current_session) = self.view_session.clone() else {
-            self.set_vault_error("Wallet vault is locked", cx);
+            self.open_wallet_from_vault_view_unlock(wallet_id, window, cx);
             return;
         };
 
@@ -156,6 +156,58 @@ impl WalletRoot {
                     Err(error) => {
                         root.set_vault_error(
                             format!("Failed to switch wallet: {error}").as_str(),
+                            cx,
+                        );
+                        root.sync_wallet_select(window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_wallet_from_vault_view_unlock(
+        &mut self,
+        wallet_id: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(store) = self.vault_store.clone() else {
+            self.set_vault_error("Wallet vault storage is unavailable", cx);
+            return;
+        };
+        let Some(vault_view_unlock) = self.vault_view_unlock.clone() else {
+            self.set_vault_error("Wallet vault is locked", cx);
+            return;
+        };
+
+        let active_wallet_generation = self.active_wallet_generation;
+        self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
+        let switch_generation = self.wallet_switch_generation;
+        self.vault_error = None;
+        let wallet_id_string = wallet_id.to_owned();
+        let metadata = self.wallet_metadata.clone();
+        let join = self.runtime.spawn_blocking(move || {
+            store.load_view_session_with_view_unlock(&vault_view_unlock, &wallet_id_string)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = join.await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                if root.wallet_switch_generation != switch_generation
+                    || root.active_wallet_generation != active_wallet_generation
+                {
+                    return;
+                }
+                match result {
+                    Ok(Ok(session)) => root.install_view_session(session, metadata, window, cx),
+                    Ok(Err(error)) => {
+                        root.handle_vault_error(&error, cx);
+                        root.sync_wallet_select(window, cx);
+                    }
+                    Err(error) => {
+                        root.set_vault_error(
+                            format!("Failed to open wallet: {error}").as_str(),
                             cx,
                         );
                         root.sync_wallet_select(window, cx);
@@ -276,7 +328,9 @@ impl WalletRoot {
         self.vault_view_unlock = Some(vault_view_unlock);
         self.wallet_metadata = metadata;
         self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
-        self.selected_wallet_id = Some(wallet_id);
+        self.selected_wallet_id = Some(Arc::clone(&wallet_id));
+        self.ui_state.last_wallet_id = Some(wallet_id.as_ref().to_owned());
+        self.save_ui_state();
         #[cfg(feature = "hardware")]
         {
             self.active_hardware_profile = self.active_hardware_profile_for_wallet();
@@ -432,9 +486,7 @@ impl WalletRoot {
             self.hardware_wallet_creation_generation.wrapping_add(1);
         self.hardware_wallet_creation_intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
-        self.vault_error = Some(Arc::from(
-            "Hardware-derived private data is locked. Select a hardware wallet and unlock its matching device profile.",
-        ));
+        self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
         cx.notify();

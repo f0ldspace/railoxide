@@ -81,8 +81,9 @@ pub(in crate::root) use hardware::{
     HardwareAccountPickerRow, HardwareProfileApprovalPrompt, HardwareProfilePickerView,
     HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus,
     HardwareProfileUnlockPurpose, HardwareProfileUnlockState, TrezorPinMatrixPromptState,
-    hardware_account_picker_rows, hardware_profile_approval_prompt_for_account,
-    hardware_profile_auto_open_wallet_id, hardware_profile_detection_should_retry,
+    dismiss_hardware_profile_unlock_state, hardware_account_picker_rows,
+    hardware_profile_approval_prompt_for_account, hardware_profile_auto_open_wallet_id,
+    hardware_profile_detection_should_retry,
     hardware_profile_detection_should_suppress_initial_ledger_progress,
     hardware_profile_detection_should_suppress_initial_trezor_progress,
     hardware_profile_evm_address_for_session, hardware_profile_hardware_error_message,
@@ -95,10 +96,12 @@ pub(in crate::root::vault) use selection::hardware_device_kind_from_source;
 #[allow(unused_imports)]
 pub(in crate::root) use selection::{
     HardwareWalletDisplayInfo, hardware_device_kind_from_wallet_select_value,
-    hardware_device_wallet_select_label, hardware_wallet_display_info,
+    hardware_device_wallet_select_label, hardware_wallet_display_info, remembered_wallet_option,
     wallet_options_from_metadata, wallet_select_items_from_metadata,
     wallet_select_value_for_selected_wallet,
 };
+#[cfg(test)]
+pub(in crate::root) use setup::load_preferred_password_unlockable_wallet_session;
 pub(in crate::root) use types::{VaultState, WalletOption, WalletSetupMode};
 
 #[allow(dead_code)]

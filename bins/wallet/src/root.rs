@@ -22,7 +22,10 @@ use wallet_ops::{
     ProverCacheBuildProgress, PublicBalanceSnapshot, PublicBroadcasterWakuClient,
     TokenAnchorRateCache, TokenAnchorRefreshHandle, WalletNetworkHealth, WalletSessionStore,
     hardware::HardwareWalletSyncIntent,
-    settings::{EffectiveChainConfig, EffectiveTokenRegistry, load_wallet_settings},
+    settings::{
+        EffectiveChainConfig, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
+        save_wallet_ui_state,
+    },
     subscribe_prover_cache_build,
     vault::{
         BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial,
@@ -230,7 +233,7 @@ use spend_authorization::{
     is_spend_authorization_failure_error, remembered_spend_authorization_valid_for_test,
 };
 #[cfg(test)]
-use startup::load_validated_startup_settings;
+use startup::{load_validated_startup_settings, resolve_initial_chain_id};
 #[cfg(test)]
 use utxo::{
     activity_classification_icon_style, apply_blocked_shield_rescue_rows, display_rows_from_output,
@@ -241,9 +244,15 @@ use vault::{
     HARDWARE_PROFILE_ADD_SUBACCOUNT_BUTTON_ID, HARDWARE_PROFILE_RECOVER_EXACT_BUTTON_ID,
     HARDWARE_PROFILE_RECOVER_RANGE_BUTTON_ID, default_hardware_wallet_setup_intent,
     hardware_profile_label_warning, hardware_wallet_creation_result_is_current,
-    parse_hardware_exact_recovery_index, parse_hardware_recovery_range,
-    parse_hardware_wallet_restore_account_index, trezor_passphrase_mode_copy,
-    wallet_options_from_metadata,
+    load_preferred_password_unlockable_wallet_session, parse_hardware_exact_recovery_index,
+    parse_hardware_recovery_range, parse_hardware_wallet_restore_account_index,
+    remembered_wallet_option, trezor_passphrase_mode_copy, wallet_options_from_metadata,
+};
+#[cfg(all(test, feature = "hardware"))]
+use vault::{
+    HardwareAccountPickerRow, HardwareProfileStep, HardwareProfileStepStatus,
+    HardwareProfileUnlockPurpose, HardwareProfileUnlockState,
+    dismiss_hardware_profile_unlock_state, hardware_profile_auto_open_wallet_id,
 };
 #[cfg(test)]
 use vault_ui::should_show_pre_unlock_settings_action;
@@ -366,6 +375,7 @@ pub(crate) struct WalletRoot {
     active_wallet_generation: u64,
     wallet_switch_generation: u64,
     selected_chain: u64,
+    ui_state: WalletUiState,
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     poi_cache_service: Option<Arc<PoiCacheService>>,
@@ -448,6 +458,15 @@ impl WalletRoot {
         self.vault_store
             .as_ref()
             .map(|store| store.db().root_dir().to_path_buf())
+    }
+
+    fn save_ui_state(&self) {
+        let Some(store) = self.vault_store.as_ref() else {
+            return;
+        };
+        if let Err(error) = save_wallet_ui_state(store.db().as_ref(), &self.ui_state) {
+            tracing::warn!(%error, "failed to save wallet UI state");
+        }
     }
 
     fn ensure_prover_cache_build_monitor(&mut self, cx: &Context<'_, Self>) {
@@ -544,6 +563,8 @@ impl WalletRoot {
         waku_worker_shutdown: watch::Sender<bool>,
         vault_store: Arc<DesktopVaultStore>,
         chain_ids: &[u64],
+        initial_chain_id: u64,
+        ui_state: WalletUiState,
         effective_chain_configs: BTreeMap<u64, EffectiveChainConfig>,
         effective_token_registry: EffectiveTokenRegistry,
         public_balance_refresh_interval: Duration,
@@ -570,8 +591,10 @@ impl WalletRoot {
             .copied()
             .map(|chain_id| ChainSelectItem { chain_id })
             .collect();
-        let initial_chain_id = chain_ids[0];
-        let selected_chain_index = Some(IndexPath::default().row(0));
+        let selected_chain_index = chain_ids
+            .iter()
+            .position(|chain_id| *chain_id == initial_chain_id)
+            .map(|index| IndexPath::default().row(index));
         let mut chain_states = BTreeMap::new();
         for chain_id in chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
@@ -863,6 +886,7 @@ impl WalletRoot {
             selected_wallet_id: None,
             active_wallet_generation: 0,
             wallet_switch_generation: 0,
+            ui_state,
             chain_select: chain_select.clone(),
             chain_states,
             poi_cache_service,
