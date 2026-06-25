@@ -3,7 +3,7 @@ pub(super) struct PlatformAttentionState {
 }
 
 impl PlatformAttentionState {
-    pub(super) const fn new(window: &gpui::Window) -> Self {
+    pub(super) fn new(window: &gpui::Window) -> Self {
         Self {
             native: imp::NativePlatformAttentionState::new(window),
         }
