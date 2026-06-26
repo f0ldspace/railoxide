@@ -78,6 +78,7 @@ impl Render for WalletSettingsEditor {
             },
         );
         let poi_reset_editor = editor.clone();
+        let poi_cache_reset_editor = editor.clone();
         let indexed_source_mode = Self::dropdown_field(
             editor.clone(),
             vec![
@@ -591,7 +592,20 @@ impl Render for WalletSettingsEditor {
                                     });
                                 })
                         }),
-                    )),
+                    ))
+                    .item(
+                        SettingItem::new(
+                            "Reset local POI cache",
+                            SettingField::<SharedString>::render(move |_options, _window, cx| {
+                                Self::render_local_poi_cache_reset_action(
+                                    &poi_cache_reset_editor,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .description("Clears only cached POI proof data and starts a fresh POI cache sync.")
+                        .layout(Axis::Vertical),
+                    ),
             )
             .group(poi_gateway_group);
         let public_broadcasters_page = SettingPage::new("Public Broadcasters")

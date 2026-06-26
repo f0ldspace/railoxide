@@ -18,6 +18,8 @@ impl WalletSettingsEditor {
             status: None,
             cache_building: false,
             cache_build_progress: None,
+            poi_cache_reset_confirming: false,
+            poi_cache_resetting: false,
             startup_root,
             active_root,
         };
@@ -35,6 +37,7 @@ impl WalletSettingsEditor {
 
     pub(in crate::root) fn draft_changed(&mut self, cx: &mut Context<'_, Self>) {
         self.status = None;
+        self.poi_cache_reset_confirming = false;
         self.refresh_validation();
         cx.notify();
     }
@@ -129,6 +132,7 @@ impl WalletSettingsEditor {
         self.draft = settings_draft_after_discard(&self.saved);
         self.sync_fields_from_draft();
         self.refresh_validation();
+        self.poi_cache_reset_confirming = false;
         cx.notify();
     }
 
@@ -136,7 +140,131 @@ impl WalletSettingsEditor {
         self.draft = WalletSettings::default();
         self.sync_fields_from_draft();
         self.refresh_validation();
+        self.poi_cache_reset_confirming = false;
         cx.notify();
+    }
+
+    pub(in crate::root) fn reset_local_poi_cache(&mut self, cx: &mut Context<'_, Self>) {
+        if self.poi_cache_resetting {
+            return;
+        }
+        if !self.poi_cache_reset_confirming {
+            self.poi_cache_reset_confirming = true;
+            self.status = Some(Arc::from(
+                "Confirm reset to clear cached POI artifact proof data",
+            ));
+            cx.notify();
+            return;
+        }
+
+        self.poi_cache_reset_confirming = false;
+        self.poi_cache_resetting = true;
+        self.status = Some(Arc::from("Resetting local POI cache..."));
+        let db = self.vault_store.db();
+        let service = self.active_root.as_ref().and_then(|root| {
+            root.update(cx, |root, _cx| root.poi_cache_service.clone())
+                .ok()
+                .flatten()
+        });
+        let resync_requested = service.is_some();
+        let join = if let Some(service) = service {
+            self.runtime.spawn(async move {
+                service
+                    .reset_poi_artifact_cache()
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        } else {
+            self.runtime.spawn_blocking(move || {
+                db.clear_poi_artifact_cache()
+                    .map_err(|error| error.to_string())
+            })
+        };
+        cx.spawn(async move |this, cx| {
+            let message = match join.await {
+                Ok(Ok(removed)) if resync_requested => {
+                    format!(
+                        "Local POI cache reset; cleared {removed} cache records and requested resync"
+                    )
+                }
+                Ok(Ok(removed)) => format!(
+                    "Local POI cache reset; cleared {removed} cache records"
+                ),
+                Ok(Err(error)) => format!("Failed to reset local POI cache: {error}"),
+                Err(error) => format!("Local POI cache reset task failed: {error}"),
+            };
+            let _ = this.update(cx, |editor, cx| {
+                editor.poi_cache_resetting = false;
+                editor.poi_cache_reset_confirming = false;
+                editor.status = Some(Arc::from(message));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(in crate::root) fn cancel_local_poi_cache_reset(&mut self, cx: &mut Context<'_, Self>) {
+        self.poi_cache_reset_confirming = false;
+        self.status = None;
+        cx.notify();
+    }
+
+    pub(in crate::root) fn render_local_poi_cache_reset_action(
+        editor: &Entity<Self>,
+        cx: &App,
+    ) -> gpui::Div {
+        let (confirming, resetting) = {
+            let state = editor.read(cx);
+            (state.poi_cache_reset_confirming, state.poi_cache_resetting)
+        };
+
+        if confirming {
+            let confirm_editor = editor.clone();
+            let cancel_editor = editor.clone();
+            return div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    app_button("wallet-settings-poi-cache-confirm-reset", "Confirm reset")
+                        .danger()
+                        .disabled(resetting)
+                        .on_click(move |_event, _window, cx| {
+                            confirm_editor.update(cx, |editor, cx| {
+                                editor.reset_local_poi_cache(cx);
+                            });
+                        }),
+                )
+                .child(
+                    app_button("wallet-settings-poi-cache-cancel-reset", "Cancel")
+                        .outline()
+                        .disabled(resetting)
+                        .on_click(move |_event, _window, cx| {
+                            cancel_editor.update(cx, |editor, cx| {
+                                editor.cancel_local_poi_cache_reset(cx);
+                            });
+                        }),
+                );
+        }
+
+        let reset_editor = editor.clone();
+        let label = if resetting {
+            "Resetting..."
+        } else {
+            "Reset local cache"
+        };
+        div().flex().items_center().child(
+            app_button("wallet-settings-poi-cache-reset", label)
+                .danger()
+                .disabled(resetting)
+                .on_click(move |_event, _window, cx| {
+                    reset_editor.update(cx, |editor, cx| {
+                        editor.reset_local_poi_cache(cx);
+                    });
+                }),
+        )
     }
 
     pub(in crate::root) fn apply_and_restart(
