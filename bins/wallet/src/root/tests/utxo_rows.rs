@@ -98,6 +98,37 @@ fn display_rows_keep_pending_spent_visible_when_spent_toggle_off() {
 }
 
 #[test]
+fn recoverable_poi_candidate_count_only_counts_actionable_transact_outputs() {
+    let mut missing = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    missing.poi_spendable = false;
+    missing.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "Missing".to_string(),
+    )]);
+    let mut shield = missing.clone();
+    shield.commitment_kind = "Shield".to_string();
+    let mut pending = missing.clone();
+    pending.pending_new = true;
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 4,
+        unspent_count: 4,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![
+            missing,
+            shield,
+            pending,
+            utxo_output("0x2222222222222222222222222222222222222222", "7", false),
+        ],
+        totals: Vec::new(),
+    };
+
+    assert_eq!(recoverable_poi_candidate_count(&output), 1);
+}
+
+#[test]
 fn display_rows_include_activity_classification() {
     let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
     blocked_shield.commitment_kind = "Shield".to_string();

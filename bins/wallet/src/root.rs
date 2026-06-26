@@ -238,7 +238,7 @@ use startup::{load_validated_startup_settings, resolve_initial_chain_id};
 #[cfg(test)]
 use utxo::{
     activity_classification_icon_style, apply_blocked_shield_rescue_rows, display_rows_from_output,
-    format_compact_age, should_show_blocked_shield_refund_action,
+    format_compact_age, recoverable_poi_candidate_count, should_show_blocked_shield_refund_action,
 };
 #[cfg(test)]
 use vault::{

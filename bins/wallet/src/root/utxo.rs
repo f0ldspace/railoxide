@@ -45,8 +45,8 @@ use super::spend_authorization::{
 use super::tokens::parse_address;
 use super::{
     SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-    WalletRoot, app_refresh_button, centered_message, dialog_content_max_height, dialog_max_height,
-    rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+    WalletRoot, centered_message, dialog_content_max_height, dialog_max_height, rgb_with_alpha,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 
 use crate::assets::WalletIconSource;
@@ -109,26 +109,20 @@ impl BlockedShieldRescueRowState {
 
 impl WalletRoot {
     pub(super) fn sync_utxo_table(&mut self, cx: &mut Context<'_, Self>) {
-        let (mut rows, poi_refresh_session, poi_refreshing, snapshot) =
-            match self.chain_states.get(&self.selected_chain) {
-                Some(state) => {
-                    let snapshot = state.snapshot().cloned();
-                    let rows = snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
-                        display_rows_from_output(
-                            snapshot,
-                            self.tx_search_query.as_ref(),
-                            self.show_spent_utxos,
-                        )
-                    });
-                    (
-                        rows,
-                        state.poi_refresh_session(),
-                        state.poi_refreshing(),
+        let (mut rows, snapshot) = match self.chain_states.get(&self.selected_chain) {
+            Some(state) => {
+                let snapshot = state.snapshot().cloned();
+                let rows = snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
+                    display_rows_from_output(
                         snapshot,
+                        self.tx_search_query.as_ref(),
+                        self.show_spent_utxos,
                     )
-                }
-                _ => (Vec::new(), None, false, None),
-            };
+                });
+                (rows, snapshot)
+            }
+            _ => (Vec::new(), None),
+        };
         if let Some(snapshot) = snapshot.as_ref() {
             self.prune_blocked_shield_rescue_rows(snapshot);
             apply_blocked_shield_rescue_rows(
@@ -139,9 +133,6 @@ impl WalletRoot {
         }
         self.utxo_table.update(cx, |state, cx| {
             state.delegate_mut().set_rows(rows);
-            state
-                .delegate_mut()
-                .set_poi_refresh_state(poi_refresh_session, poi_refreshing);
             cx.notify();
         });
     }
@@ -186,6 +177,16 @@ impl WalletRoot {
         })
         .detach();
         cx.notify();
+    }
+
+    fn retry_poi_recovery(session: Option<Arc<wallet_ops::WalletSession>>, cx: &mut App) {
+        let Some(session) = session else {
+            return;
+        };
+        cx.spawn(async move |_cx| {
+            session.refresh_poi_statuses().await;
+        })
+        .detach();
     }
 
     fn begin_blocked_shield_refund(
@@ -747,11 +748,12 @@ impl WalletRoot {
 
     fn render_utxo_controls(&self, root: &Entity<Self>) -> impl IntoElement {
         let search_active = !self.tx_search_query.is_empty();
-        let local_pending_spent_count = self
-            .chain_states
-            .get(&self.selected_chain)
-            .and_then(ChainUtxoState::snapshot)
-            .map_or(0, |snapshot| snapshot.local_pending_spent_count);
+        let state = self.chain_states.get(&self.selected_chain);
+        let snapshot = state.and_then(ChainUtxoState::snapshot);
+        let local_pending_spent_count =
+            snapshot.map_or(0, |snapshot| snapshot.local_pending_spent_count);
+        let recoverable_poi_count =
+            snapshot.map_or(0, |snapshot| recoverable_poi_candidate_count(snapshot));
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
         let search_input = app_input(&self.tx_search_input)
@@ -786,6 +788,27 @@ impl WalletRoot {
                     root.set_spent_visibility(checked, cx);
                 });
             });
+        let poi_refreshing = state.is_some_and(ChainUtxoState::poi_refreshing);
+        let poi_refresh_session = state.and_then(ChainUtxoState::poi_refresh_session);
+        let poi_recovery_session = poi_refresh_session.clone();
+        let poi_recovery_label = if recoverable_poi_count == 1 {
+            "Retry PPOI recovery".to_string()
+        } else {
+            format!("Retry PPOI recovery ({recoverable_poi_count})")
+        };
+        let poi_recovery_tooltip = format!(
+            "Retry recovery for {recoverable_poi_count} PPOI-pending private output{}",
+            if recoverable_poi_count == 1 { "" } else { "s" }
+        );
+        let poi_recovery_button = app_button("wallet-retry-poi-recovery", poi_recovery_label)
+            .outline()
+            .small()
+            .loading(poi_refreshing)
+            .disabled(poi_refreshing || poi_refresh_session.is_none())
+            .tooltip(poi_recovery_tooltip)
+            .on_click(move |_event, _window, cx| {
+                Self::retry_poi_recovery(poi_recovery_session.clone(), cx);
+            });
 
         div()
             .flex_none()
@@ -803,11 +826,16 @@ impl WalletRoot {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_start()
                     .gap_2()
                     .child(div().w(px(280.0)).child(search_input))
-                    .child(spent_toggle),
+                    .child(spent_toggle)
+                    .child(div().flex_1())
+                    .when(recoverable_poi_count > 0, |this| {
+                        this.child(poi_recovery_button)
+                    }),
             )
     }
 
@@ -994,8 +1022,6 @@ pub(super) struct UtxoDelegate {
     rows: Arc<[UtxoDisplayRow]>,
     columns: [Column; 7],
     tx_search_input: Entity<InputState>,
-    poi_refresh_session: Option<Arc<wallet_ops::WalletSession>>,
-    poi_refreshing: bool,
 }
 
 impl UtxoDelegate {
@@ -1027,8 +1053,6 @@ impl UtxoDelegate {
                     .movable(false),
             ],
             tx_search_input,
-            poi_refresh_session: None,
-            poi_refreshing: false,
         }
     }
 
@@ -1040,15 +1064,6 @@ impl UtxoDelegate {
         for (column, width) in self.columns.iter_mut().zip(widths.iter().copied()) {
             column.width = width;
         }
-    }
-
-    pub(super) fn set_poi_refresh_state(
-        &mut self,
-        session: Option<Arc<wallet_ops::WalletSession>>,
-        refreshing: bool,
-    ) {
-        self.poi_refresh_session = session;
-        self.poi_refreshing = refreshing;
     }
 }
 
@@ -1078,34 +1093,11 @@ impl TableDelegate for UtxoDelegate {
                 .into_any_element();
         }
 
-        let session = self.poi_refresh_session.clone();
-        let refreshing = self.poi_refreshing;
-        let can_refresh = session.is_some();
-        let action = app_refresh_button(
-            "wallet-poi-refresh",
-            "Refresh POI statuses",
-            refreshing,
-            can_refresh,
-            move |_window, cx| {
-                let Some(session) = session.clone() else {
-                    return;
-                };
-                cx.spawn(async move |_cx| {
-                    session.refresh_poi_statuses().await;
-                })
-                .detach();
-            },
-        )
-        .into_any_element();
-
         div()
             .size_full()
             .flex()
             .items_center()
-            .justify_between()
-            .gap_1()
             .child("POI")
-            .child(action)
             .into_any_element()
     }
 
@@ -1465,6 +1457,36 @@ pub(super) fn should_focus_utxo_table(
     active_activity == Activity::Wallet
         && active_wallet_tab.shows_utxos()
         && state.is_some_and(ChainUtxoState::renders_table)
+}
+
+pub(super) fn recoverable_poi_candidate_count(snapshot: &ListUtxosOutput) -> usize {
+    snapshot
+        .utxos
+        .iter()
+        .filter(|row| is_recoverable_poi_candidate(row))
+        .count()
+}
+
+fn is_recoverable_poi_candidate(row: &UtxoOutput) -> bool {
+    if row.is_spent
+        || row.pending_new
+        || row.pending_spent
+        || row.local_pending_spent
+        || row.poi_spendable
+        || row.commitment_kind != "Transact"
+    {
+        return false;
+    }
+
+    row.poi_statuses.is_empty()
+        || row
+            .poi_statuses
+            .values()
+            .any(|status| is_recoverable_poi_status(status))
+}
+
+fn is_recoverable_poi_status(status: &str) -> bool {
+    matches!(status, "Missing" | "Unknown" | "ProofSubmitted")
 }
 
 pub(super) fn display_rows_from_output(
