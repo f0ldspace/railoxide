@@ -87,6 +87,52 @@ pub fn create_spend_grant(
     unlock_spend(metadata, password).map(SpendGrant::one_use)
 }
 
+pub fn reencrypt_metadata(
+    metadata: &VaultMetadata,
+    current_password: &str,
+    new_password: &str,
+) -> Result<VaultMetadata, VaultError> {
+    validate_version(metadata.version)?;
+    let current_root_key =
+        derive_root_key_for_unlock(current_password.as_bytes(), &metadata.salt, metadata.kdf)?;
+    let current_wrapping_keys = derive_wrapping_keys_for_unlock(&current_root_key)?;
+    let view_dek = decrypt_wrapped_key(
+        &current_wrapping_keys.view,
+        RecordKind::ViewDek,
+        &metadata.wrapped_view_dek,
+    )?;
+    let spend_dek = decrypt_wrapped_key(
+        &current_wrapping_keys.spend,
+        RecordKind::SpendDek,
+        &metadata.wrapped_spend_dek,
+    )?;
+
+    let mut salt = [0u8; SALT_LEN];
+    fill(&mut salt).map_err(|_| VaultError::Random)?;
+    let new_root_key = derive_root_key(new_password.as_bytes(), &salt, metadata.kdf)?;
+    let new_wrapping_keys = derive_wrapping_keys(&new_root_key)?;
+    let wrapped_view_dek = encrypt_payload(
+        &new_wrapping_keys.view,
+        RecordKind::ViewDek,
+        "vault",
+        view_dek.expose_secret(),
+    )?;
+    let wrapped_spend_dek = encrypt_payload(
+        &new_wrapping_keys.spend,
+        RecordKind::SpendDek,
+        "vault",
+        spend_dek.expose_secret(),
+    )?;
+
+    Ok(VaultMetadata {
+        version: VAULT_VERSION,
+        kdf: metadata.kdf,
+        salt,
+        wrapped_view_dek,
+        wrapped_spend_dek,
+    })
+}
+
 pub fn generate_seed_material() -> Result<GeneratedSeedMaterial, VaultError> {
     let mut entropy = vec![0u8; 32];
     fill(&mut entropy).map_err(|_| VaultError::Random)?;

@@ -37,7 +37,7 @@ use super::{
     public_account_metadata_record_entry, public_account_metadata_record_key,
     public_account_secret_record_entry, public_account_secret_record_key,
     public_address_book_record_entry, public_address_book_record_key,
-    public_evm_address_from_private_key, serialize_wallet_utxo,
+    public_evm_address_from_private_key, reencrypt_metadata, serialize_wallet_utxo,
     sort_broadcaster_preference_entries, sort_hardware_profile_metadata,
     sort_private_address_book_entries, sort_public_account_metadata,
     sort_public_address_book_entries, sort_wallet_metadata, sort_walletconnect_sessions,

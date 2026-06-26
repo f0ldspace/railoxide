@@ -47,6 +47,7 @@ use super::{
     dialog_max_height, scrollable_dialog_content, secondary_dialog_content_width,
 };
 
+mod change_password;
 mod errors;
 mod hardware;
 mod inputs;

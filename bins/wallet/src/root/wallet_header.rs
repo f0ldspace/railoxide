@@ -226,6 +226,7 @@ impl WalletRoot {
             Some(state) if state.is_syncing()
         ) || self.view_session.is_none();
         let add_root = root.clone();
+        let change_password_root = root.clone();
         let manage_root = root.clone();
         let export_root = root.clone();
         let repair_root = root;
@@ -240,6 +241,7 @@ impl WalletRoot {
             .icon(IconName::Ellipsis)
             .dropdown_menu(move |menu, _window, _cx| {
                 let add_root = add_root.clone();
+                let change_password_root = change_password_root.clone();
                 let manage_root = manage_root.clone();
                 let export_root = export_root.clone();
                 let repair_root = repair_root.clone();
@@ -257,6 +259,13 @@ impl WalletRoot {
                         move |_event, window, cx| {
                             manage_root.update(cx, |root, cx| {
                                 root.open_manage_wallets_dialog(window, cx);
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new("Change vault password").on_click(
+                        move |_event, window, cx| {
+                            change_password_root.update(cx, |root, cx| {
+                                root.open_change_vault_password_dialog(window, cx);
                             });
                         },
                     ))

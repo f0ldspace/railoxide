@@ -1,7 +1,7 @@
 use super::{
     Arc, CreatedVault, DbConfig, DbStore, DesktopVaultStore, KdfParams, PathBuf, SpendGrant,
     VAULT_METADATA_KEY, VaultError, VaultMetadata, ViewUnlock, create_spend_grant,
-    create_with_params, current_vault_version, unlock_view,
+    create_with_params, current_vault_version, reencrypt_metadata, unlock_view,
 };
 
 impl DesktopVaultStore {
@@ -74,6 +74,16 @@ impl DesktopVaultStore {
         let grant = create_spend_grant(&metadata, password)?;
         self.upgrade_vault_metadata_version_if_legacy(&mut metadata)?;
         Ok(grant)
+    }
+
+    pub fn reencrypt_vault(
+        &self,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), VaultError> {
+        let metadata = self.metadata()?;
+        let metadata = reencrypt_metadata(&metadata, current_password, new_password)?;
+        self.put_metadata(&metadata)
     }
 
     fn upgrade_vault_metadata_version_if_legacy(

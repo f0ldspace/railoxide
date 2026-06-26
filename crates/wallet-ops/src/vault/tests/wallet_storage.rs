@@ -94,6 +94,102 @@ fn create_vault_does_not_overwrite_existing_metadata() {
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
+
+#[test]
+fn reencrypt_vault_changes_password_without_rewriting_wallet_records() {
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let store = DesktopVaultStore::from_db(Arc::clone(&db));
+    store
+        .create_vault_with_params(TEST_PASSWORD, test_kdf())
+        .expect("create vault");
+    let wallet_id = "password-change-wallet";
+    let stored = store
+        .import_wallet_mnemonic(TEST_PASSWORD, wallet_id, 0, "english", TEST_MNEMONIC)
+        .expect("import wallet");
+    let view_payload = db
+        .get_desktop_wallet_vault_record(&stored.view_record_key)
+        .expect("load view record")
+        .expect("view record present");
+    let spend_payload = db
+        .get_desktop_wallet_vault_record(&stored.spend_record_key)
+        .expect("load spend record")
+        .expect("spend record present");
+    let new_password = "new correct horse battery staple";
+
+    store
+        .reencrypt_vault(TEST_PASSWORD, new_password)
+        .expect("reencrypt vault");
+
+    assert!(matches!(
+        store.unlock_view(TEST_PASSWORD),
+        Err(VaultError::UnlockFailed)
+    ));
+    assert!(matches!(
+        store.create_spend_grant(TEST_PASSWORD),
+        Err(VaultError::UnlockFailed)
+    ));
+    assert!(store.unlock_view(new_password).is_ok());
+    assert_eq!(
+        db.get_desktop_wallet_vault_record(&stored.view_record_key)
+            .expect("load view record")
+            .expect("view record present"),
+        view_payload
+    );
+    assert_eq!(
+        db.get_desktop_wallet_vault_record(&stored.spend_record_key)
+            .expect("load spend record")
+            .expect("spend record present"),
+        spend_payload
+    );
+    assert!(store.load_view_bundle(new_password, wallet_id).is_ok());
+    let mut grant = store
+        .create_spend_grant(new_password)
+        .expect("create grant with new password");
+    assert!(store.load_spend_bundle(&mut grant, wallet_id).is_ok());
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn reencrypt_vault_wrong_current_password_leaves_metadata_unchanged() {
+    let root_dir = temp_db_root();
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db"),
+    );
+    let store = DesktopVaultStore::from_db(Arc::clone(&db));
+    store
+        .create_vault_with_params(TEST_PASSWORD, test_kdf())
+        .expect("create vault");
+    let metadata = store.metadata().expect("load metadata");
+
+    assert!(matches!(
+        store.reencrypt_vault("wrong password", "new password"),
+        Err(VaultError::UnlockFailed)
+    ));
+
+    assert_eq!(store.metadata().expect("load metadata"), metadata);
+    assert!(store.unlock_view(TEST_PASSWORD).is_ok());
+    assert!(matches!(
+        store.unlock_view("new password"),
+        Err(VaultError::UnlockFailed)
+    ));
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
 #[test]
 fn imported_wallet_stores_encrypted_view_and_spend_bundles() {
     let root_dir = temp_db_root();
