@@ -262,6 +262,48 @@ fn blocked_shield_rescue_row_state_tracks_resolution_generation() {
 }
 
 #[test]
+fn resolving_blocked_shield_refund_is_loading_not_unavailable() {
+    let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    blocked_shield.commitment_kind = "Shield".to_string();
+    blocked_shield.activity_classification = "Blocked Shield".to_string();
+    blocked_shield.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "ShieldBlocked".to_string(),
+    )]);
+    blocked_shield.poi_spendable = false;
+    blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
+        eligible: false,
+        disabled_reason: None,
+        origin_address: None,
+        public_account_uuid: None,
+        public_account_label: None,
+    });
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![blocked_shield],
+        totals: Vec::new(),
+    };
+
+    let mut rows = display_rows_from_output(&output, "", false);
+    let utxo_id = rows[0].utxo_id.expect("blocked Shield id");
+
+    apply_blocked_shield_rescue_rows(
+        &mut rows,
+        &BTreeMap::from([(utxo_id, BlockedShieldRescueRowState::resolving(7))]),
+        &BTreeSet::new(),
+    );
+
+    assert!(should_show_blocked_shield_refund_action(&rows[0]));
+    assert!(blocked_shield_refund_origin_resolving(&rows[0]));
+    assert!(!blocked_shield_refund_action_available(&rows[0]));
+}
+
+#[test]
 fn cached_blocked_shield_rescue_does_not_reenable_spent_row() {
     let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", true);
     blocked_shield.commitment_kind = "Shield".to_string();

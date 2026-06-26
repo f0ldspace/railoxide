@@ -179,7 +179,10 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn retry_poi_recovery(session: Option<Arc<wallet_ops::WalletSession>>, cx: &mut App) {
+    pub(super) fn retry_poi_recovery(
+        session: Option<Arc<wallet_ops::WalletSession>>,
+        cx: &mut App,
+    ) {
         let Some(session) = session else {
             return;
         };
@@ -189,7 +192,7 @@ impl WalletRoot {
         .detach();
     }
 
-    fn begin_blocked_shield_refund(
+    pub(super) fn begin_blocked_shield_refund(
         &mut self,
         row: &UtxoDisplayRow,
         window: &mut Window,
@@ -1435,6 +1438,19 @@ pub(super) fn should_show_blocked_shield_refund_action(row: &UtxoDisplayRow) -> 
     is_shield_blocked_poi_status(&row.poi_status) && row.blocked_shield_rescue.is_some()
 }
 
+pub(super) fn blocked_shield_refund_action_available(row: &UtxoDisplayRow) -> bool {
+    let Some(rescue) = row.blocked_shield_rescue.as_ref() else {
+        return false;
+    };
+    rescue.eligible || can_start_blocked_shield_origin_resolution(row, rescue)
+}
+
+pub(super) fn blocked_shield_refund_origin_resolving(row: &UtxoDisplayRow) -> bool {
+    row.blocked_shield_rescue.as_ref().is_some_and(|rescue| {
+        rescue.disabled_reason.as_deref() == Some(BLOCKED_SHIELD_RESCUE_RESOLVING_REASON)
+    })
+}
+
 fn is_shield_blocked_poi_status(status: &str) -> bool {
     status == "ShieldBlocked"
 }
@@ -1503,6 +1519,21 @@ pub(super) fn display_rows_from_output(
         .collect();
     rows.reverse();
     rows
+}
+
+pub(super) fn blocked_shield_rescue_display_rows(
+    output: &ListUtxosOutput,
+    rescue_rows: &std::collections::BTreeMap<
+        BlockedShieldRescueUtxoId,
+        BlockedShieldRescueRowState,
+    >,
+    in_flight_refunds: &BTreeSet<BlockedShieldRescueUtxoId>,
+) -> Vec<UtxoDisplayRow> {
+    let mut rows = display_rows_from_output(output, "", false);
+    apply_blocked_shield_rescue_rows(&mut rows, rescue_rows, in_flight_refunds);
+    rows.into_iter()
+        .filter(should_show_blocked_shield_refund_action)
+        .collect()
 }
 
 pub(super) fn apply_blocked_shield_rescue_rows(

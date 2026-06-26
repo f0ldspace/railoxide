@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window,
-    div, img, prelude::FluentBuilder as _, px, rgb,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString, Styled,
+    Window, div, img, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Disableable, Icon, IconName, Sizable, WindowExt, scroll::ScrollableElement};
+use gpui_component::{
+    Disableable, Icon, IconName, Sizable, WindowExt, button::ButtonVariants,
+    scroll::ScrollableElement,
+};
 use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
-use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
 use ui::theme::{self};
 use wallet_ops::{
     ListUtxosOutput, TokenAnchorRateCache, TokenTotal,
@@ -20,10 +24,14 @@ use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 use super::chain_load::loading_summary;
 use super::public_account::render_public_address_qr_dialog_content;
+use super::utxo::{
+    UtxoDisplayRow, blocked_shield_refund_action_available, blocked_shield_refund_origin_resolving,
+    blocked_shield_rescue_display_rows, recoverable_poi_candidate_count, short_hash,
+};
 use super::{
     ChainUtxoState, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, UnshieldAsset, WalletRoot, centered_message,
-    dialog_content_max_height, dialog_max_height, parse_address, scrollable_dialog_content,
-    secondary_dialog_content_width, token_display_metadata,
+    dialog_content_max_height, dialog_max_height, parse_address, rgb_with_alpha,
+    scrollable_dialog_content, secondary_dialog_content_width, token_display_metadata,
 };
 
 #[cfg(test)]
@@ -47,6 +55,25 @@ pub(super) struct FormattedTokenTotal {
     pub(super) pending_outgoing_total: Option<U256>,
     pub(super) decimals: Option<u8>,
     pub(super) icon_path: Option<WalletIconSource>,
+}
+
+#[derive(Clone)]
+struct PrivatePendingAssetLine {
+    label: String,
+    amount: String,
+}
+
+#[derive(Clone)]
+struct PrivatePendingSummary {
+    blocked_shield_rows: Vec<UtxoDisplayRow>,
+    pending_poi_assets: Vec<PrivatePendingAssetLine>,
+    pending_incoming_assets: Vec<PrivatePendingAssetLine>,
+    pending_outgoing_assets: Vec<PrivatePendingAssetLine>,
+    pending_incoming_outputs: usize,
+    pending_outgoing_outputs: usize,
+    recoverable_poi_outputs: usize,
+    poi_refreshing: bool,
+    poi_refresh_session: Option<Arc<wallet_ops::WalletSession>>,
 }
 
 pub(super) fn max_unshield_amount_from_snapshot(
@@ -333,6 +360,91 @@ pub(super) fn should_show_pending_amount(pending_total: Option<U256>) -> bool {
     pending_total.is_some_and(|amount| !amount.is_zero())
 }
 
+fn private_pending_summary(
+    assets: &[FormattedTokenTotal],
+    snapshot: &ListUtxosOutput,
+    blocked_shield_rows: Vec<UtxoDisplayRow>,
+    poi_refreshing: bool,
+    poi_refresh_session: Option<Arc<wallet_ops::WalletSession>>,
+) -> Option<PrivatePendingSummary> {
+    let pending_poi_assets = assets
+        .iter()
+        .filter(|asset| should_show_pending_poi_amount(asset.pending_poi_total))
+        .map(|asset| PrivatePendingAssetLine {
+            label: asset.label.clone(),
+            amount: asset.pending_poi_amount.clone(),
+        })
+        .collect::<Vec<_>>();
+    let pending_incoming_assets = assets
+        .iter()
+        .filter(|asset| should_show_pending_amount(asset.pending_incoming_total))
+        .map(|asset| PrivatePendingAssetLine {
+            label: asset.label.clone(),
+            amount: asset.pending_incoming_amount.clone(),
+        })
+        .collect::<Vec<_>>();
+    let pending_outgoing_assets = assets
+        .iter()
+        .filter(|asset| should_show_pending_amount(asset.pending_outgoing_total))
+        .map(|asset| PrivatePendingAssetLine {
+            label: asset.label.clone(),
+            amount: asset.pending_outgoing_amount.clone(),
+        })
+        .collect::<Vec<_>>();
+    let pending_incoming_outputs = snapshot.utxos.iter().filter(|row| row.pending_new).count();
+    let pending_outgoing_outputs = snapshot
+        .utxos
+        .iter()
+        .filter(|row| row.pending_spent || row.local_pending_spent)
+        .count();
+    let recoverable_poi_outputs = recoverable_poi_candidate_count(snapshot);
+
+    if pending_poi_assets.is_empty()
+        && pending_incoming_assets.is_empty()
+        && pending_outgoing_assets.is_empty()
+        && blocked_shield_rows.is_empty()
+        && recoverable_poi_outputs == 0
+    {
+        return None;
+    }
+
+    Some(PrivatePendingSummary {
+        blocked_shield_rows,
+        pending_poi_assets,
+        pending_incoming_assets,
+        pending_outgoing_assets,
+        pending_incoming_outputs,
+        pending_outgoing_outputs,
+        recoverable_poi_outputs,
+        poi_refreshing,
+        poi_refresh_session,
+    })
+}
+
+fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'static str {
+    if !summary.blocked_shield_rows.is_empty() {
+        "Blocked Shield private outputs need attention."
+    } else if summary.recoverable_poi_outputs > 0 {
+        "Some private outputs need PPOI recovery before they become spendable."
+    } else if !summary.pending_poi_assets.is_empty() {
+        "Some private outputs are waiting for PPOI validation before they become spendable."
+    } else if summary.pending_incoming_outputs > 0 && summary.pending_outgoing_outputs > 0 {
+        "Incoming private outputs and outgoing private spends are waiting for confirmation."
+    } else if summary.pending_incoming_outputs > 0 {
+        "Incoming private outputs are waiting for confirmation."
+    } else {
+        "Outgoing private spends are waiting for confirmation."
+    }
+}
+
+fn private_pending_summary_title(summary: &PrivatePendingSummary) -> &'static str {
+    if summary.blocked_shield_rows.is_empty() {
+        "Private balance update pending"
+    } else {
+        "Private assets need attention"
+    }
+}
+
 pub(super) fn build_unshield_asset(
     snapshot: &ListUtxosOutput,
     asset: &FormattedTokenTotal,
@@ -475,6 +587,7 @@ impl WalletRoot {
         let unshield_asset = assets
             .iter()
             .find_map(|asset| build_unshield_asset(snapshot, asset));
+        let pending_summary = self.private_pending_summary_from_snapshot(snapshot, &assets);
         if assets.is_empty() {
             let message = if syncing {
                 loading_summary(progress)
@@ -518,6 +631,12 @@ impl WalletRoot {
                         column.child(Self::render_private_receive_action(
                             root.clone(),
                             receive_available,
+                        ))
+                    })
+                    .when_some(pending_summary, |column, summary| {
+                        column.child(Self::render_private_pending_status_card(
+                            root.clone(),
+                            summary,
                         ))
                     })
                     .children(assets.into_iter().enumerate().map(|(ix, asset)| {
@@ -587,6 +706,225 @@ impl WalletRoot {
                     root.open_private_receive_address_dialog(window, cx);
                 });
             })
+    }
+
+    fn open_private_pending_status_dialog(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        window.close_all_dialogs(cx);
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let content_root = root.clone();
+            let content = content_root
+                .read(cx)
+                .current_private_pending_summary()
+                .map_or_else(
+                    || private_pending_status_empty(content_width),
+                    |summary| {
+                        Self::render_private_pending_status_dialog_content(
+                            content_root.clone(),
+                            summary,
+                            content_width,
+                        )
+                    },
+                );
+            dialog
+                .w(dialog_width)
+                .max_h(dialog_max_height)
+                .title(app_strong_text("Private asset status"))
+                .child(scrollable_dialog_content(content_max_height, content))
+        });
+    }
+
+    fn current_private_pending_summary(&self) -> Option<PrivatePendingSummary> {
+        let snapshot = self.chain_states.get(&self.selected_chain)?.snapshot()?;
+        let assets = format_private_asset_rows_from_snapshot(
+            snapshot,
+            Some(&self.effective_token_registry),
+            Some(&self.public_broadcaster_anchor_cache),
+        );
+        self.private_pending_summary_from_snapshot(snapshot, &assets)
+    }
+
+    fn private_pending_summary_from_snapshot(
+        &self,
+        snapshot: &ListUtxosOutput,
+        assets: &[FormattedTokenTotal],
+    ) -> Option<PrivatePendingSummary> {
+        let chain_state = self.chain_states.get(&self.selected_chain);
+        let blocked_shield_rows = blocked_shield_rescue_display_rows(
+            snapshot,
+            &self.blocked_shield_rescue_rows,
+            &self.blocked_shield_refunds_in_flight,
+        );
+        private_pending_summary(
+            assets,
+            snapshot,
+            blocked_shield_rows,
+            chain_state.is_some_and(ChainUtxoState::poi_refreshing),
+            chain_state.and_then(ChainUtxoState::poi_refresh_session),
+        )
+    }
+
+    fn render_private_pending_status_card(
+        root: Entity<Self>,
+        summary: PrivatePendingSummary,
+    ) -> gpui::Div {
+        let details_root = root.clone();
+        let retry_session = summary.poi_refresh_session.clone();
+        let retrying = summary.poi_refreshing;
+        let recoverable = summary.recoverable_poi_outputs;
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb_with_alpha(theme::WARNING, 0.08))
+            .p(px(14.0))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        Icon::new(RailgunActionIcon::Clock)
+                            .small()
+                            .text_color(rgb(theme::WARNING)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_strong_text(private_pending_summary_title(&summary)))
+                            .child(
+                                app_muted_text(private_pending_summary_detail(&summary))
+                                    .line_height(px(18.0))
+                                    .whitespace_normal(),
+                            ),
+                    )
+                    .child(
+                        app_button_base("wallet-private-pending-details")
+                            .ghost()
+                            .xsmall()
+                            .compact()
+                            .child("Details")
+                            .on_click(move |_event, window, cx| {
+                                details_root.update(cx, |root, cx| {
+                                    root.open_private_pending_status_dialog(window, cx);
+                                });
+                            }),
+                    ),
+            )
+            .when(recoverable > 0, |card| {
+                card.child(
+                    div().flex().flex_wrap().items_center().gap_2().child(
+                        app_button(
+                            "wallet-private-pending-retry-poi",
+                            retry_poi_label(recoverable),
+                        )
+                        .outline()
+                        .small()
+                        .loading(retrying)
+                        .disabled(retrying || retry_session.is_none())
+                        .on_click(move |_event, _window, cx| {
+                            Self::retry_poi_recovery(retry_session.clone(), cx);
+                        }),
+                    ),
+                )
+            })
+    }
+
+    fn render_private_pending_status_dialog_content(
+        root: Entity<Self>,
+        summary: PrivatePendingSummary,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        let retry_session = summary.poi_refresh_session.clone();
+        let retrying = summary.poi_refreshing;
+        let recoverable = summary.recoverable_poi_outputs;
+        let show_recovery = recoverable > 0 || !summary.pending_poi_assets.is_empty();
+
+        div()
+            .w(content_width)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(private_pending_dialog_intro())
+            .when(!summary.blocked_shield_rows.is_empty(), |this| {
+                this.child(private_blocked_shield_detail_section(
+                    root.clone(),
+                    &summary.blocked_shield_rows,
+                ))
+            })
+            .when(!summary.pending_incoming_assets.is_empty(), |this| {
+                this.child(private_pending_detail_section(
+                    "Pending incoming",
+                    pending_output_count_label(summary.pending_incoming_outputs),
+                    "Detected private outputs waiting for chain confirmation and safe-head finality.",
+                    &summary.pending_incoming_assets,
+                    "+",
+                ))
+            })
+            .when(!summary.pending_outgoing_assets.is_empty(), |this| {
+                this.child(private_pending_detail_section(
+                    "Pending outgoing",
+                    pending_output_count_label(summary.pending_outgoing_outputs),
+                    "Detected or locally submitted private spends waiting for confirmation.",
+                    &summary.pending_outgoing_assets,
+                    "-",
+                ))
+            })
+            .when(!summary.pending_poi_assets.is_empty(), |this| {
+                this.child(private_pending_detail_section(
+                    "PPOI pending",
+                    pending_asset_count_label(summary.pending_poi_assets.len()),
+                    "Balances are detected but not PPOI-verified yet, so they are not spendable.",
+                    &summary.pending_poi_assets,
+                    "",
+                ))
+            })
+            .when(show_recovery, |this| {
+                this.child(private_pending_recovery_section(recoverable))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        app_button("wallet-private-pending-dialog-close", "Close")
+                            .outline()
+                            .small()
+                            .on_click(move |_event, window, cx| {
+                                window.close_dialog(cx);
+                            }),
+                    )
+                    .when(recoverable > 0, |actions| {
+                        actions.child(
+                            app_button(
+                                "wallet-private-pending-dialog-retry-poi",
+                                retry_poi_label(recoverable),
+                            )
+                            .primary()
+                            .small()
+                            .loading(retrying)
+                            .disabled(retrying || retry_session.is_none())
+                            .on_click(move |_event, _window, cx| {
+                                Self::retry_poi_recovery(retry_session.clone(), cx);
+                            }),
+                        )
+                    }),
+            )
     }
 
     fn render_private_balance_hero(
@@ -856,6 +1194,272 @@ fn private_asset_pending_label(label: impl Into<SharedString>) -> gpui::Div {
                 .whitespace_nowrap()
                 .text_align(gpui::TextAlign::Right),
         )
+}
+
+fn retry_poi_label(count: usize) -> String {
+    if count == 1 {
+        "Retry PPOI recovery".to_string()
+    } else {
+        format!("Retry PPOI recovery ({count})")
+    }
+}
+
+fn private_pending_dialog_intro() -> gpui::Div {
+    div()
+        .text_size(px(13.0))
+        .line_height(px(19.0))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(
+            "Private balances update from locally scanned Railgun events. Pending entries stay visible while confirmations, spends, or PPOI validation finish.",
+        )
+}
+
+fn private_pending_status_empty(content_width: Pixels) -> gpui::Div {
+    div()
+        .w(content_width)
+        .text_size(px(13.0))
+        .line_height(px(19.0))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child("No private asset status currently needs attention.")
+}
+
+fn private_pending_detail_section(
+    title: &'static str,
+    count_label: String,
+    detail: &'static str,
+    assets: &[PrivatePendingAssetLine],
+    prefix: &'static str,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .p(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(app_strong_text(title))
+                .child(app_muted_text(count_label).text_size(px(12.0))),
+        )
+        .child(
+            app_muted_text(detail)
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .whitespace_normal(),
+        )
+        .children(
+            assets
+                .iter()
+                .map(|asset| private_pending_asset_amount_row(asset, prefix)),
+        )
+}
+
+fn private_blocked_shield_detail_section(
+    root: Entity<WalletRoot>,
+    rows: &[UtxoDisplayRow],
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .p(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(app_strong_text("Blocked Shields"))
+                .child(app_muted_text(pending_output_count_label(rows.len())).text_size(px(12.0))),
+        )
+        .child(
+            app_muted_text("Blocked Shield outputs cannot be spent privately, but can be refunded to the original public source account when the origin is available.")
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .whitespace_normal(),
+        )
+        .children(
+            rows.iter()
+                .cloned()
+                .enumerate()
+                .map(|(ix, row)| private_blocked_shield_row(root.clone(), ix, row)),
+        )
+}
+
+fn private_blocked_shield_row(
+    root: Entity<WalletRoot>,
+    ix: usize,
+    row: UtxoDisplayRow,
+) -> gpui::Div {
+    let status = blocked_shield_status_label(&row);
+    let action_available = blocked_shield_refund_action_available(&row);
+    let resolving = blocked_shield_refund_origin_resolving(&row);
+    let action_label = blocked_shield_action_label(&row);
+    let action_row = row.clone();
+    let mut action = app_button(
+        SharedString::from(format!("wallet-private-blocked-shield-action-{ix}")),
+        action_label,
+    )
+    .small();
+    if row
+        .blocked_shield_rescue
+        .as_ref()
+        .is_some_and(|rescue| rescue.eligible)
+    {
+        action = action.danger();
+    } else {
+        action = action.outline();
+    }
+    action = action.loading(resolving).disabled(resolving);
+    if action_available {
+        action = action.on_click(move |_event, window, cx| {
+            let row = action_row.clone();
+            root.update(cx, |root, cx| {
+                root.begin_blocked_shield_refund(&row, window, cx);
+            });
+        });
+    } else {
+        action = action.disabled(true);
+    }
+
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_3()
+        .text_size(px(12.0))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(rgb(theme::TEXT))
+                        .child(SharedString::from(format!("{} {}", row.amount, row.token))),
+                )
+                .child(
+                    app_muted_text(format!("{} · {}", status, short_hash(&row.source_tx_hash)))
+                        .text_size(px(12.0)),
+                ),
+        )
+        .child(action)
+}
+
+fn blocked_shield_action_label(row: &UtxoDisplayRow) -> &'static str {
+    if blocked_shield_refund_action_available(row) || blocked_shield_refund_origin_resolving(row) {
+        "Refund"
+    } else {
+        "Unavailable"
+    }
+}
+
+fn blocked_shield_status_label(row: &UtxoDisplayRow) -> String {
+    let Some(rescue) = row.blocked_shield_rescue.as_ref() else {
+        return "Refund unavailable".to_string();
+    };
+    if rescue.eligible {
+        return "Refund available".to_string();
+    }
+    if blocked_shield_refund_action_available(row) {
+        return "Origin check needed".to_string();
+    }
+    rescue
+        .disabled_reason
+        .clone()
+        .unwrap_or_else(|| "Refund unavailable".to_string())
+}
+
+fn private_pending_asset_amount_row(
+    asset: &PrivatePendingAssetLine,
+    prefix: &'static str,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .text_size(px(12.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(rgb(theme::TEXT))
+                .child(SharedString::from(asset.label.clone())),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(format!(
+                    "{prefix}{} {}",
+                    asset.amount, asset.label
+                ))),
+        )
+}
+
+fn private_pending_recovery_section(recoverable: usize) -> gpui::Div {
+    let detail = if recoverable == 0 {
+        "No recoverable PPOI outputs were found in the current snapshot. This state is informational unless it changes."
+    } else {
+        "Recoverable PPOI outputs can be retried without querying wallet-specific balances from a server."
+    };
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .p(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(app_strong_text("Recoverable PPOI outputs"))
+                .child(app_muted_text(pending_output_count_label(recoverable)).text_size(px(12.0))),
+        )
+        .child(
+            app_muted_text(detail)
+                .text_size(px(12.0))
+                .line_height(px(17.0))
+                .whitespace_normal(),
+        )
+}
+
+fn pending_output_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 output".to_string()
+    } else {
+        format!("{count} outputs")
+    }
+}
+
+fn pending_asset_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 asset".to_string()
+    } else {
+        format!("{count} assets")
+    }
 }
 
 pub(super) fn refresh_form_asset_from_snapshot(
