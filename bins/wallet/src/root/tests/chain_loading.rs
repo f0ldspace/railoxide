@@ -152,3 +152,91 @@ fn progress_detail_describes_commitment_tail() {
         "Checking commitment tail: block 225 of 300"
     );
 }
+
+#[test]
+fn wallet_status_presence_classifies_sync_and_ppoi_health() {
+    let ppoi_attention = WalletStatusCounts {
+        recoverable_poi_outputs: 2,
+        ..WalletStatusCounts::default()
+    };
+    let blocked_shield_attention = WalletStatusCounts {
+        blocked_shield_outputs: 1,
+        ..WalletStatusCounts::default()
+    };
+
+    assert_eq!(sync_presence_status(true, false), PresenceStatus::Active);
+    assert_eq!(sync_presence_status(false, true), PresenceStatus::Healthy);
+    assert_eq!(sync_presence_status(false, false), PresenceStatus::Unknown);
+    assert_eq!(ppoi_presence_status(true, true), PresenceStatus::Active);
+    assert_eq!(ppoi_presence_status(false, true), PresenceStatus::Healthy);
+    assert_eq!(ppoi_presence_status(false, false), PresenceStatus::Unknown);
+    assert_eq!(ppoi_attention.ppoi_attention_count(), 2);
+    assert_eq!(blocked_shield_attention.ppoi_attention_count(), 1);
+}
+
+#[test]
+fn ready_wallet_status_labels_prioritize_actionable_private_attention() {
+    assert_eq!(
+        ready_wallet_status_labels(WalletStatusCounts::default()),
+        SyncStatusLabels {
+            title: "Wallet ready".to_string(),
+            percent: 100,
+            detail: "Private wallet synced and ready".to_string(),
+        }
+    );
+    assert_eq!(
+        ready_wallet_status_labels(WalletStatusCounts {
+            blocked_shield_outputs: 1,
+            recoverable_poi_outputs: 3,
+            ..WalletStatusCounts::default()
+        }),
+        SyncStatusLabels {
+            title: "Private assets need attention".to_string(),
+            percent: 100,
+            detail: "1 blocked Shield output needs attention".to_string(),
+        }
+    );
+    assert_eq!(
+        ready_wallet_status_labels(WalletStatusCounts {
+            recoverable_poi_outputs: 3,
+            ..WalletStatusCounts::default()
+        }),
+        SyncStatusLabels {
+            title: "PPOI recovery available".to_string(),
+            percent: 100,
+            detail: "3 outputs can retry PPOI recovery".to_string(),
+        }
+    );
+    assert_eq!(
+        ready_wallet_status_labels(WalletStatusCounts {
+            pending_incoming_outputs: 1,
+            pending_outgoing_outputs: 2,
+            pending_poi_assets: 1,
+            ..WalletStatusCounts::default()
+        }),
+        SyncStatusLabels {
+            title: "Private balance update pending".to_string(),
+            percent: 100,
+            detail: "1 incoming output · 2 outgoing outputs · 1 PPOI-pending asset".to_string(),
+        }
+    );
+}
+
+#[test]
+fn ready_wallet_status_text_is_hidden_for_all_ready_states() {
+    assert!(!ready_wallet_status_shows_text(
+        WalletStatusCounts::default()
+    ));
+    assert!(!ready_wallet_status_shows_text(WalletStatusCounts {
+        pending_incoming_outputs: 1,
+        ..WalletStatusCounts::default()
+    }));
+    assert!(!ready_wallet_status_shows_text(WalletStatusCounts {
+        recoverable_poi_outputs: 1,
+        ..WalletStatusCounts::default()
+    }));
+    assert!(!ready_wallet_status_shows_text(WalletStatusCounts {
+        blocked_shield_outputs: 1,
+        ..WalletStatusCounts::default()
+    }));
+}

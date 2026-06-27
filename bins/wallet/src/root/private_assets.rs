@@ -423,7 +423,11 @@ fn private_pending_summary(
 
 fn private_pending_summary_detail(summary: &PrivatePendingSummary) -> &'static str {
     if !summary.blocked_shield_rows.is_empty() {
-        "Blocked Shield private outputs need attention."
+        if summary.blocked_shield_rows.len() == 1 {
+            "A blocked Shield can be reviewed and refunded."
+        } else {
+            "Blocked Shields can be reviewed and refunded."
+        }
     } else if summary.recoverable_poi_outputs > 0 {
         "Some private outputs need PPOI recovery before they become spendable."
     } else if !summary.pending_poi_assets.is_empty() {
@@ -708,7 +712,11 @@ impl WalletRoot {
             })
     }
 
-    fn open_private_pending_status_dialog(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(super) fn open_private_pending_status_dialog(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         window.close_all_dialogs(cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
@@ -773,9 +781,6 @@ impl WalletRoot {
         summary: PrivatePendingSummary,
     ) -> gpui::Div {
         let details_root = root.clone();
-        let retry_session = summary.poi_refresh_session.clone();
-        let retrying = summary.poi_refreshing;
-        let recoverable = summary.recoverable_poi_outputs;
 
         div()
             .w_full()
@@ -824,23 +829,6 @@ impl WalletRoot {
                             }),
                     ),
             )
-            .when(recoverable > 0, |card| {
-                card.child(
-                    div().flex().flex_wrap().items_center().gap_2().child(
-                        app_button(
-                            "wallet-private-pending-retry-poi",
-                            retry_poi_label(recoverable),
-                        )
-                        .outline()
-                        .small()
-                        .loading(retrying)
-                        .disabled(retrying || retry_session.is_none())
-                        .on_click(move |_event, _window, cx| {
-                            Self::retry_poi_recovery(retry_session.clone(), cx);
-                        }),
-                    ),
-                )
-            })
     }
 
     fn render_private_pending_status_dialog_content(
@@ -851,7 +839,7 @@ impl WalletRoot {
         let retry_session = summary.poi_refresh_session.clone();
         let retrying = summary.poi_refreshing;
         let recoverable = summary.recoverable_poi_outputs;
-        let show_recovery = recoverable > 0 || !summary.pending_poi_assets.is_empty();
+        let show_recovery = recoverable > 0;
 
         div()
             .w(content_width)
@@ -872,6 +860,9 @@ impl WalletRoot {
                     "Detected private outputs waiting for chain confirmation and safe-head finality.",
                     &summary.pending_incoming_assets,
                     "+",
+                    theme::WARNING,
+                    RailgunActionIcon::Clock,
+                    None,
                 ))
             })
             .when(!summary.pending_outgoing_assets.is_empty(), |this| {
@@ -881,6 +872,9 @@ impl WalletRoot {
                     "Detected or locally submitted private spends waiting for confirmation.",
                     &summary.pending_outgoing_assets,
                     "-",
+                    theme::WARNING,
+                    RailgunActionIcon::Clock,
+                    None,
                 ))
             })
             .when(!summary.pending_poi_assets.is_empty(), |this| {
@@ -890,6 +884,9 @@ impl WalletRoot {
                     "Balances are detected but not PPOI-verified yet, so they are not spendable.",
                     &summary.pending_poi_assets,
                     "",
+                    theme::WARNING,
+                    RailgunActionIcon::Clock,
+                    (recoverable == 0).then_some("No recoverable PPOI outputs found yet."),
                 ))
             })
             .when(show_recovery, |this| {
@@ -1209,9 +1206,7 @@ fn private_pending_dialog_intro() -> gpui::Div {
         .text_size(px(13.0))
         .line_height(px(19.0))
         .text_color(rgb(theme::TEXT_MUTED))
-        .child(
-            "Private balances update from locally scanned Railgun events. Pending entries stay visible while confirmations, spends, or PPOI validation finish.",
-        )
+        .child("Private balances update automatically from scanned Railgun events.")
 }
 
 fn private_pending_status_empty(content_width: Pixels) -> gpui::Div {
@@ -1229,26 +1224,20 @@ fn private_pending_detail_section(
     detail: &'static str,
     assets: &[PrivatePendingAssetLine],
     prefix: &'static str,
+    accent_color: u32,
+    icon: RailgunActionIcon,
+    footer_note: Option<&'static str>,
 ) -> gpui::Div {
-    div()
-        .w_full()
+    let content = div()
         .flex()
         .flex_col()
         .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .p(px(10.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(app_strong_text(title))
-                .child(app_muted_text(count_label).text_size(px(12.0))),
-        )
+        .child(private_pending_section_header(
+            title,
+            count_label,
+            accent_color,
+            icon,
+        ))
         .child(
             app_muted_text(detail)
                 .text_size(px(12.0))
@@ -1260,31 +1249,74 @@ fn private_pending_detail_section(
                 .iter()
                 .map(|asset| private_pending_asset_amount_row(asset, prefix)),
         )
+        .when_some(footer_note, |content, note| {
+            content.child(
+                app_muted_text(note)
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .whitespace_normal(),
+            )
+        });
+    private_pending_section_card(accent_color, content)
+}
+
+fn private_pending_section_card(accent_color: u32, content: gpui::Div) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .items_start()
+        .gap_3()
+        .p(px(10.0))
+        .child(private_pending_section_accent(accent_color))
+        .child(content.flex_1().min_w(px(0.0)))
+}
+
+fn private_pending_section_accent(accent_color: u32) -> gpui::Div {
+    div()
+        .w(px(3.0))
+        .min_h(px(48.0))
+        .h_full()
+        .flex_none()
+        .rounded_full()
+        .bg(rgb_with_alpha(accent_color, 0.82))
+}
+
+fn private_pending_section_header(
+    title: &'static str,
+    count_label: String,
+    accent_color: u32,
+    icon: RailgunActionIcon,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(icon).xsmall().text_color(rgb(accent_color)))
+                .child(app_strong_text(title)),
+        )
+        .child(app_muted_text(count_label).text_size(px(12.0)))
 }
 
 fn private_blocked_shield_detail_section(
     root: Entity<WalletRoot>,
     rows: &[UtxoDisplayRow],
 ) -> gpui::Div {
-    div()
-        .w_full()
+    let content = div()
         .flex()
         .flex_col()
         .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .p(px(10.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(app_strong_text("Blocked Shields"))
-                .child(app_muted_text(pending_output_count_label(rows.len())).text_size(px(12.0))),
-        )
+        .child(private_pending_section_header(
+            "Blocked Shields",
+            pending_output_count_label(rows.len()),
+            theme::DANGER,
+            RailgunActionIcon::Shield,
+        ))
         .child(
             app_muted_text("Blocked Shield outputs cannot be spent privately, but can be refunded to the original public source account when the origin is available.")
                 .text_size(px(12.0))
@@ -1296,7 +1328,8 @@ fn private_blocked_shield_detail_section(
                 .cloned()
                 .enumerate()
                 .map(|(ix, row)| private_blocked_shield_row(root.clone(), ix, row)),
-        )
+        );
+    private_pending_section_card(theme::DANGER, content)
 }
 
 fn private_blocked_shield_row(
@@ -1414,36 +1447,23 @@ fn private_pending_asset_amount_row(
 }
 
 fn private_pending_recovery_section(recoverable: usize) -> gpui::Div {
-    let detail = if recoverable == 0 {
-        "No recoverable PPOI outputs were found in the current snapshot. This state is informational unless it changes."
-    } else {
-        "Recoverable PPOI outputs can be retried without querying wallet-specific balances from a server."
-    };
-    div()
-        .w_full()
+    let content = div()
         .flex()
         .flex_col()
         .gap_2()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .bg(rgb(theme::SURFACE))
-        .p(px(10.0))
+        .child(private_pending_section_header(
+            "Recoverable PPOI outputs",
+            pending_output_count_label(recoverable),
+            theme::DANGER,
+            RailgunActionIcon::Clock,
+        ))
         .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(app_strong_text("Recoverable PPOI outputs"))
-                .child(app_muted_text(pending_output_count_label(recoverable)).text_size(px(12.0))),
-        )
-        .child(
-            app_muted_text(detail)
+            app_muted_text("Recoverable PPOI outputs can be retried without querying wallet-specific balances from a server.")
                 .text_size(px(12.0))
                 .line_height(px(17.0))
                 .whitespace_normal(),
-        )
+        );
+    private_pending_section_card(theme::DANGER, content)
 }
 
 fn pending_output_count_label(count: usize) -> String {

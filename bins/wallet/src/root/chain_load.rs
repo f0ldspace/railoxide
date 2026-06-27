@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use gpui::{Context, ParentElement, SharedString, Styled, Window, div, px, rgb};
+use gpui::{
+    AnyElement, Context, ParentElement, SharedString, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
+};
 use gpui_component::{WindowExt, progress::Progress as UiProgress};
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, watch};
@@ -12,7 +15,7 @@ use wallet_ops::{
 };
 
 use super::utxo::should_focus_utxo_table;
-use super::{BroadcasterActivityTab, WalletRoot, WalletTab};
+use super::{BroadcasterActivityTab, WalletRoot, WalletTab, count_label};
 
 pub(super) enum ChainUtxoState {
     Idle,
@@ -108,6 +111,111 @@ pub(super) struct SyncStatusLabels {
     pub(super) title: String,
     pub(super) percent: u8,
     pub(super) detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PresenceStatus {
+    Healthy,
+    Active,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct WalletStatusCounts {
+    pub(super) pending_incoming_outputs: usize,
+    pub(super) pending_outgoing_outputs: usize,
+    pub(super) pending_poi_assets: usize,
+    pub(super) recoverable_poi_outputs: usize,
+    pub(super) blocked_shield_outputs: usize,
+}
+
+impl WalletStatusCounts {
+    pub(super) const fn has_private_attention(self) -> bool {
+        self.pending_incoming_outputs > 0
+            || self.pending_outgoing_outputs > 0
+            || self.pending_poi_assets > 0
+            || self.recoverable_poi_outputs > 0
+            || self.blocked_shield_outputs > 0
+    }
+
+    pub(super) const fn ppoi_attention_count(self) -> usize {
+        self.recoverable_poi_outputs + self.blocked_shield_outputs
+    }
+}
+
+pub(super) const fn sync_presence_status(syncing: bool, ready: bool) -> PresenceStatus {
+    if syncing {
+        PresenceStatus::Active
+    } else if ready {
+        PresenceStatus::Healthy
+    } else {
+        PresenceStatus::Unknown
+    }
+}
+
+pub(super) const fn ppoi_presence_status(
+    refreshing: bool,
+    source_available: bool,
+) -> PresenceStatus {
+    if refreshing {
+        PresenceStatus::Active
+    } else if source_available {
+        PresenceStatus::Healthy
+    } else {
+        PresenceStatus::Unknown
+    }
+}
+
+pub(super) fn ready_wallet_status_labels(counts: WalletStatusCounts) -> SyncStatusLabels {
+    let title = if counts.blocked_shield_outputs > 0 {
+        "Private assets need attention"
+    } else if counts.recoverable_poi_outputs > 0 {
+        "PPOI recovery available"
+    } else if counts.has_private_attention() {
+        "Private balance update pending"
+    } else {
+        "Wallet ready"
+    };
+    SyncStatusLabels {
+        title: title.to_string(),
+        percent: 100,
+        detail: ready_wallet_status_detail(counts),
+    }
+}
+
+fn ready_wallet_status_detail(counts: WalletStatusCounts) -> String {
+    if counts.blocked_shield_outputs > 0 {
+        let verb = if counts.blocked_shield_outputs == 1 {
+            " needs attention"
+        } else {
+            " need attention"
+        };
+        return count_label(counts.blocked_shield_outputs, "blocked Shield output") + verb;
+    }
+    if counts.recoverable_poi_outputs > 0 {
+        return count_label(counts.recoverable_poi_outputs, "output") + " can retry PPOI recovery";
+    }
+    let mut parts = Vec::new();
+    if counts.pending_incoming_outputs > 0 {
+        parts.push(count_label(
+            counts.pending_incoming_outputs,
+            "incoming output",
+        ));
+    }
+    if counts.pending_outgoing_outputs > 0 {
+        parts.push(count_label(
+            counts.pending_outgoing_outputs,
+            "outgoing output",
+        ));
+    }
+    if counts.pending_poi_assets > 0 {
+        parts.push(count_label(counts.pending_poi_assets, "PPOI-pending asset"));
+    }
+    if parts.is_empty() {
+        "Private wallet synced and ready".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 impl SyncStatusContext {
@@ -210,8 +318,34 @@ pub(super) fn sync_status_labels(
 pub(super) fn sync_status_bar(
     context: SyncStatusContext,
     progress: Option<SyncProgressUpdate>,
+    right_children: Vec<AnyElement>,
 ) -> gpui::Div {
     let labels = sync_status_labels(context, progress);
+    wallet_status_bar(labels, true, true, right_children)
+}
+
+pub(super) fn ready_status_bar(
+    counts: WalletStatusCounts,
+    right_children: Vec<AnyElement>,
+) -> gpui::Div {
+    wallet_status_bar(
+        ready_wallet_status_labels(counts),
+        false,
+        ready_wallet_status_shows_text(counts),
+        right_children,
+    )
+}
+
+pub(super) const fn ready_wallet_status_shows_text(_counts: WalletStatusCounts) -> bool {
+    false
+}
+
+fn wallet_status_bar(
+    labels: SyncStatusLabels,
+    show_progress: bool,
+    show_text: bool,
+    right_children: Vec<AnyElement>,
+) -> gpui::Div {
     div()
         .h(px(36.0))
         .flex_none()
@@ -222,34 +356,53 @@ pub(super) fn sync_status_bar(
         .bg(rgb(theme::SURFACE))
         .border_t_1()
         .border_color(rgb(theme::BORDER))
-        .child(
-            div()
-                .min_w(px(170.0))
-                .text_color(rgb(theme::TEXT))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(SharedString::from(labels.title)),
-        )
-        .child(
-            UiProgress::new()
-                .w(px(190.0))
-                .h(px(6.0))
-                .value(f32::from(labels.percent)),
-        )
-        .child(
-            div()
-                .w(px(42.0))
-                .text_color(rgb(theme::INFO))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(SharedString::from(format!("{}%", labels.percent))),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .text_size(APP_TEXT_SIZE)
-                .child(SharedString::from(labels.detail)),
-        )
+        .when(show_text, |bar| {
+            bar.child(
+                div()
+                    .min_w(px(170.0))
+                    .text_color(rgb(theme::TEXT))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from(labels.title)),
+            )
+        })
+        .when(show_progress, |bar| {
+            bar.child(
+                UiProgress::new()
+                    .w(px(190.0))
+                    .h(px(6.0))
+                    .value(f32::from(labels.percent)),
+            )
+            .child(
+                div()
+                    .w(px(42.0))
+                    .text_color(rgb(theme::INFO))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from(format!("{}%", labels.percent))),
+            )
+        })
+        .when(show_text, |bar| {
+            bar.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_size(APP_TEXT_SIZE)
+                    .child(SharedString::from(labels.detail)),
+            )
+        })
+        .when(!show_text, |bar| bar.child(div().flex_1()))
+        .when(!right_children.is_empty(), |bar| {
+            bar.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .children(right_children),
+            )
+        })
 }
 
 pub(super) fn progress_detail(progress: SyncProgressUpdate) -> String {

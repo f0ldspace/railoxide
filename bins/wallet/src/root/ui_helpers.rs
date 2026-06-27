@@ -23,6 +23,14 @@ pub(super) fn rgb_with_alpha(hex: u32, alpha: f32) -> gpui::Rgba {
     color
 }
 
+pub(super) fn count_label(count: usize, singular: &'static str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
+}
+
 pub(super) fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
     let message = message.into();
     div()

@@ -117,9 +117,9 @@ use tokens::{
 };
 use ui_helpers::{
     app_panel, app_refresh_button, app_status_tag, app_step_row, app_stepper_container,
-    centered_message, copyable_mono_field, dialog_content_max_height, dialog_max_height,
-    labeled_field, rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width,
-    token_label_row,
+    centered_message, copyable_mono_field, count_label, dialog_content_max_height,
+    dialog_max_height, labeled_field, rgb_with_alpha, scrollable_dialog_content,
+    secondary_dialog_content_width, token_label_row,
 };
 use utxo::{BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table};
 use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};
@@ -132,7 +132,11 @@ use broadcaster_picker::{
     should_preserve_estimate_after_broadcaster_policy_change,
 };
 #[cfg(test)]
-use chain_load::{loading_summary, progress_detail, wallet_generation_matches};
+use chain_load::{
+    PresenceStatus, WalletStatusCounts, loading_summary, ppoi_presence_status, progress_detail,
+    ready_wallet_status_labels, ready_wallet_status_shows_text, sync_presence_status,
+    wallet_generation_matches,
+};
 #[cfg(test)]
 use gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
 #[cfg(test)]
