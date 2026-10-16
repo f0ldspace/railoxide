@@ -1191,6 +1191,7 @@ fn ui_state_roundtrip_through_local_db() {
         version: 0,
         public_account_sort: super::PublicAccountSort::Added,
         public_hide_empty_accounts: true,
+        swap_disclaimer_acknowledged: true,
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
         last_wallet_kind: RememberedWalletKind::SoftwareProfile,
@@ -1215,6 +1216,7 @@ fn ui_state_roundtrip_through_local_db() {
             version: WALLET_UI_STATE_VERSION,
             public_account_sort: super::PublicAccountSort::Added,
             public_hide_empty_accounts: true,
+            swap_disclaimer_acknowledged: true,
             last_wallet_id: Some("wallet-123".to_owned()),
             last_chain_id: Some(137),
             last_wallet_kind: RememberedWalletKind::SoftwareProfile,
@@ -1687,6 +1689,20 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             .map(|gateway| format!("{gateway}/"))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn native_eth_presets_show_the_ethereum_mark() {
+    for chain_id in railgun_ui::built_in_chain_ids() {
+        let preset = super::presets::EvmPreset::for_chain(chain_id).unwrap();
+        let shows_ethereum_mark = railgun_ui::native_currency_icon_asset_path(chain_id)
+            == railgun_ui::chain_icon_asset_path(1);
+        assert_eq!(
+            shows_ethereum_mark,
+            preset.native_currency.symbol == "ETH",
+            "chain {chain_id}"
+        );
+    }
 }
 
 #[test]

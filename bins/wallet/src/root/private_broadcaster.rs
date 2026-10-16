@@ -52,7 +52,8 @@ mod progress;
 mod types;
 
 pub(super) use progress::{
-    apply_private_broadcaster_progress_stage, ensure_self_broadcast_unshield_progress_stage,
+    apply_private_broadcaster_progress_stage, end_private_broadcaster_progress_steps,
+    ensure_self_broadcast_unshield_progress_stage,
     fail_private_broadcaster_progress_steps_at_stage,
     finish_private_broadcaster_progress_steps_at_stage,
     finish_private_self_broadcast_progress_steps_at_stage,
@@ -60,14 +61,15 @@ pub(super) use progress::{
     private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_footer_action,
     private_broadcaster_progress_is_terminal, private_broadcaster_progress_steps,
     private_broadcaster_stage_detail, private_broadcaster_stage_id,
-    private_progress_stage_disables_stop, private_submission_discard_attempt_available,
-    self_broadcast_progress_steps, self_broadcast_step_retry_kind,
-    sponsored_stop_uses_session_command,
+    private_broadcaster_stage_label, private_progress_stage_disables_stop,
+    private_submission_discard_attempt_available, self_broadcast_progress_steps,
+    self_broadcast_step_retry_kind, sponsored_stop_uses_session_command,
 };
+pub(in crate::root) use progress::{broadcaster_resend_count, broadcaster_wait_detail};
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
-    private_broadcaster_retry_button_id, private_broadcaster_stage_label,
-    private_broadcaster_step_detail, public_broadcaster_waiting_can_stop,
+    private_broadcaster_retry_button_id, private_broadcaster_step_detail,
+    public_broadcaster_waiting_can_stop,
 };
 #[cfg(test)]
 pub(super) use progress::{
@@ -78,11 +80,12 @@ pub(super) use progress::{
 pub(super) use progress::{
     private_broadcaster_closed_active_stage, private_broadcaster_progress_is_successful,
 };
+use types::private_submission_dialog_title_action;
 pub(super) use types::{
     PrivateBroadcasterClosedActiveProgress, PrivateBroadcasterProgressState,
-    PrivateBroadcasterProgressStepState, PrivateSubmissionProgressFlow, SelfBroadcastGasRetryKind,
+    PrivateBroadcasterProgressStepState, PrivateSubmissionProgressFlow,
+    SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH, SelfBroadcastGasRetryKind,
 };
-use types::{SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH, private_submission_dialog_title_action};
 
 pub(super) struct SelfBroadcastGasRetryDialogContent {
     root: Entity<WalletRoot>,
@@ -729,7 +732,7 @@ impl WalletRoot {
             && let Some(step) = progress.steps.last_mut()
         {
             step.message = Some(Arc::from(
-                "The approved execution effects are not confirmed. This operation remains available in Stealth accounts.",
+                "The execution is not confirmed yet. This operation remains available in Stealth accounts.",
             ));
         }
         progress
@@ -1364,17 +1367,15 @@ fn self_broadcast_progress_context_rows(
         if let Some(receipt) = result.tx.receipt() {
             values.push(("Block", receipt.block_number.to_string()));
         }
-        if let wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt { status, .. } = &result.tx {
-            let execution = match status {
-                wallet_ops::vault::ExecutorPayloadStatus::Executed => "approved effects confirmed",
-                wallet_ops::vault::ExecutorPayloadStatus::Reverted => "reverted",
-                wallet_ops::vault::ExecutorPayloadStatus::MissingEffects => {
-                    "expected effects missing"
-                }
-                wallet_ops::vault::ExecutorPayloadStatus::Invalidated { .. } => {
-                    "another approved payload executed"
-                }
-                wallet_ops::vault::ExecutorPayloadStatus::Uncertain => "not confirmed",
+        if matches!(
+            result.tx,
+            wallet_ops::SelfBroadcastTxOutcome::ExecutorReceipt { .. }
+        ) {
+            // The receipt tells a revert at the time. It is recorded nowhere.
+            let execution = match result.tx.execution_status() {
+                Some(true) => "confirmed",
+                Some(false) => "reverted",
+                None => "not confirmed",
             };
             values.push(("Execution", execution.into()));
         }
@@ -1679,7 +1680,7 @@ pub(super) fn render_private_self_broadcast_status_notice(
         ),
         None if result.tx.receipt().is_some() => (
             "Execution not confirmed",
-            "The receipt does not establish the approved effects. Stealth accounts retains this operation for reconciliation and recovery.",
+            "The receipt alone does not confirm the execution. Stealth accounts keeps this operation, where Check balances updates its result.",
             theme::WARNING,
         ),
         None => (

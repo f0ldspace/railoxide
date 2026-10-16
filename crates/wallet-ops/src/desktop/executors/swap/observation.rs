@@ -5,16 +5,17 @@
 //! confirmed block, never from the orderbook's order status. Logs locate events
 //! inside the requested page. State read at the confirmed block decides what can
 //! no longer happen: spent nullifiers, the execution nonce, the order's filled
-//! amount, and, for Reshield delivery, the executor's buy-token balance. External
+//! amount, and, for Reshield and Across delivery, the executor's buy-token balance. External
 //! delivery is established by the trade alone. State also decides whether the page
 //! can hold anything new, and its logs are read only when it can. Each recorded
 //! observation keeps its block and is dropped once that block is no longer canonical.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use alloy::eips::{BlockId, BlockNumHash};
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::providers::{DynProvider, Provider as _};
 use alloy::rpc::types::{Filter, Log, TransactionRequest};
 use alloy::sol_types::{SolCall, SolEvent, SolValue as _};
@@ -23,9 +24,13 @@ use broadcaster_core::contracts::railgun::{
     Nullified, RelayAdapt7702, Shield, ShieldRequest, Transact, Transaction,
 };
 use eyre::{Result, eyre};
+use sync_service::WalletCurrentSnapshot;
 use tracing::Instrument as _;
 
 use super::super::ExecutorReconciliationReport;
+use super::super::attribution::{
+    ExecutorAttributionEvidence, InvalidatedSwapOrders, attributed_action,
+};
 use crate::ExecutorOwner;
 use crate::desktop::executor_discovery::execution_nonce_at;
 use crate::desktop::executor_observation::{
@@ -34,12 +39,15 @@ use crate::desktop::executor_observation::{
 use crate::public_wallet::PublicErc20;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
-    ExecutorOperationId, ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord,
-    IssuedExecutorPayload, SwapDelivery, SwapObservation, SwapOrderObservations, SwapOrderRecord,
-    SwapPreHookDeath, SwapPreHookDeathCause, SwapShieldObservation, SwapTradeAmounts,
+    AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, ExecutorOperationId,
+    ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload, SwapBridgeHandoff,
+    SwapBridgeOutcome, SwapDelivery, SwapFunding, SwapObservation, SwapOperationRecord,
+    SwapOrderObservations, SwapOrderRecord, SwapPreHookDeath, SwapPreHookDeathCause,
+    SwapShieldObservation, SwapTradeAmounts,
 };
 
-const MAX_OBSERVATION_BLOCKS: u64 = 64;
+/// The most blocks one observation page, and so one of its log queries, spans.
+pub(super) const MAX_OBSERVATION_BLOCKS: u64 = 64;
 
 // The pinned shared bindings have no settlement event or reads, and no getter for
 // Railgun's public nullifier map. These match the deployed contracts.
@@ -59,35 +67,72 @@ alloy::sol! {
 pub enum SwapOrderState {
     /// Nothing canonical is observed yet. The order may still fill.
     Open,
-    /// The pre-hook ran and no trade is observed. Retries stay blocked. Once
-    /// `expired`, the order can no longer fill and the sell token can be recovered.
+    /// The pre-hook ran, or a pre-hook sharing its proof and nonce funded the account, and no
+    /// trade is observed. Retries stay blocked. Once `expired`, the order can no longer fill
+    /// and the sell token can be recovered.
     PreHookOnly { expired: bool },
-    /// Traded, and the reshield isn't established yet. External delivery never stays here.
+    /// Traded, and neither the reshield nor an Across deposit is established yet. External
+    /// delivery never stays here, and NEAR Intents only until its settlement receipt is read.
     Traded,
-    /// Traded and delivered: reshielded, or paid to the External receiver.
+    /// A Bridge order handed off on this chain, without an outcome on the destination chain.
+    Bridging,
+    /// Traded and delivered: reshielded, paid to the External receiver, or delivered by the
+    /// bridge on the destination chain.
     Done,
-    /// Traded, and the executor still held buy tokens at a finalized block.
-    /// Recovery of the buy token is offered. Only Reshield delivery reaches this.
+    /// Traded, and the executor still held buy tokens at a finalized block. Recovery of the
+    /// buy token is offered. Reshield delivery and an Across post-hook that didn't run reach this.
     NotDelivered,
+    /// The bridge expired or refunded the deposit, which returns the bought token to the
+    /// executor. Recovery of it is offered once an explicit check finds it there, for Across
+    /// after that check also verified the refund on this chain.
+    Refunding,
+    /// The bridge provider reported a failed or incomplete deposit. The wallet can't recover
+    /// it; an explicit status check may still resolve it.
+    NeedsAttention,
+    /// The fill completed without the shield. The destination stealth account holds the token;
+    /// recovery is offered on the destination chain.
+    HeldOnDestination,
     /// The pre-hook can never run. Its inputs are released and a retry may start.
     AttemptEnded(SwapPreHookDeathCause),
+    /// Another attempt of the same swap use, signed at the same pre-hook nonce, traded with
+    /// the funding this order shared. This order can't fill and holds nothing to recover.
+    Superseded,
 }
 
-/// Completion needs both the trade and delivery. Observations are the last
-/// recorded ones; current decisions need a reconciled record.
+/// Completion needs both the trade and delivery, and for a Bridge order the destination
+/// outcome after its hand-off. Without a trade, `swap`'s verified funding at the order's use
+/// and pre-hook nonce counts like its own executed pre-hook, until a sibling attempt at that
+/// nonce trades and supersedes the order. Observations are the last recorded ones; current
+/// decisions need a reconciled record.
 #[must_use]
-pub fn swap_order_state(order: &SwapOrderRecord) -> SwapOrderState {
+pub fn swap_order_state(swap: &SwapOperationRecord, order: &SwapOrderRecord) -> SwapOrderState {
+    order_state(
+        order,
+        swap.funding(order).is_some(),
+        swap.traded_sibling(order).is_some(),
+    )
+}
+
+/// [`swap_order_state`] with `funded` saying whether the order shares a verified funding and
+/// `superseded` whether a sibling attempt at its pre-hook nonce traded.
+fn order_state(order: &SwapOrderRecord, funded: bool, superseded: bool) -> SwapOrderState {
     let observed = order.observations();
     if observed.traded.is_some() {
-        return if observed.delivered.is_some() {
-            SwapOrderState::Done
-        } else if observed.undelivered.is_some() {
-            SwapOrderState::NotDelivered
-        } else {
-            SwapOrderState::Traded
+        return match (observed.delivered, order.delivery()) {
+            (None, _) if observed.undelivered.is_some() => SwapOrderState::NotDelivered,
+            (None, _) => SwapOrderState::Traded,
+            // A Bridge order's delivery on this chain is its hand-off.
+            (Some(_), SwapDelivery::Bridge(_)) => bridge_state(observed.bridge_outcome),
+            (Some(_), SwapDelivery::Reshield | SwapDelivery::External { .. }) => {
+                SwapOrderState::Done
+            }
         };
     }
-    if observed.pre_hook_executed.is_some() {
+    // A recorded death keeps its cause.
+    if superseded && observed.pre_hook_dead.is_none() {
+        return SwapOrderState::Superseded;
+    }
+    if observed.pre_hook_executed.is_some() || funded {
         return SwapOrderState::PreHookOnly {
             expired: observed.expired.is_some(),
         };
@@ -99,15 +144,82 @@ pub fn swap_order_state(order: &SwapOrderRecord) -> SwapOrderState {
         })
 }
 
+/// Where a handed-off Bridge order stands, from its outcome on the destination chain.
+const fn bridge_state(outcome: Option<SwapBridgeOutcome>) -> SwapOrderState {
+    match outcome {
+        None => SwapOrderState::Bridging,
+        Some(outcome) if outcome.is_delivered() => SwapOrderState::Done,
+        Some(SwapBridgeOutcome::Refunding) => SwapOrderState::Refunding,
+        Some(SwapBridgeOutcome::HeldOnDestination { .. }) => SwapOrderState::HeldOnDestination,
+        Some(_) => SwapOrderState::NeedsAttention,
+    }
+}
+
+/// Where `order` stands as an attempt of its swap use. Equal to [`swap_order_state`] except
+/// when the use's trade and delivery sit on different attempts: then the traded attempt and
+/// the attempt holding the hand-off both report the bridge's state, from the hand-off
+/// attempt's outcome.
+#[must_use]
+pub fn swap_attempt_state(record: &ExecutorRecord, order: &SwapOrderRecord) -> SwapOrderState {
+    let observed = order.observations();
+    let paired = record.swap().and_then(|swap| {
+        if observed.traded.is_some() {
+            if observed.delivered.is_some() {
+                return None;
+            }
+            swap.delivery_order(order)
+        } else {
+            observed.bridge_handoff?;
+            swap.trade_order(order).map(|_| order)
+        }
+    });
+    paired.map_or_else(
+        || {
+            let swap = record.swap();
+            order_state(
+                order,
+                swap.is_some_and(|swap| swap.funding(order).is_some()),
+                swap.is_some_and(|swap| swap.traded_sibling(order).is_some()),
+            )
+        },
+        |delivery| bridge_state(delivery.observations().bridge_outcome),
+    )
+}
+
 impl ExecutorOwner {
-    /// Reconcile the swap executor over `range`, then update every order's
-    /// observations from the same confirmed block. The orderbook is not consulted.
-    /// If the swap read fails, the executor needs reconciliation again before any
-    /// recorded outcome is relied on.
+    /// Read the swap executor's account at the confirmed tip, then update every order's
+    /// observations from that block, locating the swap's own events in `range`. The
+    /// orderbook is not consulted. If the swap read fails, the executor needs
+    /// reconciliation again before any recorded outcome is relied on.
     pub async fn observe_swap(
         &self,
         operation: ExecutorOperationId,
         range: Range<u64>,
+    ) -> Result<ExecutorReconciliationReport> {
+        let sync = self.synced_snapshot();
+        Box::pin(self.observe_swap_synced(operation, range, sync)).await
+    }
+
+    /// Private sync's current snapshot. `None` before sync is attached and while it has none.
+    pub(in crate::desktop::executors) fn synced_snapshot(
+        &self,
+    ) -> Option<Arc<WalletCurrentSnapshot>> {
+        let wallet = self
+            .synced_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|(wallet, _)| wallet.clone())?;
+        wallet.current_snapshot()
+    }
+
+    /// [`Self::observe_swap`] with `sync` as private sync's snapshot, which attributes a
+    /// pre-hook's consumed nonce. It is read only and starts no chain read.
+    pub(crate) async fn observe_swap_synced(
+        &self,
+        operation: ExecutorOperationId,
+        range: Range<u64>,
+        sync: Option<Arc<WalletCurrentSnapshot>>,
     ) -> Result<ExecutorReconciliationReport> {
         if self
             .swap_record(operation)?
@@ -115,12 +227,10 @@ impl ExecutorOwner {
         {
             return Err(eyre!("swap order is unavailable"));
         }
-        let report = trace_step(
-            "swap_history",
-            self.reconcile_history(operation, range.clone()),
-        )
-        .await?;
-        let observed = self.read_swap_observations(report.record(), range).await;
+        let report = trace_step("swap_account", self.reconcile_account(operation)).await?;
+        let observed = self
+            .read_swap_observations(report.record(), range, sync.as_deref())
+            .await;
         let _guard = self.lock_activity().await;
         self.require_record_unchanged(report.record())?;
         self.apply_swap_observations(report, observed)
@@ -130,14 +240,11 @@ impl ExecutorOwner {
         &self,
         record: &ExecutorRecord,
         range: Range<u64>,
-    ) -> Result<Vec<(OrderUid, SwapOrderObservations)>> {
-        let mut chain = self.chain.clone();
-        chain
-            .railgun
-            .as_mut()
-            .ok_or_else(|| eyre!("chain does not support Railgun"))?
-            .deployment
-            .relay_adapt_7702_contract = record.delegate();
+        sync: Option<&WalletCurrentSnapshot>,
+    ) -> Result<SwapObserved> {
+        let mut chain = self
+            .chain_for_delegate(record.delegate())
+            .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
         trace_step(
             "swap_orders",
@@ -146,6 +253,7 @@ impl ExecutorOwner {
                 &chain,
                 record,
                 range,
+                sync,
             ))),
         )
         .await
@@ -154,7 +262,7 @@ impl ExecutorOwner {
     fn apply_swap_observations(
         &self,
         report: ExecutorReconciliationReport,
-        observed: Result<Vec<(OrderUid, SwapOrderObservations)>>,
+        observed: Result<SwapObserved>,
     ) -> Result<ExecutorReconciliationReport> {
         let ExecutorReconciliationReport { mut record, code } = report;
         let operation = record.operation();
@@ -165,7 +273,18 @@ impl ExecutorOwner {
                 return Err(error);
             }
         };
-        for (uid, observations) in observed {
+        // Fundings are written first: an interrupted update then leaves an order funded
+        // without naming its hook, which every reader handles, instead of an executed
+        // pre-hook whose sibling attempt reads as open.
+        if record
+            .swap()
+            .is_some_and(|swap| swap.fundings() != observed.fundings)
+        {
+            record = self
+                .store
+                .record_swap_fundings(operation, observed.fundings)?;
+        }
+        for (uid, observations) in observed.orders {
             let changed = record
                 .swap()
                 .and_then(|swap| swap.orders().iter().find(|order| order.uid() == uid))
@@ -260,20 +379,25 @@ async fn observe_swap_orders(
     chain: &EffectiveChainConfig,
     record: &ExecutorRecord,
     range: Range<u64>,
-) -> Result<Vec<(OrderUid, SwapOrderObservations)>> {
+    sync: Option<&WalletCurrentSnapshot>,
+) -> Result<SwapObserved> {
     let railgun = chain.require_railgun()?.deployment.contract;
     for provider in endpoints.providers().await {
         let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = provider.index);
         match trace_step(
             "swap_facts_rpc",
-            read_swap_facts(&provider.provider, chain, record, range.clone()),
+            read_swap_facts(&provider.provider, chain, record, range.clone(), sync),
         )
         .instrument(span)
         .await
         {
             Ok(facts) => {
                 endpoints.succeeded(&provider);
-                return Ok(derive_swap_observations(record, railgun, &facts));
+                let orders = derive_swap_observations(record, railgun, sync, &facts);
+                return Ok(SwapObserved {
+                    orders,
+                    fundings: facts.fundings,
+                });
             }
             Err(error) => endpoints.failed(&provider, &error),
         }
@@ -283,11 +407,20 @@ async fn observe_swap_orders(
     ))
 }
 
+/// One read's result: every order's observations and the swap's verified fundings.
+struct SwapObserved {
+    /// In the record's order.
+    orders: Vec<(OrderUid, SwapOrderObservations)>,
+    fundings: Vec<SwapFunding>,
+}
+
 /// What one read established, before it is combined with the order's recorded
 /// observations that are still canonical.
 #[derive(Default)]
 struct OrderFacts {
     retained: SwapOrderObservations,
+    /// This order's pre-hook ran. Left unset when another attempt's pre-hook shares the
+    /// evidence, which then only shows a funding.
     executed: Option<SwapObservation>,
     traded: Option<SwapObservation>,
     /// The executed amounts of the trade in `traded`.
@@ -298,16 +431,42 @@ struct OrderFacts {
     nullifiers_spent: Option<bool>,
     /// The settlement's `filledAmount` at the confirmed block, when read.
     filled: Option<U256>,
-    /// This order's buy-token balance at the confirmed block. Read only for Reshield delivery.
+    /// This order's buy-token balance at the confirmed block. Read only for orders that pay the
+    /// executor: Reshield and Across delivery.
     buy_balance: Option<U256>,
+    /// This order's trade is delivered by another attempt of its swap use, whose retained
+    /// hand-off is in the trade's receipt.
+    delivered_by_use: bool,
+    /// The funding at this order's swap use and pre-hook nonce sits in a block past the
+    /// order's `validTo`. The deadline guard reverts there, so another attempt's pre-hook ran.
+    funding_after_valid_to: bool,
 }
 
 struct SwapFacts {
+    settlement: Address,
     confirmed: BlockNumHash,
     timestamp: u64,
     nonce: U256,
     /// In the record's order.
     orders: Vec<OrderFacts>,
+    /// The recorded fundings that are still canonical and the ones this read found, at most
+    /// one per swap use and pre-hook nonce.
+    fundings: Vec<SwapFunding>,
+}
+
+/// [`SwapOperationRecord::funding`] over `fundings` and the order's retained observations,
+/// so a reorged funding or death counts for nothing.
+fn shares_funding(
+    fundings: &[SwapFunding],
+    order: &SwapOrderRecord,
+    retained: &SwapOrderObservations,
+) -> bool {
+    retained.pre_hook_dead.is_none()
+        && order.use_id().is_some_and(|use_id| {
+            fundings.iter().any(|funding| {
+                funding.use_id == use_id && funding.pre_hook_nonce == order.pre_hook().nonce()
+            })
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -380,6 +539,7 @@ async fn read_swap_facts(
     chain: &EffectiveChainConfig,
     record: &ExecutorRecord,
     range: Range<u64>,
+    sync: Option<&WalletCurrentSnapshot>,
 ) -> Result<SwapFacts> {
     let (Some(observed), Some(executor), Some(swap)) =
         (record.nonce_observation(), record.address(), record.swap())
@@ -450,9 +610,58 @@ async fn read_swap_facts(
                 pre_hook_dead,
                 undelivered: headers.keep(recorded.undelivered).await?,
                 expired: headers.keep(recorded.expired).await?,
+                bridge_handoff: if let Some(handoff) = recorded.bridge_handoff {
+                    headers
+                        .keep(Some(handoff.observation))
+                        .await?
+                        .map(|observation| SwapBridgeHandoff {
+                            observation,
+                            ..handoff
+                        })
+                } else {
+                    None
+                },
+                post_hook_deposit: headers.keep(recorded.post_hook_deposit).await?,
+                // The destination chain's outcome isn't evidence on this chain.
+                bridge_outcome: recorded.bridge_outcome,
+                bridge_refund: headers.keep(recorded.bridge_refund).await?,
             },
             ..OrderFacts::default()
         });
+    }
+    // This mirrors `SwapOperationRecord::delivery_order` over retained observations instead
+    // of recorded ones, so a reorged trade or hand-off pairs nothing.
+    let delivered_by_use = swap
+        .orders()
+        .iter()
+        .zip(&orders)
+        .map(|(order, facts)| {
+            facts.retained.delivered.is_none()
+                && order.use_id().is_some()
+                && facts.retained.traded.is_some_and(|trade| {
+                    swap.orders()
+                        .iter()
+                        .zip(&orders)
+                        .any(|(other, other_facts)| {
+                            other.use_id() == order.use_id()
+                                && other_facts.retained.traded.is_none()
+                                && other_facts.retained.delivered.is_some()
+                                && other_facts
+                                    .retained
+                                    .bridge_handoff
+                                    .is_some_and(|handoff| handoff.observation == trade)
+                        })
+                })
+        })
+        .collect::<Vec<_>>();
+    for (facts, delivered) in orders.iter_mut().zip(delivered_by_use) {
+        facts.delivered_by_use = delivered;
+    }
+    let mut fundings = Vec::with_capacity(swap.fundings().len());
+    for funding in swap.fundings() {
+        if headers.keep(Some(funding.observation)).await?.is_some() {
+            fundings.push(*funding);
+        }
     }
 
     // State at the confirmed block decides first whether the page's logs can hold
@@ -461,8 +670,14 @@ async fn read_swap_facts(
         record,
         swap.orders(),
         &orders,
+        &fundings,
         observed.nonce(),
         tip.timestamp,
+        &ExecutorAttributionEvidence {
+            railgun,
+            sync,
+            invalidated_orders: None,
+        },
     ) || any_order_filled(
         provider,
         settlement,
@@ -514,7 +729,10 @@ async fn read_swap_facts(
             .push(log);
     }
 
+    // Pre-hook effects found in this read, for orders of a swap use.
+    let mut found = Vec::new();
     for (order, facts) in swap.orders().iter().zip(&mut orders) {
+        let funded = shares_funding(&fundings, order, &facts.retained);
         let pre_hook = RelayAdapt7702::executeCall::abi_decode(
             issued(record, order.pre_hook().payload())?
                 .context()
@@ -550,6 +768,25 @@ async fn read_swap_facts(
         {
             facts.retained.shielded = Some(credit);
         }
+        // Likewise, a receipt's Across deposit is the post-hook's once its nonce passed there,
+        // unless another post-hook at that nonce signed the same deposit.
+        if facts.retained.post_hook_deposit.is_none()
+            && let Some(handoff) = facts.retained.bridge_handoff
+            && handoff.deposit_id.is_some()
+            && let Some(post_hook) = order.post_hook()
+            && !deposit_signed_by_another_post_hook(swap.orders(), order)
+            && nonce_passed_in(
+                provider,
+                chain,
+                executor,
+                &mut headers,
+                handoff.observation.block,
+                post_hook.nonce(),
+            )
+            .await?
+        {
+            facts.retained.post_hook_deposit = Some(handoff.observation);
+        }
         let nonce = order.pre_hook().nonce();
         let valid_to = u64::from(order.valid_to());
 
@@ -557,18 +794,29 @@ async fn read_swap_facts(
             if facts.retained.pre_hook_executed.is_none()
                 && facts.retained.pre_hook_dead.is_none()
                 && facts.executed.is_none()
+                && !funded
                 && spends_all(&pre_hook)
                 && private_effects_present(railgun, &pre_hook, logs)
             {
                 let evidence = headers.evidence(*block, *transaction).await?;
-                // The deadline guard reverts after `validTo`, and only this order's
-                // pre-hook consumes its nonce `k`. A reused proof shares nullifiers
-                // with an earlier attempt's pre-hook, which these checks exclude.
+                // The deadline guard reverts after `validTo`, and only a pre-hook signed at
+                // nonce `k` consumes it. A reused proof shares nullifiers with an earlier
+                // attempt's pre-hook at another nonce, which these checks exclude. A sped-up
+                // order's pre-hook shares both, so this is a candidate until the orders are
+                // compared below.
                 if headers.at(block.number).await?.timestamp <= valid_to
                     && nonce_passed_in(provider, chain, executor, &mut headers, *block, nonce)
                         .await?
                 {
                     facts.executed = Some(evidence);
+                    if let Some(use_id) = order.use_id() {
+                        found.push(SwapFunding {
+                            use_id,
+                            pre_hook_nonce: nonce,
+                            proof: keccak256(pre_hook.abi_encode()),
+                            observation: evidence,
+                        });
+                    }
                 }
             }
             // Anyone can shield with the post-hook's public request, but only the
@@ -617,29 +865,41 @@ async fn read_swap_facts(
                     sell_amount: trade.sellAmount,
                     buy_amount: trade.buyAmount,
                     fee_amount: trade.feeAmount,
+                    settlement_gas_used: None,
+                    settlement_effective_gas_price: None,
+                    executed_fee: None,
+                    executed_fee_token: None,
                 });
                 break;
             }
         }
         let executed = facts.retained.pre_hook_executed.or(facts.executed);
         let traded = facts.retained.traded.or(facts.traded);
-        if executed.is_none() && facts.retained.pre_hook_dead.is_none() && observed.nonce() > nonce
+        if executed.is_none()
+            && !funded
+            && facts.retained.pre_hook_dead.is_none()
+            && observed.nonce() > nonce
         {
             facts.nullifiers_spent =
                 Some(nullifiers_spent(provider, railgun, &pre_hook, at_confirmed).await?);
         }
-        if traded.is_none()
-            && facts.retained.expired.is_none()
-            && tip.timestamp > valid_to
-            && facts.filled.is_none()
+        if facts.filled.is_none()
+            && ((traded.is_none() && facts.retained.expired.is_none() && tip.timestamp > valid_to)
+                || facts.nullifiers_spent == Some(false)
+                || facts
+                    .retained
+                    .pre_hook_dead
+                    .is_some_and(|death| death.cause == SwapPreHookDeathCause::Unknown))
         {
             facts.filled =
                 Some(filled_amount(provider, settlement, order.uid(), at_confirmed).await?);
         }
-        // An External order pays its receiver, so the executor's buy balance proves nothing.
+        // External and NEAR Intents orders pay elsewhere, so the executor's buy balance proves
+        // nothing for them.
         if facts.retained.traded.or(facts.traded).is_some()
             && facts.retained.delivered.is_none()
-            && matches!(order.delivery(), SwapDelivery::Reshield)
+            && !facts.delivered_by_use
+            && order.delivery().pays_executor()
         {
             facts.buy_balance = Some(
                 call_at(
@@ -650,6 +910,54 @@ async fn read_swap_facts(
                 )
                 .await?,
             );
+        }
+    }
+    // Attempts of one use that share a pre-hook nonce and proof show the same effects, and
+    // only one of their pre-hooks ran. The effects then establish the funding and no hook.
+    let shared = swap
+        .orders()
+        .iter()
+        .zip(&orders)
+        .map(|(order, facts)| {
+            order.use_id().is_some()
+                && facts.executed.is_some()
+                && swap
+                    .orders()
+                    .iter()
+                    .zip(&orders)
+                    .any(|(other, other_facts)| {
+                        other.uid() != order.uid()
+                            && other.use_id() == order.use_id()
+                            && other.pre_hook().nonce() == order.pre_hook().nonce()
+                            && other_facts.executed == facts.executed
+                    })
+        })
+        .collect::<Vec<_>>();
+    for (facts, shared) in orders.iter_mut().zip(shared) {
+        if shared {
+            facts.executed = None;
+        }
+    }
+    for funding in found {
+        if !fundings.iter().any(|known| {
+            known.use_id == funding.use_id && known.pre_hook_nonce == funding.pre_hook_nonce
+        }) {
+            fundings.push(funding);
+        }
+    }
+    for (order, facts) in swap.orders().iter().zip(&mut orders) {
+        let valid_to = u64::from(order.valid_to());
+        for funding in &fundings {
+            if order.use_id() == Some(funding.use_id)
+                && order.pre_hook().nonce() == funding.pre_hook_nonce
+                && headers
+                    .at(funding.observation.block.number)
+                    .await?
+                    .timestamp
+                    > valid_to
+            {
+                facts.funding_after_valid_to = true;
+            }
         }
     }
 
@@ -663,50 +971,145 @@ async fn read_swap_facts(
         return Err(eyre!("swap chain changed during observation"));
     }
     Ok(SwapFacts {
+        settlement,
         confirmed,
         timestamp: tip.timestamp,
         nonce: observed.nonce(),
         orders,
+        fundings,
     })
 }
 
 /// Whether the page's logs could hold evidence for an order that its recorded
 /// observations and the confirmed nonce `nonce` don't already settle. An executed
 /// pre-hook and a post-hook shield count only where the hook's nonce passed, so a
-/// hook whose nonce is unused, or used by a recorded winner, has nothing to find. A
-/// recorded trade still awaits its reshield, and a newly reached `validTo` is read
-/// once in full. Trades of unfilled orders are left to [`any_order_filled`].
+/// hook whose nonce is unused, or that `evidence` attributes to another action signed at
+/// it, has nothing to find, and neither has a pre-hook that shares one of the retained
+/// `fundings`. A recorded trade still awaits its reshield, and a newly
+/// reached `validTo` is read once in full. Trades of unfilled orders are left to
+/// [`any_order_filled`]. In a swap use whose trade and delivery are retained and whose hook
+/// nonces are consumed, the page is not read only to learn which hook ran for an order that
+/// is itself complete or ended. An order of that use that still awaits its delivery, or
+/// whose pre-hook may have run, is still searched.
 fn page_may_hold_hook_evidence(
     record: &ExecutorRecord,
     orders: &[SwapOrderRecord],
     facts: &[OrderFacts],
+    fundings: &[SwapFunding],
     nonce: U256,
     timestamp: u64,
+    evidence: &ExecutorAttributionEvidence<'_>,
 ) -> bool {
     let explained = |used: U256| {
-        record.issued().iter().any(|payload| {
-            payload.nonce() == used
-                && record.payload_status(payload.hash()) == Some(ExecutorPayloadStatus::Executed)
+        attributed_action(record, used, evidence).is_some_and(|action| {
+            !matches!(
+                action.purpose(),
+                ExecutorPayloadPurpose::SwapPreHook | ExecutorPayloadPurpose::SwapPostHook
+            )
         }) || orders.iter().zip(facts).any(|(order, facts)| {
             (order.pre_hook().nonce() == used && facts.retained.pre_hook_executed.is_some())
                 || (order.post_hook().is_some_and(|hook| hook.nonce() == used)
-                    && facts.retained.shielded.is_some())
-        })
+                    && facts.retained.post_hook_evidence())
+        }) || fundings
+            .iter()
+            .any(|funding| funding.pre_hook_nonce == used)
     };
-    orders.iter().zip(facts).any(|(order, facts)| {
-        let retained = &facts.retained;
-        let awaiting_delivery = retained.traded.is_some() && retained.delivered.is_none();
+    orders.iter().zip(facts).any(|(order, order_facts)| {
+        if use_source_resolved(orders, facts, order, nonce) && order_quiet(order_facts) {
+            return false;
+        }
+        let retained = &order_facts.retained;
+        let awaiting_delivery = retained.traded.is_some()
+            && retained.delivered.is_none()
+            && !order_facts.delivered_by_use;
         awaiting_delivery
             || (retained.pre_hook_executed.is_none()
                 && retained.pre_hook_dead.is_none()
+                && !shares_funding(fundings, order, retained)
                 && nonce > order.pre_hook().nonce())
             || order.post_hook().is_some_and(|hook| {
-                retained.shielded.is_none() && nonce > hook.nonce() && !explained(hook.nonce())
+                !retained.post_hook_evidence() && nonce > hook.nonce() && !explained(hook.nonce())
             })
             || (retained.traded.is_none()
                 && retained.pre_hook_dead.is_none()
                 && retained.expired.is_none()
                 && timestamp > u64::from(order.valid_to()))
+    })
+}
+
+/// Whether the order's own retained observations leave nothing to find: it holds a trade and
+/// its delivery, or it holds no trade and its pre-hook is recorded dead and never executed.
+/// A traded and delivered order is quiet even when its pre-hook's execution was never
+/// observed, since receipts establish its outcome.
+const fn order_quiet(facts: &OrderFacts) -> bool {
+    let retained = &facts.retained;
+    if retained.traded.is_some() {
+        retained.delivered.is_some() || facts.delivered_by_use
+    } else {
+        retained.pre_hook_dead.is_some() && retained.pre_hook_executed.is_none()
+    }
+}
+
+/// Whether `order`'s swap use has a retained trade with its delivery, on the traded order or
+/// on another attempt of the use, and the confirmed nonce `nonce` is past every hook nonce
+/// the use's attempts signed. An order without a swap use is never resolved this way. This
+/// is the use-level question only: [`page_may_hold_hook_evidence`] skips an order of such a
+/// use only when the order is itself quiet, so one that still awaits its delivery or whose
+/// pre-hook may have run is still searched.
+fn use_source_resolved(
+    orders: &[SwapOrderRecord],
+    facts: &[OrderFacts],
+    order: &SwapOrderRecord,
+    nonce: U256,
+) -> bool {
+    let Some(use_id) = order.use_id() else {
+        return false;
+    };
+    let attempts = || {
+        orders
+            .iter()
+            .zip(facts)
+            .filter(move |(attempt, _)| attempt.use_id() == Some(use_id))
+    };
+    attempts().any(|(_, facts)| {
+        facts.retained.traded.is_some()
+            && (facts.retained.delivered.is_some() || facts.delivered_by_use)
+    }) && attempts().all(|(attempt, _)| {
+        nonce > attempt.pre_hook().nonce()
+            && attempt.post_hook().is_none_or(|hook| nonce > hook.nonce())
+    })
+}
+
+/// An order's Across delivery and the terms its post-hook's deposit signed.
+const fn across_terms(order: &SwapOrderRecord) -> Option<(BridgeDelivery, &AcrossOrderTerms)> {
+    match (order.delivery(), order.bridge()) {
+        (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(terms))) => {
+            Some((delivery, terms))
+        }
+        _ => None,
+    }
+}
+
+/// Whether another order's post-hook holds `order`'s post-hook nonce and signed a deposit
+/// the `FundsDeposited` event can't tell apart from `order`'s. A deposit that several issued
+/// payloads signed names approved terms and no hook, so it doesn't show that `order`'s
+/// post-hook took the nonce.
+fn deposit_signed_by_another_post_hook(
+    orders: &[SwapOrderRecord],
+    order: &SwapOrderRecord,
+) -> bool {
+    let (Some(post_hook), Some((delivery, terms))) = (order.post_hook(), across_terms(order))
+    else {
+        return false;
+    };
+    orders.iter().any(|other| {
+        other.uid() != order.uid()
+            && other
+                .post_hook()
+                .is_some_and(|hook| hook.nonce() == post_hook.nonce())
+            && across_terms(other).is_some_and(|(other_delivery, other_terms)| {
+                terms.signs_same_deposit(delivery, other_terms, other_delivery)
+            })
     })
 }
 
@@ -744,7 +1147,7 @@ async fn any_order_filled(
     Ok(false)
 }
 
-async fn filled_amount(
+pub(super) async fn filled_amount(
     provider: &DynProvider,
     settlement: Address,
     uid: OrderUid,
@@ -791,6 +1194,7 @@ async fn nonce_passed_in(
 fn derive_swap_observations(
     record: &ExecutorRecord,
     railgun: Address,
+    sync: Option<&WalletCurrentSnapshot>,
     facts: &SwapFacts,
 ) -> Vec<(OrderUid, SwapOrderObservations)> {
     let Some(swap) = record.swap() else {
@@ -826,19 +1230,25 @@ fn derive_swap_observations(
                 next.trade_amounts = observed.trade_amounts;
             }
             next.shielded = next.shielded.or(observed.shielded);
+            // A trade delivered by another attempt of its use keeps that attempt's delivery.
             if let Some(traded) = next.traded
                 && next.delivered.is_none()
+                && !observed.delivered_by_use
             {
                 match (order.delivery(), observed.buy_balance) {
                     // The order UID commits to the receiver, and the settlement pays it in the
                     // transaction that emits the matching Trade.
                     (SwapDelivery::External { .. }, _) => next.delivered = Some(traded),
                     // A skipped or early funded post-hook leaves at least buyAmount from
-                    // the fill. A smaller remainder may be a later gift. Require a matching
-                    // shield that actually credited the approved private minimum as well.
-                    (SwapDelivery::Reshield, Some(balance))
-                        if balance < order.bounds().buy_amount =>
+                    // the fill, and so does an Across post-hook that didn't deposit it.
+                    (SwapDelivery::Reshield | SwapDelivery::Bridge(_), Some(balance))
+                        if balance >= order.bounds().buy_amount =>
                     {
+                        next.undelivered = next.undelivered.or(Some(finalized));
+                    }
+                    // A smaller remainder may be a later gift. Require a matching shield that
+                    // actually credited the approved private minimum as well.
+                    (SwapDelivery::Reshield, Some(_)) => {
                         next.delivered = shields
                             .iter()
                             .find(|(terms, shield)| {
@@ -852,10 +1262,10 @@ fn derive_swap_observations(
                                 transaction_hash: shield.observation.transaction_hash,
                             });
                     }
-                    (SwapDelivery::Reshield, Some(_)) => {
-                        next.undelivered = next.undelivered.or(Some(finalized));
-                    }
-                    (SwapDelivery::Reshield, None) => {}
+                    // Only the settlement receipt records a Bridge hand-off; explicit
+                    // reconciliation doesn't look for one.
+                    (SwapDelivery::Reshield | SwapDelivery::Bridge(_), None)
+                    | (SwapDelivery::Bridge(_), Some(_)) => {}
                 }
             }
             if next.traded.is_none()
@@ -870,12 +1280,22 @@ fn derive_swap_observations(
                 next.pre_hook_dead = None;
             } else if let Some(death) = &mut next.pre_hook_dead {
                 if death.cause == SwapPreHookDeathCause::Unknown {
-                    death.cause = death_cause(record, railgun, nonce, facts);
+                    death.cause = death_cause(record, railgun, sync, order, observed, facts);
                 }
+            } else if observed.funding_after_valid_to {
+                // The order had expired when the funding ran, so its own pre-hook never can.
+                next.pre_hook_dead = Some(SwapPreHookDeath {
+                    cause: SwapPreHookDeathCause::Expired,
+                    observation: finalized,
+                });
             } else if facts.nonce > nonce {
-                if observed.nullifiers_spent == Some(false) {
+                // A funding at this nonce ran the shared proof, whichever attempt's hook
+                // it was, so the nonce's consumption ends none of them.
+                if observed.nullifiers_spent == Some(false)
+                    && !shares_funding(&facts.fundings, order, &observed.retained)
+                {
                     next.pre_hook_dead = Some(SwapPreHookDeath {
-                        cause: death_cause(record, railgun, nonce, facts),
+                        cause: death_cause(record, railgun, sync, order, observed, facts),
                         observation: finalized,
                     });
                 }
@@ -890,38 +1310,62 @@ fn derive_swap_observations(
         .collect()
 }
 
-/// What consumed a pre-hook's nonce while its nullifiers stayed unspent.
+/// What consumed a pre-hook's nonce while its nullifiers stayed unspent. The action
+/// attributed at that nonce names it: a recorded spend or a received shield of a payload
+/// signed there, then `order` reading as invalidated in the read that showed its nullifiers
+/// unspent. Nothing is concluded from another action's missing evidence.
 fn death_cause(
     record: &ExecutorRecord,
     railgun: Address,
-    nonce: U256,
+    sync: Option<&WalletCurrentSnapshot>,
+    order: &SwapOrderRecord,
+    observed: &OrderFacts,
     facts: &SwapFacts,
 ) -> SwapPreHookDeathCause {
-    // A payload sent to the executor directly, reconciled as the nonce's winner.
-    if let Some(winner) = record.issued().iter().find(|payload| {
-        payload.nonce() == nonce
-            && record.payload_status(payload.hash()) == Some(ExecutorPayloadStatus::Executed)
-    }) {
-        return match winner.purpose() {
-            ExecutorPayloadPurpose::Recovery if recovers_assets(record, railgun, winner) => {
-                SwapPreHookDeathCause::Recovery
-            }
-            ExecutorPayloadPurpose::Recovery => SwapPreHookDeathCause::Cancellation,
-            ExecutorPayloadPurpose::SwapPostHook => SwapPreHookDeathCause::OlderPostHook,
-            ExecutorPayloadPurpose::Operation | ExecutorPayloadPurpose::SwapPreHook => {
-                SwapPreHookDeathCause::Unknown
-            }
+    let nonce = order.pre_hook().nonce();
+    // `invalidateOrder` sets the order's filled amount to the maximum. A death recorded with
+    // an unknown cause was itself read from unspent nullifiers after the nonce passed.
+    let unspent = observed.nullifiers_spent == Some(false)
+        || observed
+            .retained
+            .pre_hook_dead
+            .is_some_and(|death| death.cause == SwapPreHookDeathCause::Unknown);
+    let invalidated = (observed.filled == Some(U256::MAX) && unspent).then(|| order.uid());
+    let evidence = ExecutorAttributionEvidence {
+        railgun,
+        sync,
+        invalidated_orders: Some(InvalidatedSwapOrders {
+            settlement: facts.settlement,
+            orders: invalidated.as_slice(),
+        }),
+    };
+    // Only a recovery-kind action is named this way. An older post-hook keeps its own
+    // evidence below, which a shield anyone can fund does not replace.
+    if let Some(action) = attributed_action(record, nonce, &evidence)
+        && action.purpose() == ExecutorPayloadPurpose::Recovery
+    {
+        // Fee rounds share their calls, so any payload of the action tells.
+        let recovers = action
+            .payloads()
+            .first()
+            .and_then(|hash| issued(record, *hash).ok())
+            .is_some_and(|payload| recovers_assets(record, railgun, payload));
+        return if recovers {
+            SwapPreHookDeathCause::Recovery
+        } else {
+            SwapPreHookDeathCause::Cancellation
         };
     }
-    // Inside a settlement, a post-hook is identified by its shield in the block where the
-    // nonce passed the post-hook's.
+    // Inside a settlement, a post-hook is identified by its shield, or its recorded Across
+    // deposit, in the block where the nonce passed the post-hook's.
     let older_post_hook = record.swap().is_some_and(|swap| {
         swap.orders()
             .iter()
             .zip(&facts.orders)
             .any(|(order, observed)| {
                 order.post_hook().is_some_and(|hook| hook.nonce() == nonce)
-                    && observed.shielded.is_some()
+                    && (observed.shielded.is_some()
+                        || observed.retained.post_hook_deposit.is_some())
             })
     });
     if older_post_hook {
@@ -1035,7 +1479,7 @@ async fn nullifiers_spent(
     Ok(true)
 }
 
-async fn call_at<C: SolCall>(
+pub(super) async fn call_at<C: SolCall>(
     provider: &DynProvider,
     to: Address,
     call: C,

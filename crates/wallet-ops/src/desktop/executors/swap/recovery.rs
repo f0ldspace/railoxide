@@ -17,8 +17,7 @@ use railgun_wallet::tx::RailgunGasModel;
 
 use super::super::recovery::{PaidExecutionPurpose, recovery_allowance, recovery_gas_limits};
 use super::super::{
-    ExecutorOwner, ExecutorRecoveryExecution, ExecutorRecoveryFeeEstimate, ExecutorRecoveryFunding,
-    PreparedExecutorRecovery,
+    ExecutorOwner, ExecutorRecoveryFeeEstimate, ExecutorRecoveryFunding, PreparedExecutorRecovery,
 };
 use super::order::fillable_swap_orders;
 use super::{SwapOrderState, swap_order_state};
@@ -53,7 +52,6 @@ impl ExecutorOwner {
                 recovery_gas_limits(
                     RailgunGasModel::for_chain(self.chain.chain_id),
                     &vec![PublicActionProgressStep::Approve; calls],
-                    ExecutorRecoveryExecution::PaidExecute { nonce: U256::ZERO },
                     buffer,
                 )[0]
             },
@@ -182,11 +180,11 @@ pub(crate) fn swap_cancellation_admitted(
     profile: &SwapProfile,
     now: SystemTime,
 ) -> Result<()> {
-    let order = record
+    let (swap, order) = record
         .swap()
-        .and_then(|swap| swap.orders().last())
+        .and_then(|swap| swap.orders().last().map(|order| (swap, order)))
         .ok_or_else(|| eyre!("this swap has no order to cancel"))?;
-    if swap_order_state(order) != SwapOrderState::Open || order.pre_hook().nonce() != nonce {
+    if swap_order_state(swap, order) != SwapOrderState::Open || order.pre_hook().nonce() != nonce {
         return Err(eyre!(
             "this swap's pre-hook already ran or can no longer run; refresh the swap and recover the executor's assets if it holds any"
         ));

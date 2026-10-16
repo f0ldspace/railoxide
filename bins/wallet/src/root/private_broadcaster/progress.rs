@@ -316,6 +316,34 @@ pub(in crate::root) fn apply_private_broadcaster_progress_stage(
     }
 }
 
+/// End a stage list with `status`. Success marks every step done. Any other status goes on the
+/// step that was running, with `message`, which success puts on the last step.
+pub(in crate::root) fn end_private_broadcaster_progress_steps(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    status: PublicActionStepStatus,
+    message: Option<Arc<str>>,
+) {
+    if status == PublicActionStepStatus::Done {
+        for step in steps.iter_mut() {
+            step.status = PublicActionStepStatus::Done;
+            step.message = None;
+        }
+    }
+    let active = steps
+        .iter()
+        .position(|step| {
+            matches!(
+                step.status,
+                PublicActionStepStatus::Pending | PublicActionStepStatus::Error
+            )
+        })
+        .or_else(|| steps.len().checked_sub(1));
+    if let Some(step) = active.and_then(|index| steps.get_mut(index)) {
+        step.status = status;
+        step.message = message;
+    }
+}
+
 pub(super) const SELF_BROADCAST_INCLUSION_UNOBSERVED_MESSAGE: &str =
     "Unable to observe transaction inclusion. Check the transaction hash before sending again.";
 
@@ -486,16 +514,37 @@ pub(in crate::root) fn public_broadcaster_wait_status_detail(
     progress: &PrivateBroadcasterProgressState,
     now: Instant,
 ) -> Option<String> {
-    let resend_count = public_broadcaster_resend_count(progress, now)?;
+    if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
+        return None;
+    }
+    broadcaster_wait_detail(
+        progress.public_broadcaster_wait_started_at?,
+        progress.public_broadcaster_republish_interval?,
+        progress.public_broadcaster_response_timeout,
+        now,
+    )
+}
+
+/// What a wait for a broadcaster's answer that began at `started_at` says at `now`: how often
+/// the request was re-sent, once each `republish_interval`, and the time left before
+/// `timeout`, when the wait has one. `None` for a request that isn't re-sent.
+pub(in crate::root) fn broadcaster_wait_detail(
+    started_at: Instant,
+    republish_interval: Duration,
+    timeout: Option<Duration>,
+    now: Instant,
+) -> Option<String> {
+    let resend_count = broadcaster_resend_count(started_at, republish_interval, now)?;
+    let elapsed = now.saturating_duration_since(started_at);
     if resend_count == 0 {
         return Some("Waiting for broadcaster response".to_string());
     }
-    let Some(remaining) = public_broadcaster_wait_time_left(progress, now) else {
+    let Some(timeout) = timeout else {
         return Some(format!("Still waiting - re-sent {resend_count}x"));
     };
     Some(format!(
         "Still waiting - re-sent {resend_count}x - {} left",
-        format_public_broadcaster_wait_remaining(remaining)
+        format_public_broadcaster_wait_remaining(timeout.saturating_sub(elapsed))
     ))
 }
 
@@ -506,24 +555,26 @@ fn public_broadcaster_resend_count(
     if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
         return None;
     }
-    let started_at = progress.public_broadcaster_wait_started_at?;
-    let republish_interval = progress.public_broadcaster_republish_interval?;
+    broadcaster_resend_count(
+        progress.public_broadcaster_wait_started_at?,
+        progress.public_broadcaster_republish_interval?,
+        now,
+    )
+}
+
+/// How often a request published at `started_at` was re-sent by `now`, once each
+/// `republish_interval`. `None` for a request that isn't re-sent.
+pub(in crate::root) fn broadcaster_resend_count(
+    started_at: Instant,
+    republish_interval: Duration,
+    now: Instant,
+) -> Option<usize> {
     if republish_interval.is_zero() {
         return None;
     }
     let elapsed = now.saturating_duration_since(started_at);
     let count = elapsed.as_nanos() / republish_interval.as_nanos();
     Some(count.min(usize::MAX as u128) as usize)
-}
-
-fn public_broadcaster_wait_time_left(
-    progress: &PrivateBroadcasterProgressState,
-    now: Instant,
-) -> Option<Duration> {
-    let started_at = progress.public_broadcaster_wait_started_at?;
-    let timeout = progress.public_broadcaster_response_timeout?;
-    let elapsed = now.saturating_duration_since(started_at);
-    Some(timeout.saturating_sub(elapsed))
 }
 
 pub(in crate::root) fn format_public_broadcaster_wait_remaining(duration: Duration) -> String {
@@ -539,7 +590,7 @@ pub(in crate::root) fn format_public_broadcaster_wait_remaining(duration: Durati
     }
 }
 
-pub(super) const fn private_broadcaster_stage_label(
+pub(in crate::root) const fn private_broadcaster_stage_label(
     stage: TransactionGenerationStage,
     requires_device_approval: bool,
 ) -> &'static str {

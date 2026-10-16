@@ -1,6 +1,6 @@
 use gpui::{
     App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
-    SharedString, Styled, Window, div, img, prelude::FluentBuilder as _, px, rgb,
+    SharedString, Styled, Window, div, img, prelude::FluentBuilder as _, px, rems, rgb,
 };
 use gpui_component::{
     Disableable, Icon, Sizable,
@@ -282,24 +282,29 @@ pub(super) fn app_step_row(
         .items_start()
         .gap_3()
         .child(
+            // The marker column takes the row's height, so the connector reaches the next
+            // step's marker however tall the body is.
             div()
+                .self_stretch()
                 .flex()
                 .flex_col()
                 .items_center()
-                .child(marker)
+                .child(div().flex_none().child(marker))
                 .children((!is_last).then(|| {
-                    let connector = div()
-                        .w(px(2.0))
+                    let line = div().w(px(2.0)).flex_1().rounded_full().bg(rgb(color));
+                    // The space around the line is part of the connector's height, so a
+                    // short row keeps it clear of both markers.
+                    div()
                         .flex_1()
                         .min_h(connector_min_height)
-                        .my(px(3.0))
-                        .rounded_full()
-                        .bg(rgb(color));
-                    if let Some(opacity) = connector_opacity {
-                        connector.opacity(opacity)
-                    } else {
-                        connector
-                    }
+                        .py(px(3.0))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(match connector_opacity {
+                            Some(opacity) => line.opacity(opacity),
+                            None => line,
+                        })
                 })),
         )
         .child(body)
@@ -327,6 +332,62 @@ pub(super) fn token_label_row(
         row = row.child(img(path).size(icon_size).rounded_full().flex_none());
     }
     row.child(label)
+}
+
+pub(super) fn network_name(chain_id: u64) -> String {
+    railgun_ui::chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned)
+}
+
+/// A network named in a line of text: its mark, when it has one, then its name. The name takes
+/// the text style of the element this is a child of, and `mark` is that text's size, so the
+/// mark stays inside the line.
+pub(super) fn network_mention(chain_id: u64, mark: gpui::AbsoluteLength) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .children(
+            railgun_ui::chain_icon_asset_path(chain_id)
+                .map(|path| img(path).size(mark).flex_none().mr_1()),
+        )
+        .child(network_name(chain_id))
+}
+
+/// A token's icon with its network's icon as a badge at its corner.
+pub(super) fn network_token_icon(
+    icon: Option<WalletIconSource>,
+    chain_id: u64,
+    size: f32,
+) -> gpui::Div {
+    // The badge is a chip over the icon's corner, ringed in the surface colour so the two
+    // marks stay apart, at about the proportion `CoW` Swap draws it.
+    let badge = size * 0.6;
+    let ring = 0.0625;
+    div()
+        .relative()
+        .w(rems(size))
+        .h(rems(size))
+        .flex_none()
+        .children(icon.map(|icon| img(icon).size_full().rounded_full()))
+        .children(railgun_ui::chain_icon_asset_path(chain_id).map(|path| {
+            div()
+                .absolute()
+                .right(-rems(size * 0.15))
+                .bottom(-rems(size * 0.15))
+                .w(rems(badge))
+                .h(rems(badge))
+                .p(rems(ring))
+                .rounded_full()
+                .bg(rgb(theme::SURFACE))
+                // Most network marks are bare glyphs, so a lighter chip gives each one a body.
+                .child(
+                    div()
+                        .size_full()
+                        .p(rems(badge * 0.04))
+                        .rounded_full()
+                        .bg(rgb(theme::SURFACE_HOVER))
+                        .child(img(path).size_full().rounded_full()),
+                )
+        }))
 }
 
 #[cfg(test)]

@@ -25,6 +25,8 @@ pub(crate) const TREZOR_SYMBOL_WHITE_ICON_PATH: &str = "railgun/icons/trezor-sym
 pub(crate) const WALLETCONNECT_ICON_PATH: &str = "railgun/icons/walletconnect.svg";
 pub(crate) const COW_PROTOCOL_LOGO_LIGHT_PATH: &str = "railgun/icons/cow-protocol-logo-light.svg";
 pub(crate) const COW_DAO_LIGHT_PATH: &str = "railgun/icons/cow-dao-light.svg";
+pub(crate) const ACROSS_LOGOMARK_PATH: &str = "railgun/icons/across-logomark-aqua-circle.svg";
+pub(crate) const NEAR_SYMBOL_WHITE_PATH: &str = "railgun/icons/near-symbol-white.svg";
 const TELEGRAM_ICON_PATH: &str = "railgun/icons/telegram.svg";
 const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
@@ -44,6 +46,7 @@ const LANDMARK_ICON_PATH: &str = "railgun/icons/landmark.svg";
 const SAVE_ICON_PATH: &str = "railgun/icons/save.svg";
 pub(crate) const IMPORT_ICON_PATH: &str = "railgun/icons/import.svg";
 pub(crate) const LIST_ICON_PATH: &str = "railgun/icons/list.svg";
+pub(crate) const CIRCLE_QUESTION_MARK_ICON_PATH: &str = "railgun/icons/circle-question-mark.svg";
 pub(crate) const GROUP_ICON_PATH: &str = "railgun/icons/group.svg";
 pub(crate) const USERS_ICON_PATH: &str = "railgun/icons/users.svg";
 pub(crate) const PIGGY_BANK_ICON_PATH: &str = "railgun/icons/piggy-bank.svg";
@@ -73,6 +76,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     WALLETCONNECT_ICON_PATH,
     COW_PROTOCOL_LOGO_LIGHT_PATH,
     COW_DAO_LIGHT_PATH,
+    ACROSS_LOGOMARK_PATH,
+    NEAR_SYMBOL_WHITE_PATH,
     TELEGRAM_ICON_PATH,
     ARROW_BIG_RIGHT_DASH_ICON_PATH,
     SHIELD_ICON_PATH,
@@ -92,6 +97,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     SAVE_ICON_PATH,
     IMPORT_ICON_PATH,
     LIST_ICON_PATH,
+    CIRCLE_QUESTION_MARK_ICON_PATH,
     GROUP_ICON_PATH,
     USERS_ICON_PATH,
     PIGGY_BANK_ICON_PATH,
@@ -122,6 +128,9 @@ const WALLETCONNECT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/walletco
 const COW_PROTOCOL_LOGO_LIGHT_BYTES: &[u8] =
     include_bytes!("../assets/icons/cow-protocol-logo-light.svg");
 const COW_DAO_LIGHT_BYTES: &[u8] = include_bytes!("../assets/icons/cow-dao-light.svg");
+const ACROSS_LOGOMARK_BYTES: &[u8] =
+    include_bytes!("../assets/icons/across-logomark-aqua-circle.svg");
+const NEAR_SYMBOL_WHITE_BYTES: &[u8] = include_bytes!("../assets/icons/near-symbol-white.svg");
 const TELEGRAM_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/telegram.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
     include_bytes!("../../../crates/ui/assets/icons/arrow-big-right-dash.svg");
@@ -143,6 +152,8 @@ const LANDMARK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/landmark.svg"
 const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
 const IMPORT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/import.svg");
 const LIST_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/list.svg");
+const CIRCLE_QUESTION_MARK_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/circle-question-mark.svg");
 const GROUP_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/group.svg");
 const USERS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/users.svg");
 const PIGGY_BANK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/piggy-bank.svg");
@@ -424,6 +435,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         WALLETCONNECT_ICON_PATH => Some(WALLETCONNECT_ICON_BYTES),
         COW_PROTOCOL_LOGO_LIGHT_PATH => Some(COW_PROTOCOL_LOGO_LIGHT_BYTES),
         COW_DAO_LIGHT_PATH => Some(COW_DAO_LIGHT_BYTES),
+        ACROSS_LOGOMARK_PATH => Some(ACROSS_LOGOMARK_BYTES),
+        NEAR_SYMBOL_WHITE_PATH => Some(NEAR_SYMBOL_WHITE_BYTES),
         TELEGRAM_ICON_PATH => Some(TELEGRAM_ICON_BYTES),
         ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
@@ -443,6 +456,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         SAVE_ICON_PATH => Some(SAVE_ICON_BYTES),
         IMPORT_ICON_PATH => Some(IMPORT_ICON_BYTES),
         LIST_ICON_PATH => Some(LIST_ICON_BYTES),
+        CIRCLE_QUESTION_MARK_ICON_PATH => Some(CIRCLE_QUESTION_MARK_ICON_BYTES),
         GROUP_ICON_PATH => Some(GROUP_ICON_BYTES),
         USERS_ICON_PATH => Some(USERS_ICON_BYTES),
         PIGGY_BANK_ICON_PATH => Some(PIGGY_BANK_ICON_BYTES),

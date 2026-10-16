@@ -4,14 +4,18 @@
 //! without proving. The review quotes without hooks and prices the order limit. Both run before
 //! the setup is confirmed, for a preview or a reserved executor; signing needs the confirmed
 //! delegation. Signing checks cached anchors and signs the pre-hook at the executor's current
-//! nonce `k`, for Reshield delivery the post-hook at `k + 1`, and the order, persists all of
-//! them with the input reservation, and only then sends the order. That request is the only one
-//! that carries signed hooks. An External order pays its receiver directly and has no post-hook.
+//! nonce `k`, for Reshield and Across delivery the post-hook at `k + 1`, and the order, persists
+//! all of them with the input reservation, and only then sends the order. That request is the
+//! only one that carries signed hooks. An External order pays its receiver directly and a NEAR
+//! Intents order its verified deposit address; neither has a post-hook. A private Bridge
+//! delivery first signs and persists its destination stealth account's guarded shield on the
+//! destination chain, which the Across post-hook's deposit message carries.
 //!
 //! The pre-hook unshields the planned amount, the private spend. Railgun takes its unshield
 //! fee from that value, so the order, its quote, and the pre-hook's approval use what the
 //! executor then holds, the order's sell amount.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,13 +23,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use alloy::primitives::aliases::U120;
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::signers::SignerSync as _;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall as _, SolValue as _};
+use broadcaster_core::contracts::across::{SpokePool, private_delivery_message};
 use broadcaster_core::contracts::cow::{
     AppData, AppDataHook, BUY_NATIVE_TOKEN, EncodedAppData, GPv2Settlement, ORDER_KIND_SELL, Order,
     OrderUid, TOKEN_BALANCE_ERC20, eip712_order_signature, order_digest,
 };
 use broadcaster_core::contracts::executor::{
-    ExecutorAction, guarded_shield_calls, post_hook_signing_hash, signed_post_hook_calldata,
+    AcrossPrivateDelivery, ExecutorAction, bridge_deposit_calls, guarded_shield_calls,
+    post_hook_signing_hash, private_bridge_deposit_calls, signed_post_hook_calldata,
 };
 use broadcaster_core::contracts::railgun::{
     Call, CommitmentPreimage, RelayAdapt7702, RelayAdapt7702ActionData, ShieldCiphertext,
@@ -36,26 +43,35 @@ use eyre::{Result, eyre};
 use local_db::PendingOutputPoiContextRecord;
 use railgun_wallet::tx::{
     BuildError, CompositeExecution, CompositeUnshieldLeg, CompositeUnshieldLegRole,
-    CompositeUnshieldRecipient, ExecutorContext, MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS,
-    MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    RailgunGasModel, SelectedInputIdentity, SwapAmountCheck, SwapAppDataTemplate,
-    SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
+    CompositeUnshieldRecipient, ExecutorContext, GasEstimateMode, MAX_BATCH_TRANSACTIONS,
+    MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest,
+    MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity, SwapAmountCheck,
+    SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
 };
 use railgun_wallet::{ProverService, TransactionBuilder, TransactionCall, Utxo};
 use reqwest::Url;
 use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
+use super::bridge::{
+    AcrossHandlerMessage, BridgeLegPrice, BridgeSigning, SwapBridgeClients, SwapBridgeQuote,
+    SwapBridgeRoute, across_deposit, bridge_route,
+};
+use super::continuing::{SwapContinuingApprovals, is_public_across};
 use super::gas::hook_data_cost_from_rpc_pool;
 use super::simulation::{PreHookSimulation, simulate_pre_hook};
-use super::{DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, trace_step};
+use super::{
+    DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, SwapSetupInclusion, SwapShieldNotes,
+    SwapUseClaim, admission, is_live_swap_use, require_swap_account, trace_step,
+};
 use crate::cow::{
     CowApiError, CowOrderSubmission, CowOrderbookClient, CowQuote, CowQuoteParameters,
-    CowSellQuoteRequest, NativeBuyRate, OrderLimit, OrderLimitError, OrderLimitParams,
-    PreHookCalls, hook_gas_limit, order_buy_amount, post_hook_gas, pre_hook_gas, price_order_limit,
+    CowSellQuoteRequest, GAS_SHARE_TIGHT_BPS, NativeBuyRate, OrderLimit, OrderLimitError,
+    OrderLimitParams, PreHookCalls, across_post_hook_gas, hook_gas_limit, order_buy_amount,
+    post_hook_gas, pre_hook_gas, price_order_limit, quote_gas_units, quote_protocol_fee,
 };
 use crate::desktop::{
-    artifact_source, buffered_gas_price_from_rpc_pool, effective_desktop_chain_config,
+    artifact_source, effective_desktop_chain_config, gas_price_from_rpc_pool_with_policy,
     query_rpc_pool_with_http_client,
 };
 use crate::poi_contexts::{
@@ -64,14 +80,17 @@ use crate::poi_contexts::{
 };
 use crate::settings::{EffectiveTokenRegistry, ExecutorProfile, SwapProfile, SwapTokenEligibility};
 use crate::vault::{
+    BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeShieldFailure, BridgeSurplus,
     ExecutorInputIdentity, ExecutorNonceObservation, ExecutorOperationId, ExecutorPayloadContext,
-    ExecutorPayloadPurpose, ExecutorPayloadStatus, ExecutorRecord, ExecutorStoreError,
-    IssuedExecutorPayload, SwapAnchorObservation, SwapApproval, SwapApprovalTokens,
-    SwapApprovedBounds, SwapAttempt, SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause,
-    SwapProof, SwapRecipient, SwapSubmission, SwapSubmissionStatus, SwapTerms,
+    ExecutorPayloadPurpose, ExecutorRecord, ExecutorStoreError, IssuedExecutorPayload,
+    SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence,
+    SwapAnchorObservation, SwapApproval, SwapApprovalTokens, SwapApprovedBounds, SwapAttempt,
+    SwapDelivery, SwapOrderRecord, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSpeedUp,
+    SwapSubmission, SwapSubmissionStatus, SwapTerms, SwapUseId, SwapUseRecord, SwapUseRole,
+    swap_account_refusal,
 };
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
+    AnchorBlocked, DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
     HardwareExecutorAction, OperationNetworkIsolation, PairAnchorRate, QuoteDeviationError,
     RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache, WalletSession, check_quote_against_anchor,
     railgun_protocol_fee_amount,
@@ -86,6 +105,56 @@ const WIDEST_PRE_HOOK_TRANSACTION: TransactionShape = TransactionShape {
 };
 
 const SWAP_SPEND_OPERATION: &str = "private swap pre-hook";
+
+/// Divisor of the approved allowed gas that gives a first order's cushion: a fifth, 20%. A
+/// requote after setup that falls short of the approved minimums by at most this much, in
+/// buy-token base units, is signed at those minimums without a new review. The order then
+/// leaves solvers that much less for gas. An Across quote that falls short of the approved
+/// destination minimum while signing raises the deposit within the same cushion.
+const APPROVAL_CUSHION_DIVISOR: u64 = 5;
+
+/// Margin added to a Bridge deposit scaled up to the approved destination minimum, in basis
+/// points of the deposit, for the provider's quote of the larger amount.
+const BRIDGE_DEPOSIT_MARGIN_BPS: u64 = 5;
+
+/// The cushion of an approval whose allowed gas is `approved_allowance`, in buy-token base
+/// units: its share by [`APPROVAL_CUSHION_DIVISOR`].
+pub(super) fn approval_cushion(approved_allowance: U256) -> U256 {
+    approved_allowance / U256::from(APPROVAL_CUSHION_DIVISOR)
+}
+
+/// The Bridge deposit that delivers `approved` on the destination chain when a deposit of
+/// `deposit` is quoted `quoted` there: `ceil(deposit * approved / quoted)` plus the margin.
+/// `None` when `quoted` is zero or the arithmetic overflows.
+pub(super) fn scaled_bridge_deposit(deposit: U256, approved: U256, quoted: U256) -> Option<U256> {
+    if quoted.is_zero() {
+        return None;
+    }
+    let scaled = deposit.checked_mul(approved)?.div_ceil(quoted);
+    let margin = scaled
+        .checked_mul(U256::from(BRIDGE_DEPOSIT_MARGIN_BPS))?
+        .div_ceil(FEE_BASIS_POINTS_DENOMINATOR);
+    scaled.checked_add(margin)
+}
+
+/// What a signing quote that delivered `current`, below the approved destination minimum
+/// `approved`, adds to the delivery allowance of the swap's later reviews, in destination-token
+/// base units: the shortfall and a quarter of it, the cushion the gas estimates take, rounded
+/// up. The preview estimates the destination shield's gas, and Across prices the real message.
+#[must_use]
+pub fn delivery_shortfall_allowance(approved: U256, current: U256) -> U256 {
+    let shortfall = approved.saturating_sub(current);
+    shortfall.saturating_add(shortfall.div_ceil(U256::from(4)))
+}
+
+const SPEED_UP_ORDER_CHANGED: &str =
+    "the order being sped up is no longer this swap's open order; review the swap again";
+const SPEED_UP_FUNDS_CHANGED: &str = "the funds of this swap changed; its order can't be sped up";
+const SPEED_UP_NONCE_CHANGED: &str =
+    "the swap executor's nonce changed; the order can't be sped up";
+const SPEED_UP_TERMS_CHANGED: &str = "this swap's fixed terms changed; review it again";
+
+const DESTINATION_ACCOUNT_MISMATCH: &str = "a private Bridge delivery needs its destination stealth account, and no other delivery takes one";
 
 /// An amount to plan for a swap, before or after its executor's setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +184,10 @@ pub struct SwapInputPlan {
     byte_budget: usize,
     size: SwapPreHookSize,
     gas_model: &'static RailgunGasModel,
+    /// Estimated post-hook gas, `None` for an order without a post-hook.
+    post_hook_gas: Option<u64>,
+    /// The open order this plan speeds up. `None` for a first order or an ordinary retry.
+    speed_up: Option<SwapSpeedUp>,
 }
 
 impl SwapInputPlan {
@@ -170,23 +243,27 @@ impl SwapInputPlan {
     pub const fn invalidates(&self) -> Option<OrderUid> {
         self.invalidates
     }
+    /// The open order a plan from [`ExecutorOwner::plan_swap_speed_up`] speeds up.
+    #[must_use]
+    pub const fn speed_up(&self) -> Option<SwapSpeedUp> {
+        self.speed_up
+    }
     /// Gas limit the order declares for the pre-hook.
     #[must_use]
     pub fn pre_hook_gas_limit(&self) -> u64 {
-        hook_gas_limit(self.pre_hook_gas())
+        hook_gas_limit(self.pre_hook_gas(GasEstimateMode::UpperBound))
     }
-    /// Gas limit the order declares for the post-hook. `None` for External delivery, whose
-    /// order has no post-hook.
+    /// Gas limit the order declares for the post-hook. `None` for External and NEAR Intents
+    /// delivery, whose orders have no post-hook.
     #[must_use]
     pub fn post_hook_gas_limit(&self) -> Option<u64> {
         self.post_hook_estimate().map(hook_gas_limit)
     }
-    /// Estimated gas of the order's hooks, which the order limit prices: the pre-hook, and the
-    /// post-hook for Reshield delivery. The declared limits add a margin that only caps
-    /// execution.
+    /// Estimated gas of the order's hooks, which the order limit prices: the pre-hook, and any
+    /// post-hook. The declared limits add a margin that only caps execution.
     #[must_use]
     pub fn hook_gas_estimate(&self) -> u64 {
-        self.pre_hook_gas()
+        self.pre_hook_gas(GasEstimateMode::UpperBound)
             .saturating_add(self.post_hook_estimate().unwrap_or(0))
     }
 
@@ -213,21 +290,46 @@ impl SwapInputPlan {
         Ok(request)
     }
 
-    fn pre_hook_gas(&self) -> u64 {
+    fn pre_hook_gas(&self, mode: GasEstimateMode) -> u64 {
         pre_hook_gas(
             self.gas_model,
             &self.size.preview.transactions,
             PreHookCalls {
                 invalidate_order: self.invalidates.is_some(),
             },
+            mode,
         )
     }
 
     const fn post_hook_estimate(&self) -> Option<u64> {
-        match self.delivery {
-            SwapDelivery::Reshield => Some(post_hook_gas(self.gas_model)),
-            SwapDelivery::External { .. } => None,
-        }
+        self.post_hook_gas
+    }
+}
+
+/// Estimated gas of `delivery`'s post-hook, `None` for an order without one.
+const fn swap_post_hook_gas(
+    gas_model: &RailgunGasModel,
+    delivery: SwapDelivery,
+    mode: GasEstimateMode,
+) -> Option<u64> {
+    match delivery {
+        SwapDelivery::Reshield => Some(post_hook_gas(gas_model, mode)),
+        SwapDelivery::External { .. }
+        | SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::NearIntents,
+            ..
+        }) => None,
+        SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            surplus,
+            private,
+            ..
+        }) => Some(across_post_hook_gas(
+            gas_model,
+            matches!(surplus, BridgeSurplus::Reshield),
+            private.is_some(),
+            mode,
+        )),
     }
 }
 
@@ -254,10 +356,111 @@ pub enum SwapPrice {
     Unverified,
 }
 
+/// What the cached price anchors gave for a quote's pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapQuoteAnchor {
+    /// Cached rates cover both tokens.
+    Verified,
+    /// A token of the pair has no configured anchor source.
+    NotConfigured,
+    /// A configured source has no cached rate. The text names the token and its read failures.
+    Unavailable(String),
+}
+
+impl SwapQuoteAnchor {
+    /// The outcome of `TokenAnchorRateCache::cached_pair_rate` for the quote's pair.
+    pub(super) fn from_cached(anchor: &Result<Option<PairAnchorRate>, AnchorBlocked>) -> Self {
+        match anchor {
+            Ok(Some(_)) => Self::Verified,
+            Ok(None) => Self::NotConfigured,
+            Err(blocked) => Self::Unavailable(format!(
+                "no cached rate for {} ({:?})",
+                blocked.token, blocked.failures
+            )),
+        }
+    }
+}
+
+impl fmt::Display for SwapQuoteAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verified => f.write_str("verified"),
+            Self::NotConfigured => f.write_str("not configured"),
+            Self::Unavailable(reason) => write!(f, "unavailable, {reason}"),
+        }
+    }
+}
+
+/// The public values of a quote that failed while pricing, attached to the failure as its
+/// `eyre` context. It holds no quote sender or receiver, no endpoint and nothing from the
+/// vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwapQuoteDiagnostics {
+    pub chain_id: u64,
+    pub sell_token: Address,
+    pub buy_token: Address,
+    pub sell_amount: U256,
+    pub buy_amount: U256,
+    pub sell_token_price: String,
+    pub gas_amount: String,
+    pub gas_price: String,
+    pub anchor: SwapQuoteAnchor,
+}
+
+impl SwapQuoteDiagnostics {
+    pub(super) fn new(chain_id: u64, quote: &CowQuoteParameters, anchor: SwapQuoteAnchor) -> Self {
+        Self {
+            chain_id,
+            sell_token: quote.sell_token,
+            buy_token: quote.buy_token,
+            sell_amount: quote.sell_amount,
+            buy_amount: quote.buy_amount,
+            sell_token_price: quote.sell_token_price.clone(),
+            gas_amount: quote.gas_amount.clone(),
+            gas_price: quote.gas_price.clone(),
+            anchor,
+        }
+    }
+}
+
+/// One `name: value` line per field, without a trailing newline.
+impl fmt::Display for SwapQuoteDiagnostics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "chain: {}\nsell token: {}\nbuy token: {}\nsell amount: {}\nbuy amount: {}\n\
+             sell token price: {}\ngas amount: {}\ngas price: {}\nprice anchor: {}",
+            self.chain_id,
+            self.sell_token,
+            self.buy_token,
+            self.sell_amount,
+            self.buy_amount,
+            self.sell_token_price,
+            self.gas_amount,
+            self.gas_price,
+            self.anchor,
+        )
+    }
+}
+
+/// Attaches `diagnostics` to a quote's pricing failure. [`OrderLimitError`] stays reachable by
+/// downcast, and any other error is returned as it is.
+pub(super) fn wrap_pricing_error(
+    error: eyre::Report,
+    diagnostics: SwapQuoteDiagnostics,
+) -> eyre::Report {
+    if error.downcast_ref::<OrderLimitError>().is_some() {
+        error.wrap_err(diagnostics)
+    } else {
+        error
+    }
+}
+
 /// Terms the user reviews before approving a private minimum. The review screen shows them
 /// with the fixed approval disclosures: the order, its hooks, and its input nullifiers become
 /// public once submitted; a later spend of unfilled inputs is linkable to the swap; the setup
-/// cost is paid even without a fill; hook gas is charged to the sell amount; and a pre-hook run
+/// cost is paid even without a fill; the user pays at most the chosen share of the gas
+/// estimate, and without a solver covering the rest the order doesn't fill; and a pre-hook run
 /// without a fill costs both the unshield and the shield fee in recovery.
 #[derive(Debug, Clone)]
 pub struct SwapReview {
@@ -265,12 +468,37 @@ pub struct SwapReview {
     quote: CowQuoteParameters,
     quote_id: Option<i64>,
     limit: OrderLimit,
+    gas: SwapGasPricing,
+    gas_share_bps: u16,
+    /// How long the order is valid after signing. Bridge delivery uses the profile's window.
+    valid_for: Duration,
+    /// `CoW`'s protocol fee in buy-token units, when the quote states it.
+    cow_fee: Option<U256>,
+    surplus_shield_fee_bps: U256,
     shield_fee_bps: U256,
     unshield_fee_bps: U256,
     sell_amount: U256,
+    /// The price tolerance on the best case, in basis points.
     slippage_bps: u32,
     price: SwapPrice,
     isolation: OperationNetworkIsolation,
+    /// The bridge leg, for Bridge delivery.
+    bridge: Option<SwapBridgeQuote>,
+    /// Earlier Across approvals of the same swap use that can still decide a speed-up's
+    /// delivery. Empty for an ordinary retry, every other delivery and a new use.
+    continuing: SwapContinuingApprovals,
+}
+
+/// Quote-time inputs of the gas estimate, kept so that another gas share reprices without I/O.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SwapGasPricing {
+    quote_gas_units: u64,
+    /// The RPC gas price in wei, without the cushion.
+    pub(super) gas_price_wei: u128,
+    /// `gas_price_wei` with the 25% cushion, which prices the gas estimate.
+    limit_gas_price_wei: u128,
+    hook_data_cost_wei: U256,
+    native_rate: NativeBuyRate,
 }
 
 impl SwapReview {
@@ -283,10 +511,159 @@ impl SwapReview {
     pub const fn quote(&self) -> &CowQuoteParameters {
         &self.quote
     }
-    /// Estimated hook gas cost in buy-token base units, taken off the quoted output.
+    /// The quoted buy amount with `CoW`'s network fee added back, in buy-token base units.
     #[must_use]
-    pub const fn hook_cost(&self) -> U256 {
-        self.limit.hook_cost
+    pub const fn best_case(&self) -> U256 {
+        self.limit.best_case
+    }
+    /// The gas estimate in buy-token base units: the quote's swap gas and the hooks'
+    /// conservative gas at the cushioned RPC price, plus any rollup data cost.
+    #[must_use]
+    pub const fn gas_estimate(&self) -> U256 {
+        self.limit.gas_estimate
+    }
+    /// The share of the gas estimate the minimum deducts, in buy-token base units.
+    #[must_use]
+    pub const fn gas_allowance(&self) -> U256 {
+        self.limit.gas_allowance
+    }
+    /// The share of the gas estimate the minimum deducts, in basis points of 10,000.
+    #[must_use]
+    pub const fn gas_share_bps(&self) -> u16 {
+        self.gas_share_bps
+    }
+    /// The RPC gas price in wei at quote time, without the cushion.
+    #[must_use]
+    pub const fn gas_price_wei(&self) -> u128 {
+        self.gas.gas_price_wei
+    }
+    /// How long the order is valid after signing.
+    #[must_use]
+    pub const fn valid_for(&self) -> Duration {
+        self.valid_for
+    }
+    /// `CoW`'s protocol fee in buy-token base units, already deducted from the quote. `None`
+    /// when the quote doesn't state it.
+    #[must_use]
+    pub const fn cow_fee(&self) -> Option<U256> {
+        self.cow_fee
+    }
+    /// Earlier Across approvals of the same swap use that can still decide this speed-up's
+    /// delivery. Empty for any other plan.
+    #[must_use]
+    pub const fn continuing(&self) -> &SwapContinuingApprovals {
+        &self.continuing
+    }
+    /// The lower destination minimum an earlier attempt of this speed-up's swap can still
+    /// deliver, which approval of this review must cover. Source-chain surplus is not part of
+    /// it. `None` for any other plan, and when no earlier approval can deliver less than this
+    /// attempt's own minimum.
+    #[must_use]
+    pub fn continuing_minimum(&self) -> Option<U256> {
+        self.bridge
+            .and_then(|bridge| self.continuing.lower_minimum(bridge.destination_minimum))
+    }
+
+    /// This review priced at another gas share, without I/O. A Bridge delivery's bridge leg was
+    /// quoted for the old order amount, so it is cleared and must be quoted again. The
+    /// continuing approvals don't depend on the gas share and stay.
+    pub fn with_gas_share(&self, gas_share_bps: u16) -> Result<Self> {
+        let limit = swap_order_limit(
+            self.plan.hook_gas_estimate(),
+            self.plan.buy_token,
+            &self.quote,
+            self.gas,
+            self.slippage_bps,
+            gas_share_bps,
+            self.shield_fee_bps,
+        )?;
+        Ok(Self {
+            limit,
+            gas_share_bps,
+            bridge: None,
+            ..self.clone()
+        })
+    }
+
+    /// This review delivering to `receiver`, without I/O. Neither quote names the receiver, and
+    /// the plan sizes it as one static ABI word, so every other term, the bridge leg included,
+    /// stays as quoted. A private Bridge delivery's receiver is its destination stealth account,
+    /// which neither the preview quote nor the delivery allowance names. Reshield delivery has no
+    /// receiver and is returned unchanged.
+    #[must_use]
+    pub fn with_receiver(&self, receiver: Address) -> Self {
+        let mut review = self.clone();
+        match &mut review.plan.delivery {
+            SwapDelivery::Reshield => {}
+            SwapDelivery::External { receiver: current }
+            | SwapDelivery::Bridge(BridgeDelivery {
+                receiver: current, ..
+            }) => *current = receiver,
+        }
+        review
+    }
+
+    /// This review with `extra` more delivery allowance, in destination-token base units: what
+    /// earlier signing quotes of this swap showed the preview's estimate to lack. The destination
+    /// minimum and expected output fall by it. `None` unless this is an Across private delivery
+    /// that leaves a positive minimum.
+    #[must_use]
+    pub fn with_delivery_shortfall(&self, extra: U256) -> Option<Self> {
+        self.plan.delivery.private_bridge()?;
+        let mut bridge = self
+            .bridge
+            .filter(|bridge| bridge.provider == BridgeProvider::Across)?;
+        let mut private = bridge.private?;
+        bridge.destination_minimum = bridge
+            .destination_minimum
+            .checked_sub(extra)
+            .filter(|minimum| !minimum.is_zero())?;
+        bridge.expected_output = bridge.expected_output.saturating_sub(extra);
+        private.delivery_allowance = private.delivery_allowance.saturating_add(extra);
+        bridge.private = Some(private);
+        Some(Self {
+            bridge: Some(bridge),
+            ..self.clone()
+        })
+    }
+
+    /// Shield fee for a `CoW` payout. Across shields only what remains after its fixed deposit.
+    #[must_use]
+    pub fn shield_fee_on_output(&self, amount: U256) -> U256 {
+        if matches!(
+            self.plan.delivery,
+            SwapDelivery::Bridge(BridgeDelivery {
+                provider: BridgeProvider::Across,
+                surplus: BridgeSurplus::Reshield,
+                ..
+            })
+        ) {
+            railgun_protocol_fee_amount(
+                amount.saturating_sub(self.limit.buy_amount),
+                self.surplus_shield_fee_bps,
+            )
+        } else {
+            railgun_protocol_fee_amount(amount, self.shield_fee_bps)
+        }
+    }
+
+    /// Upper bound of the source-chain return: the best case, reached when solvers pay all
+    /// gas, less the fixed deposit and any surplus shield fee. Only Across deposits a fixed
+    /// amount and leaves surplus on the source chain.
+    #[must_use]
+    pub fn estimated_source_surplus(&self) -> Option<U256> {
+        matches!(
+            self.plan.delivery,
+            SwapDelivery::Bridge(BridgeDelivery {
+                provider: BridgeProvider::Across,
+                ..
+            })
+        )
+        .then(|| {
+            let best = self.best_case();
+            best.saturating_sub(self.limit.buy_amount)
+                .saturating_sub(self.shield_fee_on_output(best))
+        })
     }
     /// Suggested minimum received privately after the shield fee, or for External delivery,
     /// the minimum the receiver gets.
@@ -309,6 +686,7 @@ impl SwapReview {
     pub const fn sell_amount(&self) -> U256 {
         self.sell_amount
     }
+    /// The price tolerance on the best case, in basis points.
     #[must_use]
     pub const fn slippage_bps(&self) -> u32 {
         self.slippage_bps
@@ -316,6 +694,155 @@ impl SwapReview {
     #[must_use]
     pub const fn price(&self) -> &SwapPrice {
         &self.price
+    }
+    /// The bridge quote for the order's buy amount, for Bridge delivery.
+    #[must_use]
+    pub const fn bridge(&self) -> Option<&SwapBridgeQuote> {
+        self.bridge.as_ref()
+    }
+    /// Whether both the `CoW` price and any bridge leg were checked. Otherwise approval requires
+    /// the user's acknowledgement.
+    #[must_use]
+    pub fn price_verified(&self) -> bool {
+        self.price != SwapPrice::Unverified
+            && self
+                .bridge
+                .is_none_or(|bridge| bridge.leg != BridgeLegPrice::Unverified)
+    }
+    /// Attach a bridge quote to a review priced without one.
+    #[cfg(test)]
+    pub(crate) const fn set_bridge_for_tests(&mut self, bridge: &SwapBridgeQuote) {
+        self.bridge = Some(*bridge);
+    }
+    /// This review with `approvals` as its continuing approvals. UI tests use it for a
+    /// speed-up's review, since their records hold no earlier order.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_continuing_for_tests(
+        mut self,
+        approvals: Vec<super::continuing::SwapContinuingApproval>,
+    ) -> Self {
+        self.continuing = SwapContinuingApprovals::for_tests(approvals);
+        self
+    }
+    /// A review of the Across `delivery` to a public receiver from `record`'s stealth account,
+    /// priced without I/O for one stand-in note of `amount`: `bought` is the quoted buy amount,
+    /// and the bridge leg delivers `destination_minimum` and `expected_output`. It exists only
+    /// for the desktop's debug UI fixture, which shows a review on a wallet without private
+    /// funds. Its executor is no confirmed delegation and the store holds no such record, so
+    /// `ExecutorOwner::issue_swap_order` refuses it before anything is signed.
+    #[cfg(debug_assertions)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_ui_fixture(
+        profile: &SwapProfile,
+        record: &ExecutorRecord,
+        sell_token: Address,
+        buy_token: Address,
+        amount: U256,
+        bought: U256,
+        rate: PairAnchorRate,
+        gas_price_wei: u128,
+        delivery: BridgeDelivery,
+        destination_minimum: U256,
+        expected_output: U256,
+        continuing: Vec<super::continuing::SwapContinuingApproval>,
+        isolation: OperationNetworkIsolation,
+    ) -> Result<Self> {
+        let executor = SwapExecutor {
+            operation: Some(record.operation()),
+            executor: record
+                .address()
+                .ok_or_else(|| eyre!("stealth account is unavailable"))?,
+            delegate: record.delegate(),
+            expected_pre_hook_nonce: U256::ONE,
+            // Enough for a quote. Signing needs the checked delegation.
+            setup: SwapExecutorSetup::Recorded,
+            reused: false,
+        };
+        // The contracts only size the pre-hook, which is never built.
+        let builder = TransactionBuilder {
+            chain_type: 0,
+            chain_id: profile.chain_id(),
+            railgun_contract: Address::repeat_byte(4),
+            relay_adapt_contract: Address::repeat_byte(5),
+        };
+        let note = Utxo::new(
+            railgun_wallet::Note::new_change(U256::ONE, sell_token, amount, [0; 16]),
+            0,
+            0,
+            railgun_wallet::UtxoSource {
+                tx_hash: B256::ZERO,
+                block_number: 1,
+                block_timestamp: 1,
+            },
+            railgun_wallet::UtxoCommitmentKind::Transact,
+        );
+        let SwapAmountPlan::Fits(plan) = plan_swap_inputs(
+            &builder,
+            profile,
+            executor,
+            &[note],
+            &SwapAmountRequest {
+                sell_token,
+                buy_token,
+                amount,
+                delivery: SwapDelivery::Bridge(delivery),
+                byte_budget: None,
+            },
+            profile.app_data_byte_budget(),
+            None,
+        )?
+        else {
+            return Err(eyre!("the stand-in note doesn't fit one order"));
+        };
+        let quote = CowQuote {
+            quote: CowQuoteParameters {
+                sell_token,
+                buy_token,
+                receiver: None,
+                sell_amount: order_sell_amount(amount, RAILGUN_PROTOCOL_FEE_BPS)?,
+                buy_amount: bought,
+                valid_to: 0,
+                fee_amount: U256::ZERO,
+                gas_amount: "150000".into(),
+                gas_price: gas_price_wei.to_string(),
+                sell_token_price: "1".into(),
+                kind: "sell".into(),
+                partially_fillable: false,
+            },
+            expiration: String::new(),
+            id: None,
+            verified: true,
+            protocol_fee_bps: Some("2".into()),
+        };
+        let mut review = price_swap_review(
+            plan,
+            quote,
+            SwapPrice::Verified {
+                rate,
+                observations: Vec::new(),
+            },
+            RAILGUN_PROTOCOL_FEE_BPS,
+            RAILGUN_PROTOCOL_FEE_BPS,
+            50,
+            crate::cow::GAS_SHARE_BALANCED_BPS,
+            profile.valid_to_window(),
+            gas_price_wei,
+            U256::ZERO,
+            isolation,
+        )?;
+        review.bridge = Some(SwapBridgeQuote {
+            provider: BridgeProvider::Across,
+            destination_minimum,
+            expected_output,
+            // The deposit is the order's buy amount, and Across keeps the rest.
+            fee: Some(review.limit.buy_amount.saturating_sub(expected_output)),
+            leg: BridgeLegPrice::SameAsset,
+            fill_time_sec: Some(4),
+            private: None,
+        });
+        review.continuing = SwapContinuingApprovals::for_tests(continuing);
+        Ok(review)
     }
     /// In proxy and direct modes the review states that per-swap isolation is unavailable.
     #[must_use]
@@ -327,6 +854,18 @@ impl SwapReview {
     pub fn buy_amount_for(&self, private_minimum: U256) -> Result<U256> {
         Ok(order_buy_amount(private_minimum, self.shield_fee_bps)?)
     }
+    /// The gas an order signed at `private_minimum` leaves room for, in buy-token base units:
+    /// this review's buy amount and allowed gas, less that minimum's buy amount. It is
+    /// [`Self::gas_allowance`] at the suggested minimum, less below a higher minimum, and more
+    /// above a lower one, where it can exceed the gas estimate.
+    pub fn gas_allowance_for(&self, private_minimum: U256) -> Result<U256> {
+        Ok(self
+            .limit
+            .buy_amount
+            .checked_add(self.limit.gas_allowance)
+            .ok_or(OrderLimitError::Overflow)?
+            .saturating_sub(self.buy_amount_for(private_minimum)?))
+    }
 
     /// The terms to persist when the user approves this review with its setup.
     pub fn approval(
@@ -334,7 +873,10 @@ impl SwapReview {
         private_minimum: U256,
         price_acknowledged: bool,
     ) -> Result<SwapApproval> {
-        let buy_amount = self.require_approval(private_minimum, price_acknowledged)?;
+        let destination_minimum = self.bridge.map(|bridge| bridge.destination_minimum);
+        let private = self.bridge.and_then(|bridge| bridge.private);
+        let buy_amount =
+            self.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
         Ok(SwapApproval {
             bounds: SwapApprovedBounds {
                 sell_amount: self.sell_amount,
@@ -346,76 +888,254 @@ impl SwapReview {
                 slippage_bps: self.slippage_bps,
                 pre_hook_gas_limit: self.plan.pre_hook_gas_limit(),
                 post_hook_gas_limit: self.plan.post_hook_gas_limit(),
-                hook_cost: Some(self.hook_cost()),
+                hook_cost: Some(self.gas_estimate()),
                 anchors: match &self.price {
                     SwapPrice::Verified { observations, .. } => observations.clone(),
                     SwapPrice::Unverified => Vec::new(),
                 },
+                destination_minimum,
+                gas_share_bps: Some(self.gas_share_bps),
+                gas_estimate: Some(self.gas_estimate()),
+                gas_allowance: Some(self.gas_allowance()),
+                gas_price_wei: Some(self.gas.gas_price_wei),
+                valid_for_secs: Some(self.valid_for_secs()?),
+                destination_shield_fee_bps: private
+                    .map(|private| private.destination_shield_fee_bps),
+                delivery_allowance: private.map(|private| private.delivery_allowance),
+                // Set by the caller for each side that needs setup.
+                destination_setup_fee: None,
+                source_setup_fee: None,
             },
-            price_verified: Some(self.price != SwapPrice::Unverified),
+            price_verified: Some(self.price_verified()),
             price_acknowledged,
             delivery: self.plan.delivery,
             tokens: Some(SwapApprovalTokens {
                 sell: self.plan.sell_token,
                 buy: self.plan.buy_token,
             }),
+            // Bound by the pair's preparation, once both accounts are chosen.
+            accounts: None,
         })
     }
 
-    /// How this fresh review, planned for the approved amount and slippage once the setup is
-    /// confirmed, differs from the approval. `None` means the order can be signed with the
-    /// approved minimum: a better quote only adds surplus. Another delivery kind or receiver
-    /// address, a lower suggested minimum, another Railgun fee the order depends on, or another
-    /// kind of price check needs a new review.
+    /// How this fresh review, planned for the approved amount, price tolerance, gas share and
+    /// validity once the setup is confirmed, differs from the approval. `None` means the order
+    /// can be signed with [`Self::approved_order_minimum`]: a better quote or a lower gas
+    /// estimate only adds surplus, and a shortfall within the cushion is taken from the allowed
+    /// gas. Another delivery kind or receiver address, a suggested minimum, destination minimum
+    /// or allowed gas that moved beyond the cushion, a higher declared gas limit, another
+    /// validity, another Railgun fee the order depends on, or another kind of price check needs
+    /// a new review, and so does an approval saved before gas shares. A private Bridge delivery
+    /// also needs one for another destination account, failure choice or destination shield fee.
     #[must_use]
     pub fn approval_change(&self, approval: &SwapApproval) -> Option<SwapReviewChange> {
+        self.approved_order_minimum(approval).err()
+    }
+
+    /// The private minimum to sign the approved first order with, or what needs a new review:
+    /// see [`Self::approval_change`]. It is the approved minimum, except for a Bridge delivery
+    /// whose fresh bridge quote is below the approved destination minimum: its deposit is
+    /// raised until the provider delivers that minimum again.
+    pub fn approved_order_minimum(
+        &self,
+        approval: &SwapApproval,
+    ) -> Result<U256, SwapReviewChange> {
         // Only the parsed address counts; a receiver's label isn't part of the delivery.
         if self.plan.delivery != approval.delivery {
-            return Some(SwapReviewChange::Delivery);
+            return Err(SwapReviewChange::Delivery);
         }
         let approved = &approval.bounds;
         // An External order carries no shield, so it doesn't depend on the shield fee.
         if matches!(self.plan.delivery, SwapDelivery::Reshield)
             && self.shield_fee_bps != approved.shield_fee_bps
         {
-            return Some(SwapReviewChange::ShieldFee {
+            return Err(SwapReviewChange::ShieldFee {
                 approved: approved.shield_fee_bps,
                 current: self.shield_fee_bps,
             });
         }
         if self.unshield_fee_bps != approved.unshield_fee_bps {
-            return Some(SwapReviewChange::UnshieldFee {
+            return Err(SwapReviewChange::UnshieldFee {
                 approved: approved.unshield_fee_bps,
                 current: self.unshield_fee_bps,
             });
         }
-        if approved
-            .hook_cost
-            .is_none_or(|cost| self.hook_cost() > cost)
-            || self.plan.pre_hook_gas_limit() > approved.pre_hook_gas_limit
+        // A private Bridge delivery shields on the destination chain, at that chain's fee.
+        let private = self.bridge.and_then(|bridge| bridge.private);
+        if self.plan.delivery.private_bridge().is_some() {
+            let current = private.map(|private| private.destination_shield_fee_bps);
+            if current.is_none() || current != approved.destination_shield_fee_bps {
+                return Err(SwapReviewChange::DestinationShieldFee {
+                    approved: approved.destination_shield_fee_bps.unwrap_or_default(),
+                    current: current.unwrap_or_default(),
+                });
+            }
+        }
+        let (Some(_), Some(approved_allowance)) = (approved.gas_share_bps, approved.gas_allowance)
+        else {
+            return Err(SwapReviewChange::GasShare);
+        };
+        if self.plan.pre_hook_gas_limit() > approved.pre_hook_gas_limit
             || self.plan.post_hook_gas_limit().is_some_and(|current| {
                 approved
                     .post_hook_gas_limit
                     .is_none_or(|limit| current > limit)
             })
         {
-            return Some(SwapReviewChange::HookCost);
+            return Err(SwapReviewChange::HookCost);
+        }
+        // Within the cushion, more allowed gas or a lower minimum needs no review.
+        let cushioned = self.cushioned_minimum(approved, approved_allowance);
+        if cushioned.is_none() && self.gas_allowance() > approved_allowance {
+            return Err(SwapReviewChange::GasAllowance {
+                approved: approved_allowance,
+                current: self.gas_allowance(),
+            });
+        }
+        let current_validity = self.valid_for.as_secs();
+        if approved.valid_for_secs.map(u64::from) != Some(current_validity) {
+            return Err(SwapReviewChange::Validity {
+                approved: approved.valid_for_secs.map_or(0, u64::from),
+                current: current_validity,
+            });
         }
         let was_verified = approval
             .price_verified
             .unwrap_or(!approved.anchors.is_empty());
-        if (self.price != SwapPrice::Unverified) != was_verified {
-            return Some(SwapReviewChange::PriceVerification);
+        if self.price_verified() != was_verified {
+            return Err(SwapReviewChange::PriceVerification);
+        }
+        if let Some(minimum) = cushioned {
+            return Ok(minimum);
         }
         let current = self.suggested_private_minimum();
-        (current < approved.private_minimum).then_some(SwapReviewChange::Minimum {
-            approved: approved.private_minimum,
-            current,
-        })
+        if current < approved.private_minimum {
+            return Err(SwapReviewChange::Minimum {
+                approved: approved.private_minimum,
+                current,
+            });
+        }
+        // A Bridge approval without a destination minimum binds none, so it signs nothing.
+        let destination = self
+            .bridge
+            .map_or(U256::ZERO, |bridge| bridge.destination_minimum);
+        if matches!(self.plan.delivery, SwapDelivery::Bridge(_))
+            && approved
+                .destination_minimum
+                .is_none_or(|minimum| destination < minimum)
+        {
+            // A higher delivery allowance is what lowered a private delivery's minimum.
+            let approved_allowance = approved.delivery_allowance.unwrap_or_default();
+            if let Some(private) = private
+                && private.delivery_allowance > approved_allowance
+            {
+                return Err(SwapReviewChange::DeliveryAllowance {
+                    approved: approved_allowance,
+                    current: private.delivery_allowance,
+                });
+            }
+            return Err(SwapReviewChange::DestinationMinimum {
+                approved: approved.destination_minimum.unwrap_or_default(),
+                current: destination,
+            });
+        }
+        Ok(approved.private_minimum)
     }
 
-    fn require_approval(&self, private_minimum: U256, price_acknowledged: bool) -> Result<U256> {
-        if self.price == SwapPrice::Unverified && !price_acknowledged {
+    /// The private minimum that keeps the approved minimums when this review's own order
+    /// falls short of them by at most the cushion, a fifth of the approved allowed gas. It is
+    /// the approved minimum, or for a Bridge delivery quoted below the approved destination
+    /// minimum, the deposit scaled up to it: `ceil(deposit * approved / quoted)` plus the
+    /// margin, and at least the approved deposit. The shortfall is that minimum's buy amount
+    /// less this review's, and it also stays within this review's allowed gas, so the order
+    /// never asks for more than the best case after the price tolerance. `None` when the
+    /// shortfall is larger, or for a Bridge delivery without a quote or an approved destination
+    /// minimum.
+    fn cushioned_minimum(
+        &self,
+        approved: &SwapApprovedBounds,
+        approved_allowance: U256,
+    ) -> Option<U256> {
+        let quoted_buy_amount = self.limit.buy_amount;
+        let minimum = if matches!(self.plan.delivery, SwapDelivery::Bridge(_)) {
+            let approved_destination = approved.destination_minimum?;
+            let quoted_destination = self.bridge?.destination_minimum;
+            if quoted_destination >= approved_destination {
+                approved.private_minimum
+            } else {
+                // Bridge orders carry no shield, so the deposit is the private minimum.
+                scaled_bridge_deposit(quoted_buy_amount, approved_destination, quoted_destination)?
+                    .max(approved.private_minimum)
+            }
+        } else {
+            approved.private_minimum
+        };
+        self.within_cushion(minimum, approved_allowance)
+            .then_some(minimum)
+    }
+
+    /// Whether an order signed at `minimum` stays within the cushion: its buy amount exceeds
+    /// this review's by at most a fifth of `approved_allowance`, and by at most this review's
+    /// allowed gas.
+    fn within_cushion(&self, minimum: U256, approved_allowance: U256) -> bool {
+        let Ok(buy_amount) = self.buy_amount_for(minimum) else {
+            return false;
+        };
+        let shortfall = buy_amount.saturating_sub(self.limit.buy_amount);
+        shortfall <= approval_cushion(approved_allowance) && shortfall <= self.gas_allowance()
+    }
+
+    /// The deposit to sign when the signing quote for `deposit` delivers `quoted`, below the
+    /// approved `destination_minimum`: [`scaled_bridge_deposit`], at least `deposit`, when it
+    /// stays within the cushion. Bridge orders carry no shield, so the deposit is the private
+    /// minimum.
+    fn raised_deposit(
+        &self,
+        deposit: U256,
+        destination_minimum: U256,
+        quoted: U256,
+        approved_allowance: U256,
+    ) -> Option<U256> {
+        let raised = scaled_bridge_deposit(deposit, destination_minimum, quoted)?.max(deposit);
+        self.within_cushion(raised, approved_allowance)
+            .then_some(raised)
+    }
+
+    /// The validity in whole seconds, as the approval records it.
+    fn valid_for_secs(&self) -> Result<u32> {
+        u32::try_from(self.valid_for.as_secs())
+            .map_err(|_| eyre!("the order's validity is out of range"))
+    }
+
+    /// A Bridge delivery needs its bridge quote and a nonzero `destination_minimum`; other
+    /// deliveries take none. Only Across delivers privately.
+    fn require_approval(
+        &self,
+        private_minimum: U256,
+        destination_minimum: Option<U256>,
+        price_acknowledged: bool,
+    ) -> Result<U256> {
+        if let SwapDelivery::Bridge(bridge) = self.plan.delivery {
+            if !bridge.has_valid_surplus() {
+                return Err(eyre!("this bridge provider can't handle surplus that way"));
+            }
+            if !bridge.has_valid_private_delivery() {
+                return Err(eyre!(
+                    "this bridge provider can't deliver to a private balance"
+                ));
+            }
+            if self.bridge.is_none() {
+                return Err(eyre!("quote the bridge before approving this swap"));
+            }
+            if destination_minimum.is_none_or(|minimum| minimum.is_zero()) {
+                return Err(eyre!(
+                    "approve a minimum received on the destination network for this swap"
+                ));
+            }
+        } else if destination_minimum.is_some() {
+            return Err(eyre!("only a bridge swap has a destination minimum"));
+        }
+        if !self.price_verified() && !price_acknowledged {
             return Err(eyre!(
                 "acknowledge the unverified price before approving this swap"
             ));
@@ -426,18 +1146,41 @@ impl SwapReview {
 
 pub struct SwapReviewRequest<'a> {
     pub plan: SwapInputPlan,
+    /// The price tolerance on the best case, in basis points.
     pub slippage_bps: u32,
+    /// The share of the gas estimate the minimum deducts, in basis points of 10,000.
+    pub gas_share_bps: u16,
+    /// How long the order is valid after signing. Bridge delivery ignores it and uses the swap
+    /// profile's window.
+    pub valid_for: Duration,
     /// The swap's own orderbook client, kept for its order submission.
     pub orderbook: &'a CowOrderbookClient,
     /// `None` when returning for unverified-price acknowledgement. Signing also uses the
     /// background cache, and still checks the downside limit if a rate becomes available.
     pub anchor_cache: Option<&'a TokenAnchorRateCache>,
     pub token_registry: &'a EffectiveTokenRegistry,
+    /// Required for Bridge delivery, whose bridge leg the review quotes for the order's buy
+    /// amount.
+    pub bridge: Option<SwapBridgeRoute<'a>>,
+}
+
+/// The destination chain's side of a private Bridge order: where the pre-signed shield is issued.
+pub struct SwapDestinationContext {
+    pub owner: Arc<ExecutorOwner>,
+    pub session: Arc<WalletSession>,
+    /// Authorizes the destination stealth account's signature. For a software wallet, the
+    /// order's authorization duplicated with `DesktopPrivateSpendAuthorization::for_destination`;
+    /// for a hardware wallet, the second authorization of `complete_with_destination`.
+    pub authorization: DesktopPrivateSpendAuthorization,
 }
 
 /// Approval of a reviewed swap.
 pub struct SwapOrderRequest<'a> {
     pub review: &'a SwapReview,
+    /// The swap use the order is signed for. A swap's own order or retry names the use that
+    /// claims its account. An explicitly reused account that doesn't hold the use yet is
+    /// claimed for it first, so repeating the request with the same use resumes it.
+    pub swap_use: SwapUseId,
     /// `M`, the approved minimum received privately after the shield fee, or by an External
     /// receiver.
     pub private_minimum: U256,
@@ -448,17 +1191,49 @@ pub struct SwapOrderRequest<'a> {
     pub orderbook: &'a CowOrderbookClient,
     pub anchor_cache: &'a TokenAnchorRateCache,
     pub token_registry: &'a EffectiveTokenRegistry,
+    /// The route of a Bridge delivery: the provider to quote again while signing, and the
+    /// destination chain whose contracts its receiver is checked against. Required for Bridge
+    /// delivery.
+    pub bridge: Option<SwapBridgeRoute<'a>>,
+    /// The approved minimum received on a Bridge delivery's destination chain: the review's
+    /// bridge quote minimum for a fresh approval, or the saved approval's. Required for Bridge
+    /// delivery.
+    pub destination_minimum: Option<U256>,
+    /// The destination chain's owner, session and authorization. Required exactly for a private
+    /// Bridge delivery.
+    pub destination: Option<SwapDestinationContext>,
+    /// The lower continuing destination minimum the user accepted with a speed-up's review:
+    /// [`SwapReview::continuing_minimum`]. `None` when the review disclosed none, as for any
+    /// other plan.
+    pub continuing_minimum: Option<U256>,
     pub verify_proof: bool,
 }
 
 /// A term that changed between review and signing. Nothing was signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapReviewChange {
-    /// The delivery kind or the External receiver's address differs from the approval. This
-    /// always needs a full review.
+    /// The delivery kind, the External receiver's address, or a Bridge delivery's provider,
+    /// destination, receiver, token or surplus choice differs from the approval. For a private
+    /// Bridge delivery the receiver is the destination stealth account, and the choice of what
+    /// happens when the destination shield fails is compared too. This always needs a full
+    /// review.
     Delivery,
-    /// A displayed network/hook limit increased, or an older approval lacks it.
+    /// A declared hook gas limit increased, or the pre-hook must now invalidate another order.
     HookCost,
+    /// The approval was saved before gas shares and records neither a share nor the allowed
+    /// gas. It needs a full review.
+    GasShare,
+    /// The fresh review allows more gas than the approval, in buy-token base units.
+    GasAllowance {
+        approved: U256,
+        current: U256,
+    },
+    /// The order's validity differs from the approved one, in seconds. An approval without a
+    /// recorded validity reports zero.
+    Validity {
+        approved: u64,
+        current: u64,
+    },
     ShieldFee {
         approved: U256,
         current: U256,
@@ -480,6 +1255,74 @@ pub enum SwapReviewChange {
         approved: U256,
         current: U256,
     },
+    /// A fresh bridge quote delivers less than the approved minimum on the destination chain.
+    DestinationMinimum {
+        approved: U256,
+        current: U256,
+    },
+    /// The destination chain's shield fee rate of a private Bridge delivery differs from the
+    /// approved one, in basis points. An approval without one reports zero.
+    DestinationShieldFee {
+        approved: U256,
+        current: U256,
+    },
+    /// A private Bridge delivery's destination minimum fell below the approved one because the
+    /// delivery allowance rose, in destination-token base units.
+    DeliveryAllowance {
+        approved: U256,
+        current: U256,
+    },
+    /// The order's source account, its private delivery's destination account, or whether
+    /// either needs setup differs from the accounts the approval binds. An approved new
+    /// account that took its derived address is not a change. This always needs a full review.
+    Accounts,
+    /// How a Public account lets its swap take what it sells differs from the review: it must
+    /// now send approval transactions the review didn't price, or sign a permit whose hook the
+    /// order wasn't priced with. Nothing was sent.
+    ApprovalPlan,
+    /// An earlier attempt of the swap a speed-up relaxes can still deliver `current` on the
+    /// destination chain. That is lower than this attempt's minimum and lower than the
+    /// continuing minimum the user accepted, `approved`, which is zero when none was disclosed.
+    /// An ordinary retry never asks for this.
+    ContinuingApproval {
+        approved: U256,
+        current: U256,
+    },
+    /// The order a speed-up would sign doesn't ask for less than the open order's buy amount,
+    /// `open`. Nothing was signed.
+    SpeedUpBuyAmount {
+        open: U256,
+        current: U256,
+    },
+}
+
+/// Why an open order can't be sped up now, for the action that offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapSpeedUpRefusal {
+    /// Two orders of the swap can still fill, and a pre-hook invalidates only one.
+    TwoOrdersFillable,
+    /// The order isn't the swap's open order any more, has expired, or its swap takes no
+    /// speed-up.
+    Unavailable,
+}
+
+/// Whether an order with `buy_amount` speeds up the open order approved at `open`. The two
+/// orders' signed `CoW` buy amounts are compared for the unchanged sell amount, since solvers
+/// fill against that limit. Destination minimums are not compared.
+#[must_use]
+pub fn swap_speed_up_relaxes(open: &SwapApprovedBounds, buy_amount: U256) -> bool {
+    buy_amount < open.buy_amount
+}
+
+/// The review change for a speed-up whose order wouldn't relax the open order's `open`.
+fn speed_up_buy_amount_change(
+    open: &SwapApprovedBounds,
+    buy_amount: U256,
+) -> Option<SwapReviewChange> {
+    (!swap_speed_up_relaxes(open, buy_amount)).then_some(SwapReviewChange::SpeedUpBuyAmount {
+        open: open.buy_amount,
+        current: buy_amount,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,6 +1363,27 @@ pub fn swap_submission_outcome(
     }
 }
 
+/// What the orderbook's answer to the order `uid` says of its submission. A duplicate-order
+/// answer is an acceptance whose response was lost. An interrupted request, or an answer that
+/// isn't about the order, leaves it pending.
+pub(super) fn swap_submission_status(
+    result: &Result<OrderUid, CowApiError>,
+    uid: OrderUid,
+) -> SwapSubmissionStatus {
+    match result {
+        Ok(assigned) if *assigned == uid => SwapSubmissionStatus::Accepted,
+        Err(CowApiError::DuplicatedOrder) => SwapSubmissionStatus::Accepted,
+        Err(
+            CowApiError::AppDataTooLarge
+            | CowApiError::SellAmountDoesNotCoverFee
+            | CowApiError::NoLiquidity
+            | CowApiError::UnsupportedToken
+            | CowApiError::Rejected { .. },
+        ) => SwapSubmissionStatus::Rejected,
+        _ => SwapSubmissionStatus::Pending,
+    }
+}
+
 /// The next plan's budget after app data of `rejected_len` bytes didn't fit.
 const fn swap_replan_budget(byte_budget: usize, rejected_len: usize) -> usize {
     let below = rejected_len.saturating_sub(1);
@@ -533,8 +1397,8 @@ const fn swap_replan_budget(byte_budget: usize, rejected_len: usize) -> usize {
 /// Select `utxos` for a swap pre-hook and check it against the batch limit and `byte_budget`,
 /// without proving. The pre-hook unshields to the executor and runs the deadline guard, an
 /// optional invalidation of `invalidates`, and the exact approval. The app data holds a
-/// post-hook only for Reshield delivery. Hook calls are sized with their real encodings; every
-/// argument that is only known at signing is a static ABI word.
+/// post-hook only for Reshield and Across delivery. Hook calls are sized with their real
+/// encodings; every argument that is only known at signing is a static ABI word.
 pub(crate) fn plan_swap_inputs(
     builder: &TransactionBuilder,
     profile: &SwapProfile,
@@ -560,6 +1424,8 @@ pub(crate) fn plan_swap_inputs(
         invalidates,
     )?;
     let gas_model = RailgunGasModel::for_chain(profile.chain_id());
+    let post_hook_gas =
+        swap_post_hook_gas(gas_model, request.delivery, GasEstimateMode::UpperBound);
     let template = SwapAppDataTemplate {
         app_code: profile.app_code().to_owned(),
         pre_hook_gas_limit: hook_gas_limit(pre_hook_gas(
@@ -568,18 +1434,18 @@ pub(crate) fn plan_swap_inputs(
             PreHookCalls {
                 invalidate_order: invalidates.is_some(),
             },
+            GasEstimateMode::UpperBound,
         )),
-        post_hook: match request.delivery {
-            SwapDelivery::Reshield => Some(SwapPostHookTemplate {
-                calls: guarded_shield_calls(
+        post_hook: match post_hook_gas {
+            Some(gas) => Some(SwapPostHookTemplate {
+                calls: placeholder_post_hook_calls(
                     context.executor,
                     request.buy_token,
-                    U256::ONE,
-                    placeholder_shield(request.buy_token),
+                    request.delivery,
                 )?,
-                gas_limit: hook_gas_limit(post_hook_gas(gas_model)),
+                gas_limit: hook_gas_limit(gas),
             }),
-            SwapDelivery::External { .. } => None,
+            None => None,
         },
     };
     let check = builder.check_swap_pre_hook(
@@ -598,6 +1464,8 @@ pub(crate) fn plan_swap_inputs(
         byte_budget,
         size,
         gas_model,
+        post_hook_gas,
+        speed_up: None,
     };
     Ok(match check {
         SwapAmountCheck::Fits(size) => SwapAmountPlan::Fits(plan(size)),
@@ -608,9 +1476,15 @@ pub(crate) fn plan_swap_inputs(
 }
 
 /// Price the order limit for a hook-free quote of the order's sell amount, the plan's amount
-/// after the unshield fee: hook gas, slippage, and for Reshield delivery the shield fee. An
-/// External order carries no shield, so its review uses a shield fee of zero and its buy amount
-/// is the approved minimum.
+/// after the unshield fee: the gas share, the price tolerance, and for Reshield delivery the
+/// shield fee. External and Bridge orders carry no shield of the buy amount, so their reviews
+/// use a shield fee of zero and their buy amount is the approved minimum. `valid_for` is the
+/// order's effective validity, the swap profile's window for Bridge delivery.
+///
+/// When the requested gas share leaves no positive minimum and is above the Tight preset, the
+/// review is priced at Tight instead, and its `gas_share_bps()` reports Tight, so a form can
+/// still show the quote while its chosen preset is unavailable. The caller keeps the share it
+/// requested, so a later requote tries it again. If Tight fails too, the error is returned.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn price_swap_review(
     plan: SwapInputPlan,
@@ -619,52 +1493,159 @@ pub(crate) fn price_swap_review(
     shield_fee_bps: U256,
     unshield_fee_bps: U256,
     slippage_bps: u32,
+    gas_share_bps: u16,
+    valid_for: Duration,
     gas_price_wei: u128,
     hook_data_cost_wei: U256,
     isolation: OperationNetworkIsolation,
 ) -> Result<SwapReview> {
     let sell_amount = order_sell_amount(plan.amount(), unshield_fee_bps)?;
+    let surplus_shield_fee_bps = shield_fee_bps;
     let shield_fee_bps = match plan.delivery {
         SwapDelivery::Reshield => shield_fee_bps,
-        SwapDelivery::External { .. } => U256::ZERO,
+        SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => U256::ZERO,
     };
-    let native_rate = match &price {
-        SwapPrice::Verified { rate, .. } => NativeBuyRate::Anchor(rate.buy_rate),
-        SwapPrice::Unverified => NativeBuyRate::Quote,
-    };
-    let limit = price_order_limit(&OrderLimitParams {
-        quote: &quote.quote,
-        hook_gas: plan.hook_gas_estimate(),
-        gas_price_wei,
-        hook_data_cost_wei,
-        native_rate,
+    let gas = swap_gas_pricing(&quote.quote, &price, gas_price_wei, hook_data_cost_wei)?;
+    tracing::debug!(
+        target: "swap_quote",
+        step = "gas_price_comparison",
+        cow_gas_price_wei = %quote.quote.gas_price,
+        rpc_gas_price_wei = gas_price_wei,
+        limit_gas_price_wei = gas.limit_gas_price_wei,
+        quote_gas_units = gas.quote_gas_units,
+        gas_share_bps,
+        "priced swap and hook gas from RPC gas"
+    );
+    let (limit, gas_share_bps) = order_limit_or_tight(
+        plan.hook_gas_estimate(),
+        plan.buy_token,
+        &quote.quote,
+        gas,
         slippage_bps,
+        gas_share_bps,
         shield_fee_bps,
-    })
-    .map_err(|error| match error {
-        // Report the wallet's buy token, not CoW's native buy address.
-        OrderLimitError::HookCostExceedsOutput {
-            hook_cost,
-            quoted_output,
-            ..
-        } => OrderLimitError::HookCostExceedsOutput {
-            buy_token: plan.buy_token,
-            hook_cost,
-            quoted_output,
-        },
-        error => error,
-    })?;
+    )?;
     Ok(SwapReview {
+        cow_fee: quote_protocol_fee(&quote),
         plan,
         quote: quote.quote,
         quote_id: quote.id,
         limit,
+        gas,
+        gas_share_bps,
+        valid_for,
+        surplus_shield_fee_bps,
         shield_fee_bps,
         unshield_fee_bps,
         sell_amount,
         slippage_bps,
         price,
         isolation,
+        bridge: None,
+        continuing: SwapContinuingApprovals::default(),
+    })
+}
+
+/// The quote-time gas inputs of an order's limit: `quote`'s swap gas, the RPC gas price with
+/// its cushion, the hooks' rollup data cost, and the rate that converts gas into the buy token,
+/// the anchor's for a verified `price` and otherwise the quote's own.
+pub(super) fn swap_gas_pricing(
+    quote: &CowQuoteParameters,
+    price: &SwapPrice,
+    gas_price_wei: u128,
+    hook_data_cost_wei: U256,
+) -> Result<SwapGasPricing, OrderLimitError> {
+    let native_rate = match price {
+        SwapPrice::Verified { rate, .. } => NativeBuyRate::Anchor(rate.buy_rate),
+        SwapPrice::Unverified => NativeBuyRate::Quote,
+    };
+    // The gas estimate, and thus the minimum and an Across deposit, allows a 25% gas-price
+    // increase, rounded upward to whole wei. Neither changes the hooks' execution gas limits
+    // or applies the broadcaster's separate gas-price buffer.
+    Ok(SwapGasPricing {
+        quote_gas_units: quote_gas_units(quote)?,
+        gas_price_wei,
+        limit_gas_price_wei: gas_price_wei
+            .checked_add(gas_price_wei.div_ceil(4))
+            .ok_or(OrderLimitError::Overflow)?,
+        hook_data_cost_wei,
+        native_rate,
+    })
+}
+
+/// The order limit of `quote` at `gas_share_bps`, with the share it was priced at. When that
+/// share leaves no positive minimum and is above the Tight preset, the limit is priced at Tight
+/// instead. If Tight fails too, the error is returned.
+pub(super) fn order_limit_or_tight(
+    hook_gas: u64,
+    buy_token: Address,
+    quote: &CowQuoteParameters,
+    gas: SwapGasPricing,
+    price_tolerance_bps: u32,
+    gas_share_bps: u16,
+    shield_fee_bps: U256,
+) -> Result<(OrderLimit, u16), OrderLimitError> {
+    let limit = swap_order_limit(
+        hook_gas,
+        buy_token,
+        quote,
+        gas,
+        price_tolerance_bps,
+        gas_share_bps,
+        shield_fee_bps,
+    );
+    match limit {
+        Err(OrderLimitError::HookCostExceedsOutput { .. })
+            if gas_share_bps > GAS_SHARE_TIGHT_BPS =>
+        {
+            let limit = swap_order_limit(
+                hook_gas,
+                buy_token,
+                quote,
+                gas,
+                price_tolerance_bps,
+                GAS_SHARE_TIGHT_BPS,
+                shield_fee_bps,
+            )?;
+            Ok((limit, GAS_SHARE_TIGHT_BPS))
+        }
+        limit => Ok((limit?, gas_share_bps)),
+    }
+}
+
+/// The order limit of `quote` at `gas_share_bps`, for hooks estimated at `hook_gas`. A
+/// nonpositive minimum names the wallet's `buy_token`, not `CoW`'s native buy address.
+pub(super) fn swap_order_limit(
+    hook_gas: u64,
+    buy_token: Address,
+    quote: &CowQuoteParameters,
+    gas: SwapGasPricing,
+    price_tolerance_bps: u32,
+    gas_share_bps: u16,
+    shield_fee_bps: U256,
+) -> Result<OrderLimit, OrderLimitError> {
+    price_order_limit(&OrderLimitParams {
+        quote,
+        quote_gas_units: gas.quote_gas_units,
+        hook_gas,
+        gas_price_wei: gas.limit_gas_price_wei,
+        hook_data_cost_wei: gas.hook_data_cost_wei,
+        native_rate: gas.native_rate,
+        price_tolerance_bps,
+        gas_share_bps,
+        shield_fee_bps,
+    })
+    .map_err(|error| match error {
+        OrderLimitError::HookCostExceedsOutput {
+            gas_estimate,
+            best_case,
+            ..
+        } => OrderLimitError::HookCostExceedsOutput {
+            buy_token,
+            gas_estimate,
+            best_case,
+        },
+        error => error,
     })
 }
 
@@ -689,6 +1670,8 @@ impl SwapOutputPoiSink for WalletSession {
 /// A reviewed swap's proved pre-hook and approval, ready to sign.
 pub(crate) struct SwapOrderSigning<'a> {
     pub(crate) review: &'a SwapReview,
+    /// The swap use that claims the plan's account: see [`SwapOrderRequest::swap_use`].
+    pub(crate) swap_use: SwapUseId,
     pub(crate) private_minimum: U256,
     pub(crate) price_acknowledged: bool,
     /// Proved Railgun transactions of the pre-hook, unsigned.
@@ -703,6 +1686,28 @@ pub(crate) struct SwapOrderSigning<'a> {
     pub(crate) orderbook: &'a CowOrderbookClient,
     pub(crate) anchor_cache: &'a TokenAnchorRateCache,
     pub(crate) token_registry: &'a EffectiveTokenRegistry,
+    /// Required for Bridge delivery: see [`SwapOrderRequest::bridge`].
+    pub(crate) bridge: Option<SwapBridgeRoute<'a>>,
+    /// Required for Bridge delivery: see [`SwapOrderRequest::destination_minimum`].
+    pub(crate) destination_minimum: Option<U256>,
+    /// Required exactly for a private Bridge delivery: see [`SwapOrderRequest::destination`].
+    pub(crate) destination: Option<SwapDestinationSigning<'a>>,
+    /// The lower continuing destination minimum the user accepted with a speed-up's review,
+    /// `None` when the review disclosed none: see [`SwapOrderRequest::continuing_minimum`].
+    pub(crate) continuing_minimum: Option<U256>,
+}
+
+/// A private Bridge order's destination stealth account, confirmed as delegated on the
+/// destination chain, with that chain's owner and the authorization for its signature.
+#[derive(Clone, Copy)]
+pub(crate) struct SwapDestinationSigning<'a> {
+    pub(crate) owner: &'a ExecutorOwner,
+    pub(crate) delegated: DelegatedSwapExecutor,
+    pub(crate) authorization: &'a DesktopPrivateSpendAuthorization,
+    /// The wallet's local notes on the destination chain. A reused account's earlier shields
+    /// are judged from them again when its shield is issued; without them every such shield
+    /// is unknown, which refuses.
+    pub(crate) notes: Option<&'a dyn SwapShieldNotes>,
 }
 
 enum SwapRecheck {
@@ -722,6 +1727,19 @@ impl ExecutorOwner {
             base_url,
             self.chain.chain_id,
         )?)
+    }
+
+    /// `orderbook` and `bridge` on one new network route of the swap's own, for an explicit
+    /// status check, so a route its provider rejects isn't asked again. Other swaps and the
+    /// shared session are untouched.
+    pub async fn swap_clients_on_fresh_route(
+        &self,
+        orderbook: &CowOrderbookClient,
+        bridge: &SwapBridgeClients,
+    ) -> Result<(CowOrderbookClient, SwapBridgeClients)> {
+        let http = self.while_active(self.http.operation_http_client()).await?;
+        let bridge = bridge.on_route(&http);
+        Ok((orderbook.on_route(http), bridge))
     }
 
     /// Plan the pre-hook's notes for `request` from POI-spendable notes that no other executor
@@ -769,12 +1787,20 @@ impl ExecutorOwner {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        if matches!(executor.setup, SwapExecutorSetup::Recorded) {
-            swap_attempt_refusal(&record, || record.has_recorded_unresolved_issued_work())
-                .map_or(Ok(()), |refusal| Err(eyre!(refusal)))?;
-        } else {
-            require_swap_attempt_admitted(&record)?;
-        }
+        // Only a plan made for the confirmed or included delegation has reconciled evidence
+        // behind it.
+        let evidence = executor
+            .delegated()
+            .map_or(SwapAdmissionEvidence::Recorded, |delegated| {
+                delegated.evidence()
+            });
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            previewed_swap_use(&record, executor.is_reused()),
+            evidence,
+        )?;
         // Without reuse, the executor places the pair it was set up for: the setup approval's
         // before the first order, then the last order's.
         let pair = match record.swap() {
@@ -799,6 +1825,81 @@ impl ExecutorOwner {
         )
     }
 
+    /// Plan a second order for the open order `order` of the swap `operation`, from local
+    /// records only. Nothing is proved or signed. The plan keeps the open order's tokens,
+    /// private spend and delivery, spends exactly the notes of the recorded proof, invalidates
+    /// the open order and names it, so review and signing stay bound to it. Like a recorded
+    /// preview it can't be signed until execution preparation confirms the account at the open
+    /// order's pre-hook nonce. While the record leaves the swap's own setup unresolved, the
+    /// speed-up needs `inclusion`, the session's last read at the latest block that showed the
+    /// setup included.
+    pub fn plan_swap_speed_up(
+        &self,
+        session: &WalletSession,
+        operation: ExecutorOperationId,
+        order: OrderUid,
+        inclusion: Option<SwapSetupInclusion>,
+    ) -> Result<SwapAmountPlan> {
+        self.require_swap_session(session)?;
+        let profile = self.swap_order_profile()?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let (_, speed_up) =
+            swap_speed_up_binding(&record, order).ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+        let executor =
+            recorded_swap_executor(&record, self.chain.chain_id, speed_up.pre_hook_nonce, false)?;
+        let utxos = self.swap_inputs(session, &record)?;
+        let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
+        let builder = TransactionBuilder {
+            chain_type: 0,
+            chain_id: self.chain.chain_id,
+            railgun_contract: chain.railgun_contract,
+            relay_adapt_contract: chain.relay_adapt_contract,
+        };
+        plan_swap_speed_up_inputs(
+            &builder,
+            &profile,
+            &record,
+            executor,
+            &utxos,
+            order,
+            SystemTime::now(),
+            inclusion,
+        )
+    }
+
+    /// Why the order `order` of the swap `operation` can't be sped up now, judged from the
+    /// record alone and without a network request. `None` is provisional: it offers the
+    /// action, and planning and signing check the order again. While the record leaves the
+    /// swap's own setup unresolved, only `inclusion`, the session's last read at the latest
+    /// block that showed the setup included, offers it.
+    pub fn swap_speed_up_refusal(
+        &self,
+        operation: ExecutorOperationId,
+        order: OrderUid,
+        inclusion: Option<SwapSetupInclusion>,
+    ) -> Result<Option<SwapSpeedUpRefusal>> {
+        let profile = self.swap_order_profile()?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let chain_id = self.chain.chain_id;
+        let admitted = speed_up_block(
+            &record,
+            &profile,
+            chain_id,
+            order,
+            SystemTime::now(),
+            inclusion,
+        );
+        Ok(match admitted {
+            Ok(_) => None,
+            Err(SpeedUpBlock::TwoOrdersFillable) => Some(SwapSpeedUpRefusal::TwoOrdersFillable),
+            Err(_) => Some(SwapSpeedUpRefusal::Unavailable),
+        })
+    }
+
     /// Quote using the shared protocol fee and background anchor rates, without hooks, and
     /// price the order limit. Signing rechecks the fees and anchors before using these terms.
     pub async fn review_swap(&self, request: SwapReviewRequest<'_>) -> Result<SwapReview> {
@@ -810,11 +1911,21 @@ impl ExecutorOwner {
         let SwapReviewRequest {
             plan,
             slippage_bps,
+            gas_share_bps,
+            valid_for,
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
         } = request;
         let profile = self.swap_order_profile()?;
+        let bridge = bridge_route(&plan, bridge)?;
+        // A bridge leg is quoted for the profile's window.
+        let valid_for = if matches!(plan.delivery, SwapDelivery::Bridge(_)) {
+            profile.valid_to_window()
+        } else {
+            valid_for
+        };
         if let Some(operation) = plan.operation() {
             self.swap_account_record(operation)?
                 .ok_or_else(|| eyre!("swap executor is unavailable"))?;
@@ -833,7 +1944,7 @@ impl ExecutorOwner {
                 .quote_sell(&swap_quote_request(
                     &plan,
                     sell_amount,
-                    valid_to_after(SystemTime::now(), profile.valid_to_window())?,
+                    valid_to_after(SystemTime::now(), valid_for)?,
                 ))
                 .await;
             tracing::debug!(
@@ -848,7 +1959,7 @@ impl ExecutorOwner {
         let gas_price = async {
             let started = Instant::now();
             tracing::debug!(target: "swap_quote", step = "gas_price", "started");
-            let gas_price = buffered_gas_price_from_rpc_pool(&pool, &chain.gas).await;
+            let gas_price = gas_price_from_rpc_pool_with_policy(&pool, 1, 1).await;
             tracing::debug!(
                 target: "swap_quote",
                 step = "gas_price",
@@ -890,6 +2001,11 @@ impl ExecutorOwner {
             },
             "finished"
         );
+        let diagnostics = SwapQuoteDiagnostics::new(
+            self.chain.chain_id,
+            &quote.quote,
+            SwapQuoteAnchor::from_cached(&anchor),
+        );
         let price = match anchor {
             Ok(Some(rate)) => {
                 check_quote_against_anchor(
@@ -905,17 +2021,103 @@ impl ExecutorOwner {
             }
             Ok(None) | Err(_) => SwapPrice::Unverified,
         };
-        price_swap_review(
+        let mut review = price_swap_review(
             plan,
             quote,
             price,
             shield_fee_bps,
             unshield_fee_bps,
             slippage_bps,
+            gas_share_bps,
+            valid_for,
             gas_price_wei,
             hook_data_cost_wei,
             orderbook.isolation(),
         )
+        .map_err(|error| wrap_pricing_error(error, diagnostics))?;
+        if let Some((delivery, route)) = bridge {
+            // Bridge orders carry no shield, so the buy amount is the suggested minimum.
+            let started = Instant::now();
+            tracing::debug!(target: "swap_quote", step = "bridge_quote", "started");
+            let quote = self
+                .quote_swap_bridge(
+                    route,
+                    delivery,
+                    &profile,
+                    review.limit.buy_amount,
+                    slippage_bps,
+                    anchor_cache,
+                    token_registry,
+                )
+                .await;
+            tracing::debug!(
+                target: "swap_quote",
+                step = "bridge_quote",
+                elapsed_ms = started.elapsed().as_millis(),
+                success = quote.is_ok(),
+                "finished"
+            );
+            review.bridge = Some(quote?);
+        }
+        // A speed-up of a public Across swap leaves its open order live, so that order or an
+        // earlier attempt's deposit can still decide its delivery. An ordinary retry's earlier
+        // orders can't fill, so it discloses none. An explicitly reused account starts a new
+        // use, whose attempts are compared with nothing. A speed-up names its use and signs at
+        // its open order's nonce.
+        if let Some(speed_up) = review.plan.speed_up
+            && is_public_across(review.plan.delivery)
+            && !review.plan.executor.is_reused()
+            && let Some(operation) = review.plan.operation()
+        {
+            review.continuing = self
+                .swap_continuing_approvals(
+                    operation,
+                    speed_up.swap_use,
+                    review.plan.delivery,
+                    Some(speed_up.pre_hook_nonce),
+                )
+                .await?;
+        }
+        Ok(review)
+    }
+
+    /// `review` at another gas share, with its bridge leg quoted again on `route` for the new
+    /// order buy amount. The `CoW` quote, the gas inputs, the plan and the validity stay as they
+    /// were reviewed, and the orderbook isn't asked.
+    pub async fn requote_swap_bridge(
+        &self,
+        review: &SwapReview,
+        gas_share_bps: u16,
+        route: SwapBridgeRoute<'_>,
+        anchor_cache: Option<&TokenAnchorRateCache>,
+        token_registry: &EffectiveTokenRegistry,
+    ) -> Result<SwapReview> {
+        self.while_active(Box::pin(async {
+            let profile = self.swap_order_profile()?;
+            let Some((delivery, route)) = bridge_route(&review.plan, Some(route))? else {
+                return Err(eyre!("only a bridge swap has a bridge leg to quote"));
+            };
+            if let Some(operation) = review.plan.operation() {
+                self.swap_account_record(operation)?
+                    .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+            }
+            let mut repriced = review.with_gas_share(gas_share_bps)?;
+            // Bridge orders carry no shield, so the buy amount is the suggested minimum.
+            repriced.bridge = Some(
+                self.quote_swap_bridge(
+                    route,
+                    delivery,
+                    &profile,
+                    repriced.limit.buy_amount,
+                    repriced.slippage_bps,
+                    anchor_cache,
+                    token_registry,
+                )
+                .await?,
+            );
+            Ok(repriced)
+        }))
+        .await
     }
 
     /// Prove the planned pre-hook, or reuse the recorded proof when a retry spends the same
@@ -941,6 +2143,7 @@ impl ExecutorOwner {
     ) -> Result<SwapOrderOutcome> {
         let SwapOrderRequest {
             review,
+            swap_use,
             private_minimum,
             price_acknowledged,
             session,
@@ -948,24 +2151,92 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
+            destination_minimum,
+            destination,
+            continuing_minimum,
             verify_proof,
         } = request;
         self.require_swap_session(&session)?;
-        review.require_approval(private_minimum, price_acknowledged)?;
+        review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
+        bridge_route(&review.plan, bridge)?;
+        if review.plan.delivery.private_bridge().is_some() != destination.is_some() {
+            return Err(eyre!(DESTINATION_ACCOUNT_MISMATCH));
+        }
+        let account_use = order_account_use(&review.plan, swap_use)?;
+        // The use claims its account before the account is read or anything is proved.
+        self.admit_swap_use(review, swap_use, private_minimum, price_acknowledged)?;
         let confirmed = session
             .sync_tip_rx
             .borrow()
             .safe_head_block
             .ok_or_else(|| eyre!("waiting for the wallet to sync the chain head"))?;
+        let operation = review
+            .plan
+            .operation()
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        // A private Bridge order is signed only once the destination chain's stealth account is
+        // confirmed as delegated too, through that chain's owner. The swap's record names it.
+        let destination_account = match (&destination, review.plan.delivery.private_bridge()) {
+            (Some(context), Some(delivery)) => {
+                let destination_operation = self
+                    .swap_account_record(operation)?
+                    .and_then(|record| record.destination_operation())
+                    .ok_or_else(|| {
+                        eyre!("this swap has no stealth account on the destination network")
+                    })?;
+                context.owner.require_swap_session(&context.session)?;
+                let confirmed = context
+                    .session
+                    .sync_tip_rx
+                    .borrow()
+                    .safe_head_block
+                    .ok_or_else(|| {
+                        eyre!("waiting for the wallet to sync the destination network")
+                    })?;
+                Some((context, destination_operation, confirmed, delivery.receiver))
+            }
+            _ => None,
+        };
+        // Both selected accounts are refreshed at the same time, each through its own owner
+        // and session. Each result is bound to its record, which signing checks again.
         let mut review = review.clone();
-        if let Some(change) = trace_step(
-            "order_account_refresh",
-            self.refresh_swap_executor(&mut review, confirmed),
-        )
-        .await?
-        {
+        let (source, destination) = tokio::join!(
+            trace_step(
+                "order_account_refresh",
+                self.refresh_swap_executor(&mut review, confirmed, account_use),
+            ),
+            async {
+                let Some((context, destination_operation, confirmed, receiver)) =
+                    destination_account
+                else {
+                    return Ok(None);
+                };
+                let delegated = trace_step(
+                    "order_destination_refresh",
+                    context.owner.delegated_swap_destination(
+                        destination_operation,
+                        confirmed,
+                        self.chain.chain_id,
+                        operation,
+                        swap_use,
+                        receiver,
+                        Some(&*context.session),
+                    ),
+                )
+                .await?;
+                Ok::<_, eyre::Report>(Some(SwapDestinationSigning {
+                    owner: context.owner.as_ref(),
+                    delegated,
+                    authorization: &context.authorization,
+                    notes: Some(&*context.session),
+                }))
+            },
+        );
+        if let Some(change) = source? {
             return Ok(SwapOrderOutcome::ReviewRequired(change));
         }
+        let destination = destination?;
         let review = &review;
         let plan = &review.plan;
         let delegated = require_delegated_plan(plan)?;
@@ -973,13 +2244,23 @@ impl ExecutorOwner {
             .swap_account_record(delegated.operation())?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
         // No proof is built for a retry the store would refuse.
-        require_swap_attempt_admitted(&record)?;
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            account_use,
+            delegated.evidence(),
+        )?;
+        require_swap_use_terms(&record, swap_use, plan)?;
         let utxos = self.swap_inputs(&session, &record)?;
         let (transactions, inputs, change_output_pois) = if let Some((transactions, inputs)) =
             reusable_swap_proof(&record, plan, &utxos)
         {
             tracing::debug!(target: "executor_observation", step = "order_proof", reused = true);
             (transactions, inputs, Vec::new())
+        } else if plan.speed_up.is_some() {
+            // A speed-up funds from the recorded proof alone, so nothing is proved for it.
+            return Err(eyre!(SPEED_UP_FUNDS_CHANGED));
         } else {
             trace_step(
                 "order_proof",
@@ -995,6 +2276,7 @@ impl ExecutorOwner {
         };
         Box::pin(self.issue_swap_order(SwapOrderSigning {
             review,
+            swap_use,
             private_minimum,
             price_acknowledged,
             transactions,
@@ -1005,8 +2287,47 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
+            destination_minimum,
+            destination,
+            continuing_minimum,
         }))
         .await
+    }
+
+    /// Bind the order to its swap use before any preparation. An explicitly reused account
+    /// that doesn't hold `swap_use` yet is claimed for it, with the approval these terms make.
+    /// Any other account must already be claimed by that use. A speed-up never claims one.
+    fn admit_swap_use(
+        &self,
+        review: &SwapReview,
+        swap_use: SwapUseId,
+        private_minimum: U256,
+        price_acknowledged: bool,
+    ) -> Result<()> {
+        let operation = review
+            .plan
+            .operation()
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        if review.plan.speed_up.is_none()
+            && review.plan.executor.is_reused()
+            && record.swap_use(swap_use).is_none()
+        {
+            self.claim_swap_use(
+                None,
+                SwapUseClaim {
+                    id: swap_use,
+                    source: SwapAccountChoice::Existing(operation),
+                    approval: review.approval(private_minimum, price_acknowledged)?,
+                    destination: None,
+                },
+            )?;
+            return Ok(());
+        }
+        require_swap_use(&record, swap_use)
     }
 
     async fn prove_swap_pre_hook(
@@ -1106,17 +2427,35 @@ impl ExecutorOwner {
         ))
     }
 
-    /// Sign the pre-hook at the executor's current nonce `k`, for Reshield delivery the post-hook
-    /// at `k + 1`, and the order, after checking cached anchors. The first order after setup
-    /// must match the pair and delivery approved with the setup, and an External receiver must
-    /// pass [`SwapProfile::check_receiver`]. Persist them with the input reservation, then
-    /// submit. Nothing signed leaves the wallet before the write succeeds.
+    /// Sign the pre-hook at the executor's current nonce `k`, for Reshield and Across delivery
+    /// the post-hook at `k + 1`, and the order, after checking cached anchors. The first order
+    /// after setup must match the pair and delivery approved with the setup, an External
+    /// receiver must pass [`SwapProfile::check_receiver`], and a public Bridge receiver the
+    /// destination chain's [`crate::settings::BridgeDestinationProfile::check_receiver`]. A
+    /// Bridge order's provider is quoted again before anything is signed: Across for the
+    /// deposit's terms, NEAR Intents for a verified deposit address that the order pays. An
+    /// Across quote below the approved destination minimum is taken once more for a deposit
+    /// raised within the approval's cushion, which the order then signs. Persist
+    /// them with the input reservation and the provider's terms, then submit. Nothing signed
+    /// leaves the wallet before the write succeeds.
+    ///
+    /// On the swap's own included setup `k` is the nonce after the setup's, which the record
+    /// leaves unresolved. The account is read at the latest block again under the lock the
+    /// write holds, and without the setup included there nothing is written or sent: the error
+    /// is [`SwapAccountRefusal::SetupUnconfirmed`].
+    ///
+    /// A private Bridge delivery's receiver is the wallet's own destination stealth account.
+    /// Before the provider's quote and before this chain's account signs anything, that account
+    /// signs its guarded shield for the approved destination minimum, which is persisted in its
+    /// record on the destination chain. The Across quote then carries the destination chain's
+    /// handler and the message that runs that shield, and the post-hook's deposit signs both.
     pub(crate) async fn issue_swap_order(
         &self,
         signing: SwapOrderSigning<'_>,
     ) -> Result<SwapOrderOutcome> {
         let SwapOrderSigning {
             review,
+            swap_use,
             private_minimum,
             price_acknowledged,
             transactions,
@@ -1127,25 +2466,145 @@ impl ExecutorOwner {
             orderbook,
             anchor_cache,
             token_registry,
+            bridge,
+            destination_minimum,
+            destination,
+            continuing_minimum,
         } = signing;
         let plan = &review.plan;
         let delegated = require_delegated_plan(plan)?;
         let (operation, executor) = (delegated.operation(), delegated.executor());
-        let buy_amount = review.require_approval(private_minimum, price_acknowledged)?;
+        let buy_amount =
+            review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
+        // The attempt records the gas the signed minimum leaves room for.
+        let gas_allowance = review.gas_allowance_for(private_minimum)?;
+        let bridge = bridge_route(plan, bridge)?;
+        if plan.delivery.private_bridge().is_some() != destination.is_some() {
+            return Err(eyre!(DESTINATION_ACCOUNT_MISMATCH));
+        }
         let profile = self.swap_order_profile()?;
         self.ensure_active()?;
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        require_swap_attempt_admitted(&record)?;
+        require_swap_use(&record, swap_use)?;
+        let account_use = order_account_use(plan, swap_use)?;
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            account_use,
+            delegated.evidence(),
+        )?;
+        require_swap_use_terms(&record, swap_use, plan)?;
         // The hooks are issued against the latest reconciled observation, which the write
-        // below requires to be unchanged; the plan's proof shape fixes the nonce.
+        // below requires to be unchanged; the plan's proof shape fixes the nonce. That is the
+        // observed nonce, or on the swap's own included setup, which the record leaves
+        // unresolved at the observed nonce, the next one, which the read at the latest block
+        // showed. The hooks still name the confirmed observation.
         let observed = record
             .nonce_observation()
-            .filter(|observed| observed.nonce() == plan.context.execution_nonce)
+            .ok_or_else(|| eyre!("the swap executor's nonce changed; plan the swap again"))?;
+        let nonce = delegated
+            .inclusion()
+            .map_or_else(
+                || Some(observed.nonce()),
+                |inclusion| {
+                    observed
+                        .nonce()
+                        .checked_add(U256::ONE)
+                        .filter(|next| *next == inclusion.nonce())
+                },
+            )
+            .filter(|nonce| *nonce == plan.context.execution_nonce)
             .ok_or_else(|| eyre!("the swap executor's nonce changed; plan the swap again"))?;
         if record.address() != Some(executor) || record.delegate() != delegated.delegate() {
             return Err(eyre!("the swap executor changed; plan the swap again"));
+        }
+        // A speed-up is signed only against the open order it was reviewed for, at that order's
+        // nonce and fixed terms, and only for a lower buy amount.
+        let speed_up_open = match plan.speed_up {
+            Some(speed_up) => {
+                let (open, _) = swap_speed_up_binding(&record, speed_up.order)
+                    .ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+                require_speed_up_window(
+                    &record,
+                    &profile,
+                    &speed_up,
+                    SystemTime::now(),
+                    delegated.inclusion(),
+                )?;
+                if nonce != speed_up.pre_hook_nonce {
+                    return Err(eyre!(SPEED_UP_NONCE_CHANGED));
+                }
+                let bounds = open.bounds();
+                if plan.invalidates != Some(speed_up.order)
+                    || review.sell_amount != bounds.sell_amount
+                    || plan.amount() != bounds.spend_amount()
+                    || plan.delivery != open.delivery()
+                    || review.slippage_bps != bounds.slippage_bps
+                {
+                    return Err(eyre!(SPEED_UP_TERMS_CHANGED));
+                }
+                let current = review.valid_for_secs()?;
+                if let Some(approved) = bounds.valid_for_secs
+                    && approved != current
+                {
+                    return Ok(SwapOrderOutcome::ReviewRequired(
+                        SwapReviewChange::Validity {
+                            approved: u64::from(approved),
+                            current: u64::from(current),
+                        },
+                    ));
+                }
+                if let Some(change) = speed_up_buy_amount_change(bounds, buy_amount) {
+                    return Ok(SwapOrderOutcome::ReviewRequired(change));
+                }
+                Some(bounds)
+            }
+            None => None,
+        };
+        // A private delivery's receiver is the stealth account this swap's record links to on
+        // the destination chain, confirmed there for the same wallet.
+        if let (Some(delivery), Some(destination)) = (plan.delivery.private_bridge(), destination)
+            && (destination.owner.chain.chain_id != delivery.destination_chain
+                || !self.view.is_same_wallet_session(&destination.owner.view)
+                || destination.delegated.executor() != delivery.receiver
+                || record.destination_operation() != Some(destination.delegated.operation()))
+        {
+            return Err(eyre!(
+                "the stealth account on the destination network doesn't belong to this swap; plan the swap again"
+            ));
+        }
+        // The first order of a use is signed for the accounts its approval binds: this account,
+        // a private delivery's receiver, and whether the use set each of them up.
+        let first_order = !record.has_swap_use_order(swap_use);
+        if first_order
+            && let Some(approval) = record.swap_use(swap_use).and_then(SwapUseRecord::approval)
+            && let Some(accounts) = approval.accounts
+        {
+            let source_setup = record
+                .swap_use(swap_use)
+                .is_none_or(SwapUseRecord::is_fresh);
+            let bound_destination = match (plan.delivery.private_bridge(), destination) {
+                (Some(delivery), Some(destination)) => {
+                    let setup = destination
+                        .owner
+                        .swap_account_record(destination.delegated.operation())?
+                        .and_then(|account| account.swap_use(swap_use).map(SwapUseRecord::is_fresh))
+                        .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?;
+                    Some((delivery.receiver, setup))
+                }
+                _ => None,
+            };
+            if !accounts.admits((executor, source_setup), bound_destination) {
+                return Ok(SwapOrderOutcome::ReviewRequired(SwapReviewChange::Accounts));
+            }
+            // An account with earlier orders skips the check below, so its approved delivery
+            // is compared here.
+            if record.swap().is_some() && approval.delivery != plan.delivery {
+                return Ok(SwapOrderOutcome::ReviewRequired(SwapReviewChange::Delivery));
+            }
         }
         // The first order after setup places the approved pair and delivery. Later orders, with
         // their own reviews, aren't bound by it. A new delivery needs a new approval.
@@ -1167,6 +2626,22 @@ impl ExecutorOwner {
                 executor,
                 receiver,
             )?;
+        }
+        // A private delivery's receiver is the wallet's own account, checked above.
+        if let Some((delivery, route)) = bridge
+            && !delivery.is_private()
+        {
+            let destination = route.destination_chain;
+            destination
+                .bridge_destination()
+                .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?
+                .check_receiver(
+                    destination
+                        .railgun
+                        .as_ref()
+                        .map(|railgun| railgun.deployment.contract),
+                    delivery.receiver,
+                )?;
         }
         // The pre-hook must invalidate every earlier order that could fill with its funds.
         if swap_invalidation(&record, &profile, SystemTime::now())?
@@ -1195,12 +2670,248 @@ impl ExecutorOwner {
                     return Ok(SwapOrderOutcome::ReviewRequired(change));
                 }
             };
+        // A private Bridge delivery shields on the destination chain at that chain's fee, the
+        // shared protocol constant like this chain's. The reviewed rate must be the current
+        // one, and for the first order after setup the one approved with it.
+        let private_quote = match plan.delivery.private_bridge() {
+            Some(_) => {
+                let quote = review
+                    .bridge
+                    .and_then(|bridge| bridge.private)
+                    .ok_or_else(|| eyre!("quote the bridge before approving this swap"))?;
+                let current = RAILGUN_PROTOCOL_FEE_BPS;
+                let reviewed = quote.destination_shield_fee_bps;
+                let approved = record
+                    .swap_approval()
+                    .filter(|_| record.swap().is_none())
+                    .map_or(reviewed, |approval| {
+                        approval
+                            .bounds
+                            .destination_shield_fee_bps
+                            .unwrap_or_default()
+                    });
+                if reviewed != current || approved != current {
+                    return Ok(SwapOrderOutcome::ReviewRequired(
+                        SwapReviewChange::DestinationShieldFee {
+                            approved: if approved == current {
+                                reviewed
+                            } else {
+                                approved
+                            },
+                            current,
+                        },
+                    ));
+                }
+                Some(quote)
+            }
+            None => None,
+        };
+
+        // Bridge reviews carry the profile's window.
+        let valid_for_secs = review.valid_for_secs()?;
+        let valid_to = valid_to_after(SystemTime::now(), review.valid_for)?;
+        // The provider quotes the approved order before anything is signed. A 1Click quote
+        // names the receiver, so it follows every check above.
+        let (bridge_terms, private_delivery, raised) = match bridge {
+            Some((delivery, route)) => {
+                let destination_minimum = destination_minimum
+                    .ok_or_else(|| eyre!("a bridge swap needs its approved destination minimum"))?;
+                // The destination account signs its shield for the approved destination
+                // minimum, the deposit's output amount. Its payload is durable on the
+                // destination chain before the quote request carries it out of the wallet.
+                let private_delivery = match destination {
+                    Some(destination) => {
+                        let handler = route
+                            .destination_chain
+                            .bridge_profile()
+                            .ok_or_else(|| {
+                                eyre!("the destination network doesn't support bridging")
+                            })?
+                            .multicall_handler();
+                        let destination_executor = destination.delegated.executor();
+                        let shield_multicall = trace_step(
+                            "order_destination_shield",
+                            self.while_active(destination.owner.issue_swap_destination_shield(
+                                destination.delegated,
+                                swap_use,
+                                delivery.destination_token,
+                                destination_minimum,
+                                destination.authorization,
+                                destination.notes,
+                            )),
+                        )
+                        .await?;
+                        // Without a fallback a failing shield reverts the fill, and Across
+                        // refunds the deposit on this chain.
+                        let keep = delivery.private.is_some_and(|private| {
+                            private.on_shield_failure == BridgeShieldFailure::KeepOnDestination
+                        });
+                        Some(AcrossPrivateDelivery {
+                            handler,
+                            destination_executor,
+                            shield_multicall,
+                            fallback: keep.then_some(destination_executor),
+                        })
+                    }
+                    None => None,
+                };
+                let message = private_delivery.as_ref().map(|private| {
+                    private_delivery_message(
+                        private.handler,
+                        delivery.destination_token,
+                        private.destination_executor,
+                        private.shield_multicall.clone(),
+                        private.fallback,
+                    )
+                });
+                let handler_message =
+                    private_delivery
+                        .as_ref()
+                        .zip(message.as_ref())
+                        .map(|(private, message)| AcrossHandlerMessage {
+                            handler: private.handler,
+                            message,
+                        });
+                let mut signing = trace_step(
+                    "order_bridge_quote",
+                    self.while_active(self.bridge_signing_terms(
+                        review,
+                        route,
+                        delivery,
+                        buy_amount,
+                        destination_minimum,
+                        valid_to,
+                        handler_message,
+                        &profile,
+                        anchor_cache,
+                        token_registry,
+                    )),
+                )
+                .await?;
+                // An Across quote that fell short within the approval's cushion is taken again
+                // for the deposit that delivers the approved minimum. The destination shield
+                // stays the one signed for that minimum. A NEAR Intents quote creates a deposit
+                // address, so it is never requested twice.
+                let mut raised = None;
+                if let BridgeSigning::Changed(SwapReviewChange::DestinationMinimum {
+                    current, ..
+                }) = signing
+                    && delivery.provider == BridgeProvider::Across
+                {
+                    // The allowed gas of the approval that binds a first order, else the
+                    // review's own.
+                    let approved_allowance = record
+                        .swap_approval()
+                        .filter(|_| record.swap().is_none())
+                        .and_then(|approval| approval.bounds.gas_allowance)
+                        .unwrap_or_else(|| review.gas_allowance());
+                    let deposit = review.raised_deposit(
+                        buy_amount,
+                        destination_minimum,
+                        current,
+                        approved_allowance,
+                    );
+                    tracing::debug!(target: "executor_observation", step = "order_bridge_quote",
+                        approved = %destination_minimum, current = %current,
+                        within_cushion = deposit.is_some(), "below the approved minimum");
+                    if let Some(deposit) = deposit
+                        && let Ok(raised_buy) = review.require_approval(
+                            deposit,
+                            Some(destination_minimum),
+                            price_acknowledged,
+                        )
+                    {
+                        let raised_signing = trace_step(
+                            "order_bridge_quote",
+                            self.while_active(self.bridge_signing_terms(
+                                review,
+                                route,
+                                delivery,
+                                raised_buy,
+                                destination_minimum,
+                                valid_to,
+                                handler_message,
+                                &profile,
+                                anchor_cache,
+                                token_registry,
+                            )),
+                        )
+                        .await?;
+                        // A still-short quote for the raised deposit can't replace the review
+                        // at its reviewed deposit. Keep that first change.
+                        if matches!(raised_signing, BridgeSigning::Terms(_)) {
+                            signing = raised_signing;
+                            raised = Some((deposit, raised_buy));
+                        }
+                    }
+                }
+                match signing {
+                    BridgeSigning::Terms(terms) => (Some(terms), private_delivery, raised),
+                    BridgeSigning::Changed(change) => {
+                        return Ok(SwapOrderOutcome::ReviewRequired(change));
+                    }
+                }
+            }
+            None => (None, None, None),
+        };
+        // A raised deposit is the order's minimum and buy amount from here on.
+        let (private_minimum, buy_amount, gas_allowance) = match raised {
+            Some((deposit, raised_buy)) => {
+                (deposit, raised_buy, review.gas_allowance_for(deposit)?)
+            }
+            None => (private_minimum, buy_amount, gas_allowance),
+        };
+        // A raised deposit can take back the reduction a speed-up was reviewed for.
+        if let Some(change) =
+            speed_up_open.and_then(|open| speed_up_buy_amount_change(open, buy_amount))
+        {
+            return Ok(SwapOrderOutcome::ReviewRequired(change));
+        }
+        // For a speed-up, an earlier attempt's post-hook above the nonce this pre-hook signs
+        // at, the open order's included, can still deposit under its own lower minimum. The
+        // user must have accepted that minimum. An ordinary retry discloses none.
+        if plan.speed_up.is_some()
+            && is_public_across(plan.delivery)
+            && let Some(destination_minimum) = destination_minimum
+        {
+            let continuing = trace_step(
+                "order_continuing_approvals",
+                self.swap_continuing_approvals(operation, swap_use, plan.delivery, Some(nonce)),
+            )
+            .await?;
+            if let Some(current) = continuing.lower_minimum(destination_minimum)
+                && continuing_minimum.is_none_or(|accepted| accepted > current)
+            {
+                return Ok(SwapOrderOutcome::ReviewRequired(
+                    SwapReviewChange::ContinuingApproval {
+                        approved: continuing_minimum.unwrap_or_default(),
+                        current,
+                    },
+                ));
+            }
+        }
+        // The destination session is needed until the order is signed. One that ended during
+        // the quote stops the order before anything of this account is signed.
+        if let Some(destination) = destination {
+            destination.owner.ensure_active()?;
+        }
+        // The open order may have expired while a quote was awaited. A new order can't relax
+        // one that solvers no longer fill.
+        if let Some(speed_up) = plan.speed_up {
+            require_speed_up_window(
+                &record,
+                &profile,
+                &speed_up,
+                SystemTime::now(),
+                delegated.inclusion(),
+            )?;
+        }
+        // Resolved before anything is signed.
+        let receiver = order_receiver(executor, plan.delivery, bridge_terms.as_ref())?;
 
         let signing_started = Instant::now();
         tracing::debug!(target: "executor_observation", step = "order_sign", "started");
         let chain_id = self.chain.chain_id;
-        let nonce = observed.nonce();
-        let valid_to = valid_to_after(SystemTime::now(), profile.valid_to_window())?;
         let proof_digest = keccak256(transactions.abi_encode());
         let unsigned = TransactionCall {
             to: executor,
@@ -1239,28 +2950,60 @@ impl ExecutorOwner {
             .authorize_call(&unsigned, signer.sign_hash_sync(&pre_hook_hash)?)?
             .data;
         let recipient = self.view.scan_keys().address_data();
-        // Every Reshield post-hook of this swap shields the full buy-token balance to the
-        // wallet's own address, keyed like executor recovery's shields. An External order pays
-        // its receiver and signs none.
-        let post_hook = match plan.delivery {
-            SwapDelivery::Reshield => {
+        // Every post-hook shield of this swap shields the full buy-token balance to the
+        // wallet's own address.
+        let wallet_shield = || self.wallet_shield(&signer, plan.buy_token);
+        // A Reshield post-hook shields the bought token and an Across post-hook deposits it,
+        // shielding any surplus when the user chose to. A private delivery's deposit pays the
+        // destination chain's handler with the message that runs the destination account's
+        // shield. External and NEAR Intents orders pay their receiver and sign none.
+        let post_hook_calls = match (plan.delivery, &bridge_terms) {
+            (SwapDelivery::Reshield, _) => Some(guarded_shield_calls(
+                executor,
+                plan.buy_token,
+                buy_amount,
+                wallet_shield()?,
+            )?),
+            (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(terms))) => {
+                let deposit = across_deposit(executor, delivery, terms);
+                let surplus_shield = (delivery.surplus == BridgeSurplus::Reshield)
+                    .then(wallet_shield)
+                    .transpose()?;
+                Some(match private_delivery {
+                    Some(private) => {
+                        let calls = private_bridge_deposit_calls(
+                            executor,
+                            terms.spoke_pool,
+                            deposit,
+                            private,
+                            surplus_shield,
+                        )?;
+                        // The plan sized the message from a placeholder of the destination
+                        // account's payload.
+                        let planned =
+                            placeholder_post_hook_calls(executor, plan.buy_token, plan.delivery)?;
+                        if calls.abi_encode().len() != planned.abi_encode().len() {
+                            return Err(eyre!(
+                                "the swap's post-hook differs from the planned one; plan the swap again"
+                            ));
+                        }
+                        calls
+                    }
+                    None => {
+                        bridge_deposit_calls(executor, terms.spoke_pool, deposit, surplus_shield)?
+                    }
+                })
+            }
+            (SwapDelivery::External { .. } | SwapDelivery::Bridge(_), _) => None,
+        };
+        let post_hook = match post_hook_calls {
+            Some(calls) => {
                 let post_hook_nonce = nonce
                     .checked_add(U256::ONE)
                     .ok_or_else(|| eyre!("executor nonce is exhausted"))?;
                 let gas_limit = plan
                     .post_hook_gas_limit()
                     .ok_or_else(|| eyre!("the swap's post-hook is unavailable"))?;
-                let shield_key = Zeroizing::new(derive_shield_private_key(&Zeroizing::new(
-                    signer.to_bytes().0,
-                ))?);
-                let shield = build_shield_request(
-                    recipient.master_public_key,
-                    &recipient.viewing_public_key,
-                    TokenData::erc20(plan.buy_token),
-                    U120::ZERO,
-                    &shield_key,
-                )?;
-                let calls = guarded_shield_calls(executor, plan.buy_token, buy_amount, shield)?;
                 let hash = post_hook_signing_hash(&calls, post_hook_nonce, chain_id, executor);
                 let calldata = signed_post_hook_calldata(
                     calls,
@@ -1271,7 +3014,7 @@ impl ExecutorOwner {
                 )?;
                 Some((post_hook_nonce, hash, calldata, gas_limit))
             }
-            SwapDelivery::External { .. } => None,
+            None => None,
         };
         let app_data = swap_app_data(
             profile.app_code(),
@@ -1292,7 +3035,7 @@ impl ExecutorOwner {
         let order = swap_order(
             plan.sell_token,
             plan.buy_token,
-            order_receiver(executor, plan.delivery),
+            receiver,
             review.sell_amount,
             buy_amount,
             valid_to,
@@ -1319,59 +3062,104 @@ impl ExecutorOwner {
             .await?;
         }
         self.ensure_active()?;
+        if let Some(destination) = destination {
+            destination.owner.ensure_active()?;
+        }
         let guard = self.lock_activity().await;
         self.require_record_unchanged(&record)?;
+        // An order on the included setup is admitted on the account read at the latest block
+        // again, under the lock the write holds. When a reorg removed the setup since the
+        // account was refreshed, nothing is written or sent.
+        let inclusion = if delegated.inclusion().is_some() {
+            let inclusion =
+                trace_step("order_included_setup", self.latest_setup_inclusion(&record))
+                    .await?
+                    .filter(|inclusion| inclusion.nonce() == nonce)
+                    .ok_or(SwapAccountRefusal::SetupUnconfirmed)?;
+            require_swap_account(
+                &record,
+                chain_id,
+                SwapAccountRole::Source,
+                account_use,
+                inclusion.evidence(),
+            )?;
+            Some(inclusion)
+        } else {
+            None
+        };
+        // The open order may have expired while the lock was awaited. A new order can't relax
+        // one that solvers no longer fill.
+        if let Some(speed_up) = plan.speed_up {
+            require_speed_up_window(&record, &profile, &speed_up, SystemTime::now(), inclusion)?;
+        }
         trace_step("order_persist", async {
-            self.store.record_swap_attempt(
-                operation,
-                SwapAttempt {
-                    terms: SwapTerms::new(
-                        plan.sell_token,
-                        plan.buy_token,
-                        SwapRecipient::new(
-                            recipient.master_public_key,
-                            recipient.viewing_public_key,
-                        ),
-                        delegated.setup_payload(),
-                    ),
-                    proof: SwapProof::new(proof_digest, input_identities.clone()),
-                    uid,
-                    submission: Some(SwapSubmission::new(signature, review.quote_id)),
-                    delivery: plan.delivery,
-                    bounds: SwapApprovedBounds {
-                        sell_amount: review.sell_amount,
-                        unshield_amount: Some(plan.amount()),
-                        unshield_fee_bps: review.unshield_fee_bps,
-                        buy_amount,
-                        private_minimum,
-                        shield_fee_bps: review.shield_fee_bps,
-                        slippage_bps: review.slippage_bps,
-                        pre_hook_gas_limit: plan.pre_hook_gas_limit(),
-                        post_hook_gas_limit: post_hook
-                            .as_ref()
-                            .map(|(_, _, _, gas_limit)| *gas_limit),
-                        hook_cost: Some(review.hook_cost()),
-                        anchors,
-                    },
-                    invalidates: plan.invalidates,
-                    pre_hook: IssuedExecutorPayload::new(
-                        nonce,
-                        delegated.delegate(),
-                        pre_hook_hash,
-                        ExecutorPayloadPurpose::SwapPreHook,
-                        ExecutorPayloadContext::new(pre_hook.clone(), observed, input_identities),
-                    ),
-                    post_hook: post_hook.map(|(post_hook_nonce, hash, calldata, _)| {
-                        IssuedExecutorPayload::new(
-                            post_hook_nonce,
-                            delegated.delegate(),
-                            hash,
-                            ExecutorPayloadPurpose::SwapPostHook,
-                            ExecutorPayloadContext::new(calldata, observed, Vec::new()),
-                        )
-                    }),
+            let attempt = SwapAttempt {
+                use_id: swap_use,
+                terms: SwapTerms::new(
+                    plan.sell_token,
+                    plan.buy_token,
+                    SwapRecipient::new(recipient.master_public_key, recipient.viewing_public_key),
+                    delegated.setup_payload(),
+                ),
+                proof: SwapProof::new(proof_digest, input_identities.clone()),
+                uid,
+                submission: Some(SwapSubmission::new(signature, review.quote_id)),
+                delivery: plan.delivery,
+                bounds: SwapApprovedBounds {
+                    sell_amount: review.sell_amount,
+                    unshield_amount: Some(plan.amount()),
+                    unshield_fee_bps: review.unshield_fee_bps,
+                    buy_amount,
+                    private_minimum,
+                    shield_fee_bps: review.shield_fee_bps,
+                    slippage_bps: review.slippage_bps,
+                    pre_hook_gas_limit: plan.pre_hook_gas_limit(),
+                    post_hook_gas_limit: post_hook.as_ref().map(|(_, _, _, gas_limit)| *gas_limit),
+                    hook_cost: Some(review.gas_estimate()),
+                    anchors,
+                    destination_minimum,
+                    gas_share_bps: Some(review.gas_share_bps),
+                    gas_estimate: Some(review.gas_estimate()),
+                    gas_allowance: Some(gas_allowance),
+                    gas_price_wei: Some(review.gas.gas_price_wei),
+                    valid_for_secs: Some(valid_for_secs),
+                    destination_shield_fee_bps: private_quote
+                        .map(|private| private.destination_shield_fee_bps),
+                    delivery_allowance: private_quote.map(|private| private.delivery_allowance),
+                    // The limits approved with the setup, when this swap's record has them.
+                    destination_setup_fee: private_quote
+                        .and_then(|_| record.swap_approval()?.bounds.destination_setup_fee),
+                    source_setup_fee: private_quote
+                        .and_then(|_| record.swap_approval()?.bounds.source_setup_fee),
                 },
-            )
+                invalidates: plan.invalidates,
+                pre_hook: IssuedExecutorPayload::new(
+                    nonce,
+                    delegated.delegate(),
+                    pre_hook_hash,
+                    ExecutorPayloadPurpose::SwapPreHook,
+                    ExecutorPayloadContext::new(pre_hook.clone(), observed, input_identities),
+                ),
+                post_hook: post_hook.map(|(post_hook_nonce, hash, calldata, _)| {
+                    IssuedExecutorPayload::new(
+                        post_hook_nonce,
+                        delegated.delegate(),
+                        hash,
+                        ExecutorPayloadPurpose::SwapPostHook,
+                        ExecutorPayloadContext::new(calldata, observed, Vec::new()),
+                    )
+                }),
+                bridge: bridge_terms,
+                speed_up: plan.speed_up.map(|speed_up| speed_up.order),
+            };
+            match inclusion {
+                Some(inclusion) => self.store.record_swap_attempt_on_included_setup(
+                    operation,
+                    attempt,
+                    inclusion.nonce(),
+                ),
+                None => self.store.record_swap_attempt(operation, attempt),
+            }
         })
         .await?;
         self.notify_change();
@@ -1405,6 +3193,133 @@ impl ExecutorOwner {
         swap_submission_outcome(submitted, uid, app_data.document.len(), plan.byte_budget)
     }
 
+    /// Sign and persist the guarded shield of this chain's destination stealth account for a
+    /// private Bridge order, at the nonce `delegated` was confirmed with: revert unless the
+    /// account holds `amount` of `token`, the deposit's signed output amount, then shield its
+    /// full balance to the wallet. The guard makes a submission before the fill revert without
+    /// consuming the nonce. The payload is in the account's record when its calldata is
+    /// returned. A retry signs again at the same nonce for its own amount, and both stay
+    /// recorded. The shield is signed for the swap use `swap_use`, which must claim the account
+    /// as its destination for `token`, also when the payload is written.
+    ///
+    /// An account the use reuses is judged again before each shield, the first and every
+    /// retry's: the shared admission rules on its reconciled record, a zero balance of `token`
+    /// read now, and, in the write's own critical section, the POI verdicts of its earlier
+    /// shields from `notes`. A verdict that changed since admission issues nothing.
+    pub(crate) async fn issue_swap_destination_shield(
+        &self,
+        delegated: DelegatedSwapExecutor,
+        swap_use: SwapUseId,
+        token: Address,
+        amount: U256,
+        authorization: &DesktopPrivateSpendAuthorization,
+        notes: Option<&dyn SwapShieldNotes>,
+    ) -> Result<Bytes> {
+        self.ensure_active()?;
+        let (operation, executor) = (delegated.operation(), delegated.executor());
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?;
+        // Like the swap's own hooks, the shield is issued against the latest reconciled
+        // observation, which the write below requires to be unchanged, at the nonce the
+        // delegation was confirmed with.
+        let observed = record
+            .nonce_observation()
+            .filter(|observed| observed.nonce() == delegated.observed().nonce())
+            .ok_or_else(|| {
+                eyre!("the destination stealth account's nonce changed; plan the swap again")
+            })?;
+        let receives_token = record.swap_use(swap_use).is_some_and(|claimed| {
+            matches!(
+                claimed.role(),
+                SwapUseRole::Destination { destination_token, .. }
+                    | SwapUseRole::PublicSourceDestination { destination_token, .. }
+                    if *destination_token == token
+            )
+        });
+        if record.address() != Some(executor)
+            || record.delegate() != delegated.delegate()
+            || !is_live_swap_use(&record, swap_use)
+            || !receives_token
+        {
+            return Err(eyre!(
+                "the destination stealth account changed; plan the swap again"
+            ));
+        }
+        let reused = record
+            .swap_use(swap_use)
+            .is_some_and(|claimed| !claimed.is_fresh());
+        if reused {
+            require_swap_account(
+                &record,
+                self.chain.chain_id,
+                SwapAccountRole::Destination { token },
+                SwapAccountUse::Claimed(swap_use),
+                SwapAdmissionEvidence::Fresh,
+            )?;
+            self.require_empty_receiving_balance(executor, delegated.delegate(), token)
+                .await?;
+        }
+        let signer = self.authorized_executor_signer(
+            authorization,
+            &HardwareExecutorAction::Execute(operation),
+            operation,
+            record.index(),
+        )?;
+        if signer.address() != executor {
+            return Err(eyre!(
+                "executor signing identity does not match the destination stealth account"
+            ));
+        }
+        let (nonce, chain_id) = (observed.nonce(), self.chain.chain_id);
+        let calls =
+            guarded_shield_calls(executor, token, amount, self.wallet_shield(&signer, token)?)?;
+        let hash = post_hook_signing_hash(&calls, nonce, chain_id, executor);
+        let calldata = signed_post_hook_calldata(
+            calls,
+            nonce,
+            chain_id,
+            executor,
+            &signer.sign_hash_sync(&hash)?,
+        )?;
+        drop(signer);
+        let guard = self.lock_activity().await;
+        self.require_record_unchanged(&record)?;
+        if reused {
+            admission::require_earlier_shields_resolved(&record, swap_use, notes)?;
+        }
+        self.store.record_swap_destination_shield(
+            operation,
+            swap_use,
+            IssuedExecutorPayload::new(
+                nonce,
+                delegated.delegate(),
+                hash,
+                ExecutorPayloadPurpose::SwapDestinationShield,
+                ExecutorPayloadContext::new(calldata.clone(), observed, Vec::new()),
+            ),
+        )?;
+        self.notify_change();
+        drop(guard);
+        Ok(calldata)
+    }
+
+    /// A shield of an executor's full `token` balance to the wallet's own address on this
+    /// chain, keyed from that executor's `signer` like executor recovery's shields.
+    fn wallet_shield(&self, signer: &PrivateKeySigner, token: Address) -> Result<ShieldRequest> {
+        let recipient = self.view.scan_keys().address_data();
+        let shield_key = Zeroizing::new(derive_shield_private_key(&Zeroizing::new(
+            signer.to_bytes().0,
+        ))?);
+        Ok(build_shield_request(
+            recipient.master_public_key,
+            &recipient.viewing_public_key,
+            TokenData::erc20(token),
+            U120::ZERO,
+            &shield_key,
+        )?)
+    }
+
     /// Resend the original signed order without signing or authorizing new terms.
     /// Use this swap's isolated client, retained by the view or created after restart.
     pub async fn resubmit_swap_order(
@@ -1433,7 +3348,7 @@ impl ExecutorOwner {
             ));
         }
         if !matches!(
-            super::observation::swap_order_state(saved),
+            super::observation::swap_order_state(swap, saved),
             super::observation::SwapOrderState::Open
                 | super::observation::SwapOrderState::PreHookOnly { expired: false }
         ) {
@@ -1479,7 +3394,7 @@ impl ExecutorOwner {
         let order = swap_order(
             swap.order_terms(saved).sell_token(),
             swap.order_terms(saved).buy_token(),
-            order_receiver(executor, saved.delivery()),
+            order_receiver(executor, saved.delivery(), saved.bridge())?,
             bounds.sell_amount,
             bounds.buy_amount,
             saved.valid_to(),
@@ -1589,18 +3504,7 @@ impl ExecutorOwner {
         uid: OrderUid,
         result: &Result<OrderUid, CowApiError>,
     ) -> Result<()> {
-        let status = match result {
-            Ok(assigned) if *assigned == uid => SwapSubmissionStatus::Accepted,
-            Err(CowApiError::DuplicatedOrder) => SwapSubmissionStatus::Accepted,
-            Err(
-                CowApiError::AppDataTooLarge
-                | CowApiError::SellAmountDoesNotCoverFee
-                | CowApiError::NoLiquidity
-                | CowApiError::UnsupportedToken
-                | CowApiError::Rejected { .. },
-            ) => SwapSubmissionStatus::Rejected,
-            _ => SwapSubmissionStatus::Pending,
-        };
+        let status = swap_submission_status(result, uid);
         self.ensure_active()?;
         self.store.record_swap_submission(operation, uid, status)?;
         self.notify_change();
@@ -1642,7 +3546,82 @@ impl ExecutorOwner {
     /// POI-spendable notes, without other operations' reservations or notes this swap's
     /// executor already spent.
     fn swap_inputs(&self, session: &WalletSession, record: &ExecutorRecord) -> Result<Vec<Utxo>> {
-        self.inputs_for_record(self.spendable_swap_notes(session)?, record)
+        self.inputs_for_swap_order(self.spendable_swap_notes(session)?, record)
+    }
+
+    /// Notes of `inputs` an order of `record`'s swap may spend: [`Self::inputs_for_record`]
+    /// without a note of a setup whose nonce is unresolved. Any setup attempt at that nonce can
+    /// still run before the pre-hook, as it does below an order on an included setup, and
+    /// spend the note as its fee.
+    pub(crate) fn inputs_for_swap_order(
+        &self,
+        inputs: Vec<Utxo>,
+        record: &ExecutorRecord,
+    ) -> Result<Vec<Utxo>> {
+        let mut inputs = self.inputs_for_record(inputs, record)?;
+        inputs.retain(|input| {
+            !record.issued().iter().any(|payload| {
+                payload.purpose() == ExecutorPayloadPurpose::Operation
+                    && !record.nonce_resolved(payload.nonce())
+                    && payload
+                        .context()
+                        .inputs()
+                        .iter()
+                        .any(|spent| spent.matches(input))
+            })
+        });
+        Ok(inputs)
+    }
+
+    /// Notes a setup of the swap `operation`, or of a new swap, may pay its fee with: as for
+    /// any setup preparation, without the notes the account's open pre-hooks reserve, since a
+    /// setup sent again runs before a pre-hook on its included setup. The fee preview selects
+    /// as signing does.
+    pub(super) fn swap_setup_fee_inputs(
+        &self,
+        session: &WalletSession,
+        operation: Option<ExecutorOperationId>,
+    ) -> Result<Vec<Utxo>> {
+        let notes = self.spendable_swap_notes(session)?;
+        match operation {
+            Some(operation) => {
+                let record = self
+                    .swap_account_record(operation)?
+                    .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+                self.inputs_for_recovery(notes, &record)
+            }
+            None => self.filter_reserved_inputs(notes, None),
+        }
+    }
+
+    /// Whether the automatic attempt to place the approved order of the swap `operation`,
+    /// spending `spend` of `token`, should quote now. One current snapshot of the wallet's
+    /// notes answers both questions. The spend fits when it fits the notes planning would
+    /// select, as [`Self::max_swap_amount`] counts them. When it doesn't, the attempt waits
+    /// while the swap's own setup can still change that: its nonce isn't settled, or a
+    /// `token` note created in a transaction recorded for one of its setups is unspent with a
+    /// POI state that [`crate::UtxoPpoiState::retry_eligible`] accepts. A setup without a
+    /// recorded transaction waits only for settlement. Otherwise the attempt runs and reports
+    /// any shortfall. Planning stays authoritative for every other limit.
+    pub fn swap_placement_readiness(
+        &self,
+        session: &WalletSession,
+        operation: ExecutorOperationId,
+        token: Address,
+        spend: U256,
+    ) -> Result<SwapPlacementReadiness> {
+        self.require_swap_session(session)?;
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
+        let notes = self.swap_note_snapshot(session)?;
+        let spendable = self.inputs_for_swap_order(notes.spendable, &record)?;
+        Ok(placement_readiness(
+            &record,
+            crate::max_unshield_spendable(&spendable, token) >= spend,
+            &notes.unspent,
+            token,
+        ))
     }
 
     /// Largest batched sell amount currently available to this swap. The same POI,
@@ -1658,7 +3637,7 @@ impl ExecutorOwner {
         Ok(crate::max_unshield_spendable(&inputs, token))
     }
 
-    pub(super) fn spendable_swap_inputs(
+    fn spendable_swap_inputs(
         &self,
         session: &WalletSession,
         operation: Option<ExecutorOperationId>,
@@ -1674,8 +3653,14 @@ impl ExecutorOwner {
         }
     }
 
-    #[cfg_attr(not(feature = "test-support"), allow(clippy::unused_self))]
     fn spendable_swap_notes(&self, session: &WalletSession) -> Result<Vec<Utxo>> {
+        Ok(self.swap_note_snapshot(session)?.spendable)
+    }
+
+    /// The wallet's notes from one current snapshot: the POI-spendable ones planning starts
+    /// from, and every unspent one with its POI state.
+    #[cfg_attr(not(feature = "test-support"), allow(clippy::unused_self))]
+    fn swap_note_snapshot(&self, session: &WalletSession) -> Result<SwapNoteSnapshot> {
         #[cfg(feature = "test-support")]
         {
             let notes = self
@@ -1683,17 +3668,38 @@ impl ExecutorOwner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !notes.is_empty() {
-                return Ok(notes.clone());
+                return Ok(SwapNoteSnapshot {
+                    spendable: notes
+                        .iter()
+                        .filter(|(_, state)| *state == crate::UtxoPpoiState::Valid)
+                        .map(|(note, _)| note.clone())
+                        .collect(),
+                    unspent: notes.clone(),
+                });
             }
         }
         let snapshot = session
             .handle
             .current_snapshot()
             .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
-        Ok(crate::poi_verified_unspent_utxos_from_records(
-            &snapshot.utxos,
-            &snapshot.pending_overlay,
-        ))
+        let lists = crate::default_active_poi_list_keys();
+        Ok(SwapNoteSnapshot {
+            spendable: crate::poi_verified_unspent_utxos_from_records(
+                &snapshot.utxos,
+                &snapshot.pending_overlay,
+            ),
+            unspent: snapshot
+                .utxos
+                .iter()
+                .filter(|entry| !entry.is_spent())
+                .map(|entry| {
+                    (
+                        entry.utxo.clone(),
+                        crate::utxos::utxo_ppoi_state(&entry.utxo.poi, &lists),
+                    )
+                })
+                .collect(),
+        })
     }
 
     /// Plan swaps from one spendable note holding `amount` of `token` instead of the session's
@@ -1701,21 +3707,36 @@ impl ExecutorOwner {
     /// sessions never sync.
     #[cfg(feature = "test-support")]
     pub fn plan_swaps_from_note_for_tests(&self, token: Address, amount: U256) {
-        let note = Utxo::new(
-            railgun_wallet::Note::new_change(U256::ONE, token, amount, [7; 16]),
-            0,
-            0,
-            railgun_wallet::UtxoSource {
-                tx_hash: B256::repeat_byte(6),
-                block_number: 1,
-                block_timestamp: 1,
-            },
-            railgun_wallet::UtxoCommitmentKind::Transact,
-        );
+        self.swap_notes_for_tests(&[(
+            token,
+            amount,
+            B256::repeat_byte(6),
+            crate::UtxoPpoiState::Valid,
+        )]);
+    }
+
+    /// Hold `notes` in place of the session's, each one of `token` holding `amount`, created
+    /// in the transaction `source` and in the POI state given. Only Valid notes are spendable.
+    /// UI tests use it, since their sessions never sync.
+    #[cfg(feature = "test-support")]
+    pub fn swap_notes_for_tests(&self, notes: &[(Address, U256, B256, crate::UtxoPpoiState)]) {
         *self
             .swap_notes_for_tests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![note];
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = test_swap_notes(notes);
+    }
+
+    /// The identity of each of `notes` as [`Self::swap_notes_for_tests`] holds them, which a
+    /// payload that spends one records.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn swap_note_identities_for_tests(
+        notes: &[(Address, U256, B256, crate::UtxoPpoiState)],
+    ) -> Vec<ExecutorInputIdentity> {
+        test_swap_notes(notes)
+            .iter()
+            .map(|(note, _)| ExecutorInputIdentity::from_utxo(note))
+            .collect()
     }
 
     fn require_swap_session(&self, session: &WalletSession) -> Result<()> {
@@ -1736,58 +3757,160 @@ impl ExecutorOwner {
     }
 }
 
+/// UI tests' stand-ins for the wallet's notes: one of `token` holding `amount` for each of
+/// `notes`, created in the transaction `source`, at its own position, in the POI state given.
+#[cfg(feature = "test-support")]
+fn test_swap_notes(
+    notes: &[(Address, U256, B256, crate::UtxoPpoiState)],
+) -> Vec<(Utxo, crate::UtxoPpoiState)> {
+    notes
+        .iter()
+        .zip(0_u64..)
+        .map(|(&(token, amount, source, state), position)| {
+            let note = Utxo::new(
+                railgun_wallet::Note::new_change(U256::ONE, token, amount, [7; 16]),
+                0,
+                position,
+                railgun_wallet::UtxoSource {
+                    tx_hash: source,
+                    block_number: 1,
+                    block_timestamp: 1,
+                },
+                railgun_wallet::UtxoCommitmentKind::Transact,
+            );
+            (note, state)
+        })
+        .collect()
+}
+
+/// The wallet's notes from one current snapshot, for a swap.
+struct SwapNoteSnapshot {
+    /// The POI-spendable notes, before any record's reservations.
+    spendable: Vec<Utxo>,
+    /// Every unspent note, with its POI state.
+    unspent: Vec<(Utxo, crate::UtxoPpoiState)>,
+}
+
+/// Whether the automatic attempt to place a swap's approved order quotes now: see
+/// [`ExecutorOwner::swap_placement_readiness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapPlacementReadiness {
+    /// Quote now. The spend fits, or nothing the swap's setup can still change would make it
+    /// fit, and the attempt reports the shortfall.
+    Place,
+    /// The spend doesn't fit yet, and the swap's own setup's change can still make it fit.
+    WaitForSetupChange,
+}
+
+/// [`ExecutorOwner::swap_placement_readiness`] for `record`, whose approved spend of `token`
+/// `fits` the notes planning would select, with `unspent` the wallet's unspent notes. Only the
+/// setups of the use that reserved the account fresh are waited for: a reused account's
+/// earlier setup has nothing left to return.
+fn placement_readiness(
+    record: &ExecutorRecord,
+    fits: bool,
+    unspent: &[(Utxo, crate::UtxoPpoiState)],
+    token: Address,
+) -> SwapPlacementReadiness {
+    let fresh = match record.active_swap_use() {
+        Some(id) => record.swap_use(id).is_some_and(SwapUseRecord::is_fresh),
+        None => record.swap_uses().is_empty(),
+    };
+    if fits || !fresh {
+        return SwapPlacementReadiness::Place;
+    }
+    let setups = || {
+        record
+            .issued()
+            .iter()
+            .filter(|payload| payload.purpose() == ExecutorPayloadPurpose::Operation)
+    };
+    let Some(nonce) = setups().map(IssuedExecutorPayload::nonce).max() else {
+        return SwapPlacementReadiness::Place;
+    };
+    if !record.nonce_settled(nonce) {
+        return SwapPlacementReadiness::WaitForSetupChange;
+    }
+    let transactions = setups()
+        .flat_map(|payload| payload.transaction_hashes().iter().copied())
+        .collect::<std::collections::HashSet<_>>();
+    let token = U256::from_be_slice(token.as_slice());
+    let change_pending = unspent.iter().any(|(note, state)| {
+        note.note.token_hash == token
+            && transactions.contains(&note.source.tx_hash)
+            && state.retry_eligible()
+    });
+    if change_pending {
+        SwapPlacementReadiness::WaitForSetupChange
+    } else {
+        SwapPlacementReadiness::Place
+    }
+}
+
 impl ExecutorOwner {
     /// Quote an account whose setup is recorded, without waiting for chain observation.
     /// Reuse permits another token pair; execution preparation checks the account afresh.
+    ///
+    /// Without reuse, `inclusion` is the session's last read at the latest block that showed
+    /// the swap's own setup included. It stands in for the recorded setup while the record
+    /// leaves that setup unresolved at its confirmed nonce, and the hint is then the next nonce.
     pub fn swap_order_preview(
         &self,
         operation: ExecutorOperationId,
         reuse: bool,
+        inclusion: Option<SwapSetupInclusion>,
     ) -> Result<SwapExecutor> {
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
-        if reuse {
-            swap_account_candidate(&record, self.chain.chain_id)
-                .ok_or_else(|| eyre!("this account is unavailable for another swap"))?;
-        } else {
-            swap_attempt_refusal(&record, || record.has_recorded_unresolved_issued_work())
-                .map_or(Ok(()), |refusal| Err(eyre!(refusal)))?;
-            if !super::is_swap_record(&record)
+        require_swap_account(
+            &record,
+            self.chain.chain_id,
+            SwapAccountRole::Source,
+            previewed_swap_use(&record, reuse),
+            SwapAdmissionEvidence::Recorded,
+        )?;
+        let observed = record
+            .nonce_observation()
+            .map_or(U256::ZERO, ExecutorNonceObservation::nonce);
+        // The order on an included setup takes the nonce after the setup's.
+        let included = inclusion
+            .filter(|inclusion| {
+                !reuse
+                    && super::own_pending_setup(&record) == Some(observed)
+                    && observed.checked_add(U256::ONE) == Some(inclusion.nonce())
+            })
+            .map(|inclusion| inclusion.nonce());
+        if !reuse
+            && included.is_none()
+            && (!super::is_swap_record(&record)
                 || !record.issued().iter().any(|payload| {
                     payload.purpose() == ExecutorPayloadPurpose::Operation
-                        && record.recorded_payload_status(payload.hash())
-                            == Some(ExecutorPayloadStatus::Executed)
-                })
-            {
-                return Err(eyre!("this swap's setup is not confirmed"));
-            }
+                        && record.nonce_resolved(payload.nonce())
+                }))
+        {
+            return Err(eyre!("this swap's setup is not confirmed"));
         }
         self.swap_order_profile()?;
-        ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
-            .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
-        Ok(SwapExecutor {
-            operation: Some(operation),
-            executor: record
-                .address()
-                .ok_or_else(|| eyre!("stealth account is unavailable"))?,
-            delegate: record.delegate(),
-            // The nonce is a fixed ABI word and does not affect the quote's gas or byte
-            // estimate. Preparation replaces this hint before proving or signing.
-            expected_pre_hook_nonce: record
-                .nonce_observation()
-                .map_or(U256::ZERO, ExecutorNonceObservation::nonce),
-            setup: SwapExecutorSetup::Recorded,
-            reused: reuse,
-        })
+        // The nonce is a fixed ABI word and does not affect the quote's gas or byte estimate.
+        // Preparation replaces this hint before proving or signing.
+        recorded_swap_executor(
+            &record,
+            self.chain.chain_id,
+            included.unwrap_or(observed),
+            reuse,
+        )
     }
 
     /// Refresh mutable account state before proving. The executor nonce is not a priced
     /// term, but an additional order invalidation changes the hook estimate and needs review.
+    /// A speed-up keeps the use, open order and pre-hook nonce it was reviewed for, and is
+    /// refused when the refreshed account no longer matches them.
     pub(crate) async fn refresh_swap_executor(
         &self,
         review: &mut SwapReview,
         confirmed: u64,
+        swap_use: SwapAccountUse,
     ) -> Result<Option<SwapReviewChange>> {
         let plan = &review.plan;
         if plan.executor.requires_setup() {
@@ -1798,14 +3921,35 @@ impl ExecutorOwner {
         let operation = plan
             .operation()
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        let mut executor = self.reuse_swap_account(operation, confirmed).await?;
+        let mut executor = self
+            .reuse_swap_account(operation, confirmed, SwapAccountRole::Source, swap_use)
+            .await?;
         if executor.executor() != plan.executor() || executor.delegate() != plan.context.delegate {
             return Err(eyre!("the swap executor changed; plan the swap again"));
         }
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        if swap_invalidation(&record, &self.swap_order_profile()?, SystemTime::now())?
+        let profile = self.swap_order_profile()?;
+        if let SwapAccountUse::SpeedUp(speed_up) = swap_use {
+            // The refreshed nonce is not adopted: at any other nonce the order would be a
+            // retry, which was not what the user reviewed.
+            if executor.expected_pre_hook_nonce() != speed_up.pre_hook_nonce {
+                return Err(eyre!(SPEED_UP_NONCE_CHANGED));
+            }
+            require_speed_up_window(
+                &record,
+                &profile,
+                &speed_up,
+                SystemTime::now(),
+                executor
+                    .delegated()
+                    .and_then(|delegated| delegated.inclusion()),
+            )?;
+            if plan.invalidates != Some(speed_up.order) {
+                return Err(eyre!(SPEED_UP_TERMS_CHANGED));
+            }
+        } else if swap_invalidation(&record, &profile, SystemTime::now())?
             .is_some_and(|live| plan.invalidates != Some(live))
         {
             return Ok(Some(SwapReviewChange::HookCost));
@@ -1820,65 +3964,131 @@ impl ExecutorOwner {
         Ok(None)
     }
 
-    /// Check the selected account and its prior orders before preparing execution.
-    /// This does not sign, reserve inputs, or restart a stopped setup.
+    /// Admit the selected account for `swap_use` in `role` before preparing execution, and
+    /// return it with its confirmed delegation. Source and destination accounts both come
+    /// through here. Recorded evidence first refuses what no observation changes. An account
+    /// whose earlier work is settled at `confirmed` then has only its delegation and nonce
+    /// refreshed, without historical block or receipt requests; any other is reconciled.
+    /// Either way the fresh record is judged under the activity lock, unchanged since it was
+    /// read. A destination's receiving-token balance and earlier shields are checked by its
+    /// caller. This does not sign, reserve inputs, or restart a stopped setup.
+    ///
+    /// The swap's own source account, while its record leaves the setup its use paid for
+    /// unresolved, is admitted on a read at the latest block that shows the setup included.
+    /// The executor then carries that read and the nonce after the setup's.
     pub async fn reuse_swap_account(
         &self,
         operation: ExecutorOperationId,
         confirmed: u64,
+        role: SwapAccountRole,
+        swap_use: SwapAccountUse,
     ) -> Result<SwapExecutor> {
+        let chain_id = self.chain.chain_id;
         let record = self
             .swap_account_record(operation)?
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
+        if let Some(refusal) = swap_account_refusal(
+            &record,
+            chain_id,
+            role,
+            swap_use,
+            SwapAdmissionEvidence::Recorded,
+        )
+        .filter(|refusal| !refusal.awaits_observation())
+        {
+            return Err(refusal.into());
+        }
         if record.settled_swaps_at(confirmed) {
-            require_swap_attempt_admitted(&record)?;
-            let mut executor =
-                trace_step("reuse_finalized", self.refresh_settled_swap(&record)).await?;
+            let mut executor = trace_step(
+                "reuse_finalized",
+                self.refresh_settled_swap(&record, role, swap_use),
+            )
+            .await?;
             executor.reused = true;
             return Ok(executor);
         }
-        let range = confirmed..confirmed.saturating_add(1);
         let report = if record.swap().is_some() {
+            let range = confirmed..confirmed.saturating_add(1);
             trace_step("reuse_orders", self.observe_swap(operation, range)).await?
         } else {
-            trace_step("reuse_history", self.reconcile_history(operation, range)).await?
+            trace_step("reuse_account", self.reconcile_account(operation)).await?
         };
-        let super::SwapSetupStatus::Delegated(delegated) =
-            trace_step("reuse_setup", self.check_swap_setup(&report)).await?
-        else {
-            return Err(eyre!(
-                "this account's setup is not confirmed; finish or retry its setup first"
-            ));
+        let delegated = match trace_step("reuse_setup", self.check_swap_setup(&report)).await? {
+            super::SwapSetupStatus::Delegated(delegated) => Some(delegated),
+            // The swap's own setup can be included before the record resolves it.
+            super::SwapSetupStatus::Pending => {
+                trace_step(
+                    "reuse_included_setup",
+                    self.included_swap_setup(report.record(), role, swap_use),
+                )
+                .await?
+            }
+            super::SwapSetupStatus::MissingDelegation => None,
+        };
+        let Some(delegated) = delegated else {
+            return Err(SwapAccountRefusal::SetupUnconfirmed.into());
         };
         let record = report.record();
         let _guard = self.lock_activity().await;
         self.require_record_unchanged(record)?;
-        require_swap_attempt_admitted(record)?;
-        if record.swap().is_none() && record.has_unresolved_issued_work() {
-            return Err(eyre!(UNFINISHED_WORK));
-        }
+        require_swap_account(record, chain_id, role, swap_use, delegated.evidence())?;
         let mut executor = SwapExecutor::from(delegated);
         executor.reused = true;
         Ok(executor)
     }
 
-    /// Set-up stealth accounts the swap form can offer for another swap, hidden ones included.
-    /// This reads local records only: a setup recorded as executed for an accepted delegate,
-    /// and the local rules of [`Self::reuse_swap_account`] judged from recorded outcomes.
-    /// Execution preparation observes and checks the chosen account with
+    /// Set-up stealth accounts the swap form can offer to place another swap, hidden ones
+    /// included, whichever role they had before. This reads local records only: the shared
+    /// admission rules judged from recorded outcomes, without a network request. Being listed
+    /// authorizes nothing: execution preparation observes and checks the chosen account with
     /// [`Self::reuse_swap_account`].
     pub fn swap_account_candidates(&self) -> Result<Vec<SwapAccountCandidate>> {
         self.swap_order_profile()?;
+        self.swap_role_candidates(SwapAccountRole::Source)
+    }
+
+    /// Set-up stealth accounts on this chain the swap form can offer as the destination of a
+    /// private Bridge swap that delivers `token`, hidden ones included. Like
+    /// [`Self::swap_account_candidates`] this reads local records only. The account's balance
+    /// of `token` and its earlier shields' POI verdicts are not judged here: preparation
+    /// checks them, and can still refuse a listed account.
+    pub fn swap_destination_candidates(&self, token: Address) -> Result<Vec<SwapAccountCandidate>> {
+        self.swap_destination_profile()?;
+        self.swap_role_candidates(SwapAccountRole::Destination { token })
+    }
+
+    fn swap_role_candidates(&self, role: SwapAccountRole) -> Result<Vec<SwapAccountCandidate>> {
         let chain_id = self.chain.chain_id;
         Ok(self
             .records()?
             .iter()
-            .filter_map(|record| swap_account_candidate(record, chain_id))
+            .filter_map(|record| swap_account_candidate(record, chain_id, role))
             .collect())
+    }
+
+    /// Why the account `operation` can't take another swap in `role`, from its recorded
+    /// outcomes and without a network request. `None` is provisional: it offers the account,
+    /// and preparation still checks its current state, and for a destination its
+    /// receiving-token balance and earlier shields.
+    pub fn swap_account_refusal(
+        &self,
+        operation: ExecutorOperationId,
+        role: SwapAccountRole,
+    ) -> Result<Option<SwapAccountRefusal>> {
+        let record = self
+            .swap_account_record(operation)?
+            .ok_or_else(|| eyre!("stealth account is unavailable"))?;
+        Ok(swap_account_refusal(
+            &record,
+            self.chain.chain_id,
+            role,
+            SwapAccountUse::New,
+            SwapAdmissionEvidence::Recorded,
+        ))
     }
 }
 
-/// A stealth account whose setup is done and that may place another swap.
+/// A stealth account whose setup is done and that may take another swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwapAccountCandidate {
     operation: ExecutorOperationId,
@@ -1912,19 +4122,20 @@ impl SwapAccountCandidate {
     }
 }
 
-fn swap_account_candidate(record: &ExecutorRecord, chain_id: u64) -> Option<SwapAccountCandidate> {
+fn swap_account_candidate(
+    record: &ExecutorRecord,
+    chain_id: u64,
+    role: SwapAccountRole,
+) -> Option<SwapAccountCandidate> {
     let address = record.address()?;
-    let set_up = ExecutorProfile::accepted(chain_id, record.delegate()).is_some()
-        && record.issued().iter().any(|payload| {
-            payload.purpose() == ExecutorPayloadPurpose::Operation
-                && record.recorded_payload_status(payload.hash())
-                    == Some(ExecutorPayloadStatus::Executed)
-        });
-    let unresolved = || record.has_recorded_unresolved_issued_work();
-    // An approved order still awaiting placement belongs to its own swap.
-    if !set_up
-        || swap_attempt_refusal(record, unresolved).is_some()
-        || record.swap().is_none() && (unresolved() || record.swap_approval().is_some())
+    if swap_account_refusal(
+        record,
+        chain_id,
+        role,
+        SwapAccountUse::New,
+        SwapAdmissionEvidence::Recorded,
+    )
+    .is_some()
     {
         return None;
     }
@@ -1940,42 +4151,274 @@ fn swap_account_candidate(record: &ExecutorRecord, chain_id: u64) -> Option<Swap
 }
 
 /// Hooks are signed only for a plan made for the confirmed delegation, at the nonce that
-/// delegation was observed with. A recorded preview must be refreshed before proving.
+/// delegation was observed with, or for the swap's own included setup, at the nonce after the
+/// setup's. A recorded preview must be refreshed before proving.
 fn require_delegated_plan(plan: &SwapInputPlan) -> Result<DelegatedSwapExecutor> {
     plan.executor.delegated().ok_or_else(|| {
         eyre!("the swap's stealth account isn't confirmed as set up; plan the swap again")
     })
 }
 
-/// A retry is refused while an earlier attempt's pre-hook can still run, including after it
-/// executed without a trade: that order can still fill until `validTo`.
-fn require_swap_attempt_admitted(record: &ExecutorRecord) -> Result<()> {
-    swap_attempt_refusal(record, || record.has_unresolved_issued_work())
-        .map_or(Ok(()), |refusal| Err(eyre!(refusal)))
+/// An order is signed only for the swap use that claims its account and was not stopped.
+fn require_swap_use(record: &ExecutorRecord, swap_use: SwapUseId) -> Result<()> {
+    if is_live_swap_use(record, swap_use) {
+        return Ok(());
+    }
+    if record
+        .swap_use(swap_use)
+        .is_some_and(SwapUseRecord::is_stopped)
+    {
+        return Err(eyre!("this swap was stopped"));
+    }
+    Err(ExecutorStoreError::SwapUseActive.into())
 }
 
-const UNFINISHED_WORK: &str =
-    "this account still has unfinished work; resolve it before starting a swap";
-
-/// Why `record` can't place a swap, from local state. `unresolved_work` reports signed work
-/// that isn't settled, which blocks an account that doesn't belong to a swap.
-fn swap_attempt_refusal(
+/// A retry keeps the tokens and delivery of its swap use's earlier attempts, whatever form
+/// the request came from. The store checks the same before it records the order.
+fn require_swap_use_terms(
     record: &ExecutorRecord,
-    unresolved_work: impl FnOnce() -> bool,
-) -> Option<&'static str> {
-    if record.is_retired() && record.swap().is_none()
-        || record.is_swap_setup_stopped()
-        || record.public_account_uuid().is_some()
+    swap_use: SwapUseId,
+    plan: &SwapInputPlan,
+) -> Result<()> {
+    if record.swap_use_keeps_terms(swap_use, plan.sell_token, plan.buy_token, plan.delivery) {
+        return Ok(());
+    }
+    Err(ExecutorStoreError::SwapUseTermsChanged.into())
+}
+
+/// The use a quote preview or plan judges `record`'s account for. Neither carries a use
+/// identity. A swap's own account is judged for the use that claims it. An account the user
+/// picked for reuse is judged for a new use, unless an explicit reuse already claimed it and
+/// has placed no order: resuming that draft previews the account it claimed. Signing names
+/// its use and refuses any other swap's claim.
+fn previewed_swap_use(record: &ExecutorRecord, reused: bool) -> SwapAccountUse {
+    let active = record.active_swap_use();
+    if !reused {
+        return SwapAccountUse::Claimed(
+            active.unwrap_or_else(|| SwapUseId::first(record.operation())),
+        );
+    }
+    active
+        .filter(|id| {
+            record.swap_use(*id).is_some_and(|claimed| {
+                !claimed.is_fresh()
+                    && !claimed.is_stopped()
+                    && matches!(claimed.role(), SwapUseRole::Source { .. })
+            }) && !record.has_swap_use_order(*id)
+        })
+        .map_or(SwapAccountUse::New, SwapAccountUse::Claimed)
+}
+
+/// The account of `record` as a recorded preview, which can be quoted but not signed for, with
+/// the nonce hint `expected_pre_hook_nonce`.
+fn recorded_swap_executor(
+    record: &ExecutorRecord,
+    chain_id: u64,
+    expected_pre_hook_nonce: U256,
+    reused: bool,
+) -> Result<SwapExecutor> {
+    ExecutorProfile::accepted(chain_id, record.delegate())
+        .ok_or_else(|| eyre!("this swap executor's delegate is not supported"))?;
+    Ok(SwapExecutor {
+        operation: Some(record.operation()),
+        executor: record
+            .address()
+            .ok_or_else(|| eyre!("stealth account is unavailable"))?,
+        delegate: record.delegate(),
+        expected_pre_hook_nonce,
+        setup: SwapExecutorSetup::Recorded,
+        reused,
+    })
+}
+
+/// The use an order of `plan` is admitted for. A speed-up is admitted only for the use it
+/// was reviewed for, and never as that use's retry.
+fn order_account_use(plan: &SwapInputPlan, swap_use: SwapUseId) -> Result<SwapAccountUse> {
+    match plan.speed_up {
+        None => Ok(SwapAccountUse::Claimed(swap_use)),
+        Some(speed_up) if speed_up.swap_use == swap_use => Ok(SwapAccountUse::SpeedUp(speed_up)),
+        Some(_) => Err(eyre!(
+            "this speed-up was reviewed for another swap; review it again"
+        )),
+    }
+}
+
+/// The order `order` of `record` and what a speed-up of it binds: its use, its UID and its
+/// pre-hook nonce. `None` when the record holds no such order of a swap use.
+fn swap_speed_up_binding(
+    record: &ExecutorRecord,
+    order: OrderUid,
+) -> Option<(&SwapOrderRecord, SwapSpeedUp)> {
+    let open = record
+        .swap()?
+        .orders()
+        .iter()
+        .find(|open| open.uid() == order)?;
+    let speed_up = SwapSpeedUp {
+        swap_use: open.use_id()?,
+        order,
+        pre_hook_nonce: open.pre_hook().nonce(),
+    };
+    Some((open, speed_up))
+}
+
+/// The plan [`ExecutorOwner::plan_swap_speed_up`] makes, without its session: a second order
+/// for the open order `order` of `record` at `now`, for the account `executor`, from the
+/// candidate notes `utxos`. Only the notes of the recorded proof are offered to the selection,
+/// and the plan is refused when `utxos` lacks one of them. `inclusion` is as for
+/// [`speed_up_block`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_swap_speed_up_inputs(
+    builder: &TransactionBuilder,
+    profile: &SwapProfile,
+    record: &ExecutorRecord,
+    executor: impl Into<SwapExecutor>,
+    utxos: &[Utxo],
+    order: OrderUid,
+    now: SystemTime,
+    inclusion: Option<SwapSetupInclusion>,
+) -> Result<SwapAmountPlan> {
+    let (open, speed_up) =
+        swap_speed_up_binding(record, order).ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+    // The account rule on recorded evidence is part of the window.
+    require_speed_up_window(record, profile, &speed_up, now, inclusion)?;
+    let swap = record.swap().ok_or_else(|| eyre!(SPEED_UP_ORDER_CHANGED))?;
+    let terms = swap.order_terms(open);
+    let request = SwapAmountRequest {
+        sell_token: terms.sell_token(),
+        buy_token: terms.buy_token(),
+        amount: open.bounds().spend_amount(),
+        delivery: open.delivery(),
+        byte_budget: None,
+    };
+    if profile.pair_eligibility(request.sell_token, request.buy_token, request.delivery)
+        != SwapTokenEligibility::Eligible
     {
-        return Some("this account is retained for recovery or public use and cannot place a swap");
+        return Err(eyre!("this token pair is not eligible for private swaps"));
     }
-    if !super::is_swap_record(record) && unresolved_work() {
-        return Some(UNFINISHED_WORK);
+    // Both orders fund from the recorded proof, so no other note may be selected.
+    let inputs = swap
+        .proof()
+        .inputs()
+        .iter()
+        .map(|input| utxos.iter().find(|utxo| input.matches(utxo)).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| eyre!(SPEED_UP_FUNDS_CHANGED))?;
+    match plan_swap_inputs(
+        builder,
+        profile,
+        executor,
+        &inputs,
+        &request,
+        profile.app_data_byte_budget(),
+        Some(order),
+    )? {
+        SwapAmountPlan::Fits(mut plan) => {
+            // Signing reuses the recorded proof and proves nothing, so a plan that selects
+            // other notes than the proof spends is refused here.
+            if reusable_swap_proof(record, &plan, &inputs).is_none() {
+                return Err(eyre!(SPEED_UP_FUNDS_CHANGED));
+            }
+            plan.speed_up = Some(speed_up);
+            Ok(SwapAmountPlan::Fits(plan))
+        }
+        // The amount is the open order's, so a smaller one can't be offered instead.
+        SwapAmountPlan::TooLarge { .. } => {
+            Err(eyre!("this swap's order can't be sped up at its amount"))
+        }
     }
-    if record.swap().is_some_and(|swap| !swap.admits_attempt()) {
-        return Some("the previous order of this swap can still execute; retry once it has ended");
+}
+
+/// Why an order can't be sped up at the moment it is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpeedUpBlock {
+    /// The shared account rule refuses the speed-up on recorded evidence.
+    Account(SwapAccountRefusal),
+    /// The record holds no such order, or it is not the one order that can still fill.
+    NotOpen,
+    /// Local time reached the order's `validTo`.
+    Expired,
+    TwoOrdersFillable,
+}
+
+/// The one rule for whether `order` of `record` can be sped up at `now`, from the record alone,
+/// with what the speed-up binds. The shared account rule must admit it on recorded evidence,
+/// which leaves `order` as the latest order. It must be unexpired by local time, since a new
+/// order can't relax one that solvers no longer fill. And it must be the only order that can
+/// still fill, because a pre-hook invalidates one order: an earlier order counts until
+/// [`fillable_swap_orders`] drops it, which its local expiry alone does not do.
+///
+/// While the record leaves the swap's own setup unresolved, the order was placed on the
+/// included setup, and the account rule judges the speed-up on `inclusion`, the last read at
+/// the latest block that showed that setup included. Without it nothing is admitted.
+pub(crate) fn speed_up_block(
+    record: &ExecutorRecord,
+    profile: &SwapProfile,
+    chain_id: u64,
+    order: OrderUid,
+    now: SystemTime,
+    inclusion: Option<SwapSetupInclusion>,
+) -> Result<SwapSpeedUp, SpeedUpBlock> {
+    let (open, speed_up) = swap_speed_up_binding(record, order).ok_or(SpeedUpBlock::NotOpen)?;
+    let evidence = if record
+        .unresolved_swap_setup_nonce(speed_up.swap_use)
+        .is_some()
+    {
+        inclusion
+            .map(SwapSetupInclusion::evidence)
+            .ok_or(SpeedUpBlock::Account(SwapAccountRefusal::SetupUnconfirmed))?
+    } else {
+        SwapAdmissionEvidence::Recorded
+    };
+    if let Some(refusal) = swap_account_refusal(
+        record,
+        chain_id,
+        SwapAccountRole::Source,
+        SwapAccountUse::SpeedUp(speed_up),
+        evidence,
+    ) {
+        return Err(SpeedUpBlock::Account(refusal));
     }
-    None
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    if u64::from(open.valid_to()) <= now_secs {
+        return Err(SpeedUpBlock::Expired);
+    }
+    match fillable_swap_orders(record, profile, now).as_slice() {
+        [fillable] if *fillable == order => Ok(speed_up),
+        [_, _, ..] => Err(SpeedUpBlock::TwoOrdersFillable),
+        _ => Err(SpeedUpBlock::NotOpen),
+    }
+}
+
+/// Refuse a speed-up bound to `speed_up` unless [`speed_up_block`] admits its order at `now`
+/// with the same binding, on `inclusion` while the record leaves the setup unresolved.
+fn require_speed_up_window(
+    record: &ExecutorRecord,
+    profile: &SwapProfile,
+    speed_up: &SwapSpeedUp,
+    now: SystemTime,
+    inclusion: Option<SwapSetupInclusion>,
+) -> Result<()> {
+    match speed_up_block(
+        record,
+        profile,
+        profile.chain_id(),
+        speed_up.order,
+        now,
+        inclusion,
+    ) {
+        Ok(current) if current == *speed_up => Ok(()),
+        Ok(_) | Err(SpeedUpBlock::NotOpen) => Err(eyre!(SPEED_UP_ORDER_CHANGED)),
+        Err(SpeedUpBlock::Account(refusal)) => Err(refusal.into()),
+        Err(SpeedUpBlock::Expired) => Err(eyre!(
+            "this order has expired; retry once its expiry is final"
+        )),
+        Err(SpeedUpBlock::TwoOrdersFillable) => Err(eyre!(
+            "two orders of this swap can still fill, and a new order can replace only one"
+        )),
+    }
 }
 
 /// The earlier order of this executor that a retry's pre-hook invalidates in the same execution
@@ -1996,7 +4439,7 @@ pub(crate) fn swap_invalidation(
 }
 
 /// Orders of this executor that can still fill. An order can't once it traded, a finalized
-/// block passed its `validTo`, or a payload that won its nonce invalidated it, such as a
+/// block passed its `validTo`, or a recovery known to have run invalidated it, such as a
 /// cancellation. Orders within one validity window of local time count as live, to tolerate
 /// clock skew.
 pub(super) fn fillable_swap_orders(
@@ -2021,29 +4464,54 @@ pub(super) fn fillable_swap_orders(
                     .pre_hook_dead
                     .is_none_or(|death| death.cause != SwapPreHookDeathCause::Expired)
                 && u64::from(order.valid_to()) >= horizon
-                && !invalidated_by_winner(record, profile.settlement(), order.uid())
+                && !invalidated_by_recovery(record, profile.settlement(), order.uid())
         })
         .map(SwapOrderRecord::uid)
         .collect()
 }
 
-/// Whether a reconciled winning payload of the executor called `invalidateOrder(uid)`.
-fn invalidated_by_winner(record: &ExecutorRecord, settlement: Address, uid: OrderUid) -> bool {
+/// Whether a recovery that ran called `invalidateOrder(uid)`, from the record alone: a
+/// resolved recovery payload whose calls invalidate the order, where the order whose pre-hook
+/// was signed at that payload's nonce has a recorded death cause of cancellation or recovery.
+/// While that cause is unknown the order counts as fillable, so at worst it is invalidated
+/// twice.
+fn invalidated_by_recovery(record: &ExecutorRecord, settlement: Address, uid: OrderUid) -> bool {
+    let Some(swap) = record.swap() else {
+        return false;
+    };
     record.issued().iter().any(|payload| {
-        if record.payload_status(payload.hash()) != Some(ExecutorPayloadStatus::Executed) {
+        if payload.purpose() != ExecutorPayloadPurpose::Recovery
+            || !record.nonce_resolved(payload.nonce())
+            || !swap.orders().iter().any(|order| {
+                order.pre_hook().nonce() == payload.nonce()
+                    && order.observations().pre_hook_dead.is_some_and(|death| {
+                        matches!(
+                            death.cause,
+                            SwapPreHookDeathCause::Cancellation | SwapPreHookDeathCause::Recovery
+                        )
+                    })
+            })
+        {
             return false;
         }
         let data = payload.context().calldata();
         let calls = RelayAdapt7702::executeCall::abi_decode(data)
             .map(|call| call._actionData.calls)
             .or_else(|_| RelayAdapt7702::multicallCall::abi_decode(data).map(|call| call._calls));
-        calls.is_ok_and(|calls| {
-            calls.iter().any(|call| {
-                call.to == settlement
-                    && GPv2Settlement::invalidateOrderCall::abi_decode(&call.data)
-                        .is_ok_and(|call| call.orderUid[..] == uid.0[..])
-            })
-        })
+        calls.is_ok_and(|calls| invalidates_order(&calls, settlement, uid))
+    })
+}
+
+/// Whether `calls` include `invalidateOrder(uid)` on `settlement`.
+pub(in crate::desktop::executors) fn invalidates_order(
+    calls: &[Call],
+    settlement: Address,
+    uid: OrderUid,
+) -> bool {
+    calls.iter().any(|call| {
+        call.to == settlement
+            && GPv2Settlement::invalidateOrderCall::abi_decode(&call.data)
+                .is_ok_and(|call| call.orderUid[..] == uid.0[..])
     })
 }
 
@@ -2180,6 +4648,114 @@ fn pre_hook_request(
     }
 }
 
+/// The post-hook calls of `delivery`, with placeholders for the terms only known at signing.
+/// Every such argument is a static ABI word, so the calls encode to the signed calls' length. A
+/// private Across delivery's deposit also carries the handler message, whose length depends
+/// only on its shield multicall's, so it is built around
+/// [`placeholder_destination_shield_multicall`]. The handler is a static word in the deposit
+/// and in the message, and so is the message's fallback recipient, whether it is set or not.
+fn placeholder_post_hook_calls(
+    executor: Address,
+    buy_token: Address,
+    delivery: SwapDelivery,
+) -> Result<Vec<Call>> {
+    Ok(match delivery {
+        SwapDelivery::Bridge(
+            bridge @ BridgeDelivery {
+                provider: BridgeProvider::Across,
+                private: Some(_),
+                ..
+            },
+        ) => private_bridge_deposit_calls(
+            executor,
+            Address::ZERO,
+            placeholder_across_deposit(executor, buy_token, bridge, Address::ZERO),
+            AcrossPrivateDelivery {
+                handler: Address::ZERO,
+                destination_executor: bridge.receiver,
+                shield_multicall: placeholder_destination_shield_multicall(bridge)?,
+                fallback: None,
+            },
+            matches!(bridge.surplus, BridgeSurplus::Reshield)
+                .then_some(placeholder_shield(buy_token)),
+        )?,
+        SwapDelivery::Bridge(
+            bridge @ BridgeDelivery {
+                provider: BridgeProvider::Across,
+                ..
+            },
+        ) => bridge_deposit_calls(
+            executor,
+            Address::ZERO,
+            placeholder_across_deposit(executor, buy_token, bridge, bridge.receiver),
+            matches!(bridge.surplus, BridgeSurplus::Reshield)
+                .then_some(placeholder_shield(buy_token)),
+        )?,
+        _ => guarded_shield_calls(
+            executor,
+            buy_token,
+            U256::ONE,
+            placeholder_shield(buy_token),
+        )?,
+    })
+}
+
+/// A `depositV3` call for `bridge` that pays `recipient`, with placeholders for the terms only
+/// known at signing and an empty message.
+fn placeholder_across_deposit(
+    executor: Address,
+    buy_token: Address,
+    bridge: BridgeDelivery,
+    recipient: Address,
+) -> SpokePool::depositV3Call {
+    SpokePool::depositV3Call {
+        depositor: executor,
+        recipient,
+        inputToken: buy_token,
+        outputToken: bridge.destination_token,
+        inputAmount: U256::ONE,
+        outputAmount: U256::ONE,
+        destinationChainId: U256::from(bridge.destination_chain),
+        exclusiveRelayer: Address::ZERO,
+        quoteTimestamp: u32::MAX,
+        fillDeadline: u32::MAX,
+        exclusivityParameter: u32::MAX,
+        message: Bytes::new(),
+    }
+}
+
+/// `RelayAdapt7702.multicall` calldata of the signed calldata's length for the guarded shield a
+/// private `bridge` delivery's destination stealth account runs in the fill: the amount and
+/// the nonce are static ABI words, and the signature is 65 bytes.
+pub(super) fn placeholder_destination_shield_multicall(bridge: BridgeDelivery) -> Result<Bytes> {
+    Ok(RelayAdapt7702::multicallCall {
+        _requireSuccess: true,
+        _calls: guarded_shield_calls(
+            bridge.receiver,
+            bridge.destination_token,
+            U256::ONE,
+            placeholder_shield(bridge.destination_token),
+        )?,
+        _nonce: U256::ONE,
+        _signature: Bytes::from_static(&[0; 65]),
+    }
+    .abi_encode()
+    .into())
+}
+
+/// The length of a private `bridge` delivery's handler message, which the fill carries on the
+/// destination chain. It is built from placeholders and names no signed payload.
+pub(super) fn placeholder_private_delivery_message_len(bridge: BridgeDelivery) -> Result<usize> {
+    Ok(private_delivery_message(
+        Address::ZERO,
+        bridge.destination_token,
+        bridge.receiver,
+        placeholder_destination_shield_multicall(bridge)?,
+        None,
+    )
+    .len())
+}
+
 /// Shield requests are static ABI types, so this encodes to the signed request's length.
 const fn placeholder_shield(token: Address) -> ShieldRequest {
     ShieldRequest {
@@ -2225,7 +4801,7 @@ fn swap_app_data(
 
 /// A fill-or-kill sell order owned by the executor that pays `receiver`, from
 /// [`order_receiver`]. A native `buy_token`, `Address::ZERO`, becomes `GPv2`'s native buy address.
-fn swap_order(
+pub(super) fn swap_order(
     sell_token: Address,
     buy_token: Address,
     receiver: Address,
@@ -2250,12 +4826,29 @@ fn swap_order(
     }
 }
 
-/// Who an order pays: the executor, whose post-hook reshields the bought token, or an External
-/// receiver.
-const fn order_receiver(executor: Address, delivery: SwapDelivery) -> Address {
+/// Who an order pays: the executor, whose post-hook reshields or bridges the bought token, an
+/// External receiver, or the NEAR Intents deposit address in the order's `bridge` terms.
+fn order_receiver(
+    executor: Address,
+    delivery: SwapDelivery,
+    bridge: Option<&BridgeOrderTerms>,
+) -> Result<Address> {
     match delivery {
-        SwapDelivery::Reshield => executor,
-        SwapDelivery::External { receiver } => receiver,
+        SwapDelivery::Reshield
+        | SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            ..
+        }) => Ok(executor),
+        SwapDelivery::External { receiver } => Ok(receiver),
+        SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::NearIntents,
+            ..
+        }) => match bridge {
+            Some(BridgeOrderTerms::NearIntents(terms)) => Ok(terms.deposit_address),
+            _ => Err(eyre!(
+                "NEAR Intents orders need their verified deposit address"
+            )),
+        },
     }
 }
 
@@ -2271,7 +4864,7 @@ pub(super) fn cow_buy_token(buy_token: Address) -> Address {
 
 /// The token whose anchors price `token`. The native asset uses the chain's wrapped-native
 /// anchors, which have the same price.
-fn anchor_token(chain_id: u64, token: Address) -> Address {
+pub(super) fn anchor_token(chain_id: u64, token: Address) -> Address {
     if token == Address::ZERO {
         crate::amounts::wrapped_native_token_for_chain(chain_id).unwrap_or(token)
     } else {
@@ -2297,7 +4890,7 @@ fn swap_quote_request(
     }
 }
 
-fn valid_to_after(now: SystemTime, window: Duration) -> Result<u32> {
+pub(super) fn valid_to_after(now: SystemTime, window: Duration) -> Result<u32> {
     now.checked_add(window)
         .and_then(|valid_to| valid_to.duration_since(UNIX_EPOCH).ok())
         .and_then(|valid_to| u32::try_from(valid_to.as_secs()).ok())

@@ -9,7 +9,7 @@ use super::gas::public_advanced_transaction_payload_fingerprint;
 use super::runtime::{public_shield_token, verified_public_chain_runtime_config};
 use super::signer::admitted_public_signer_authorized;
 use super::submission::{
-    emit_public_action_event, emit_refreshed_public_action_hardware_session,
+    PublicActionStepEnd, emit_public_action_event, emit_refreshed_public_action_hardware_session,
     public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
@@ -130,9 +130,11 @@ pub(crate) async fn submit_public_action_step_with_signer(
         command_rx,
         event_tx,
         None,
+        PublicActionStepEnd::Receipt,
         progress,
     )
     .await?
+    .into_receipt()?
     .receipt;
     if !tx.status {
         return Err(eyre!("{revert_subject} reverted ({})", tx.tx_hash));
@@ -411,9 +413,11 @@ pub async fn submit_public_shield_with_progress(
                     &mut command_rx,
                     event_tx.as_ref(),
                     None,
+                    PublicActionStepEnd::Receipt,
                     &mut progress,
                 )
-                .await?;
+                .await?
+                .into_receipt()?;
                 let receipt = approve_outcome.receipt;
                 if !receipt.status {
                     return Err(eyre!(
@@ -472,9 +476,11 @@ pub async fn submit_public_shield_with_progress(
                 &mut command_rx,
                 event_tx.as_ref(),
                 None,
+                PublicActionStepEnd::Receipt,
                 &mut progress,
             )
             .await?
+            .into_receipt()?
             .receipt;
             if !shield_receipt.status {
                 return Err(eyre!(
@@ -513,7 +519,7 @@ pub(super) fn public_shield_approval_required(
     }
 }
 
-pub(super) async fn query_erc20_allowance(
+pub(crate) async fn query_erc20_allowance(
     chain_route: &RpcChainRoute,
     http: &HttpContext,
     asset: PublicAssetId,
@@ -544,6 +550,37 @@ pub(super) async fn query_erc20_allowance(
         .wrap_err("query public shield ERC-20 allowance")?;
     PublicErc20::allowanceCall::abi_decode_returns_validate(&output)
         .wrap_err("decode public shield ERC-20 allowance")
+}
+
+/// `owner`'s balance of the ERC-20 `token`, read as [`query_erc20_allowance`] reads an
+/// allowance.
+pub(crate) async fn query_erc20_balance(
+    chain_route: &RpcChainRoute,
+    http: &HttpContext,
+    token: Address,
+    owner: Address,
+) -> Result<U256> {
+    let results = http
+        .rpc_broker()
+        .submit_eth_calls(
+            RpcRoute::from(chain_route.clone()),
+            vec![(
+                token,
+                PublicErc20::balanceOfCall { account: owner }
+                    .abi_encode()
+                    .into(),
+            )],
+            WalletRpcOrigin::PublicWallet.into(),
+        )
+        .await
+        .wrap_err("query ERC-20 balance")?;
+    let output = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("missing ERC-20 balance result"))?
+        .wrap_err("query ERC-20 balance")?;
+    PublicErc20::balanceOfCall::abi_decode_returns_validate(&output)
+        .wrap_err("decode ERC-20 balance")
 }
 
 pub(super) fn public_native_shield_transaction_request(
