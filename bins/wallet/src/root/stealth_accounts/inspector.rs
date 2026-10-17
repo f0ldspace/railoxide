@@ -61,6 +61,7 @@ impl StealthAccountsView {
             .flex_col()
             .gap_4()
             .child(inspector_columns(
+                "stealth-inspector-balances",
                 content,
                 Some(self.render_balances(record, cx)),
             ))
@@ -349,6 +350,7 @@ impl StealthAccountsView {
             );
         }
         Some(inspector_columns(
+            "stealth-inspector-payloads",
             div()
                 .debug_selector(|| "stealth-account-details".into())
                 .w_full()
@@ -422,7 +424,11 @@ impl StealthAccountsView {
     }
 }
 
-fn inspector_columns(summary: gpui::Div, table: Option<gpui::Div>) -> gpui::Div {
+fn inspector_columns(
+    table_id: &'static str,
+    summary: gpui::Div,
+    table: Option<gpui::Div>,
+) -> gpui::Div {
     // Both rows share column widths so their tables align and wrap together.
     div()
         .w_full()
@@ -432,7 +438,15 @@ fn inspector_columns(summary: gpui::Div, table: Option<gpui::Div>) -> gpui::Div 
         .items_start()
         .gap_6()
         .child(summary.flex_grow(1.).flex_basis(gpui::rems(26.)).min_w_0())
-        .children(table.map(|table| table.w(gpui::rems(48.)).max_w_full().min_w_0().ml_auto()))
+        .children(table.map(|table| {
+            // Tables in the same outer cell need separate accessibility ID scopes.
+            table
+                .id(table_id)
+                .w(gpui::rems(48.))
+                .max_w_full()
+                .min_w_0()
+                .ml_auto()
+        }))
 }
 
 fn inspector_text(label: impl Into<SharedString>) -> gpui::Div {
