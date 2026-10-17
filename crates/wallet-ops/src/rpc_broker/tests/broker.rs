@@ -1,8 +1,9 @@
 use crate::rpc_broker::actor::{Command, JobExecutor, JobOutput};
-use crate::rpc_broker::broker::{RpcBroker, SUBMISSION_CAPACITY};
+use crate::rpc_broker::broker::{RpcBroker, SUBMISSION_CAPACITY, default_executor};
+use crate::rpc_broker::identity::CandidateOrder;
 use crate::rpc_broker::model::{
-    DEFAULT_MAX_ESTIMATED_GAS, RpcBrokerError, RpcBrokerSpawnError, RpcOrigin, RpcRead, RpcRoute,
-    RpcSubmission,
+    DEFAULT_INTERVAL, DEFAULT_MAX_ESTIMATED_GAS, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError,
+    RpcBrokerSpawnError, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
 };
 use crate::rpc_broker::tests::{data_result, read_calldata, test_origin, test_route};
 use alloy::eips::BlockNumberOrTag;
@@ -40,6 +41,24 @@ async fn await_actor(broker: &RpcBroker) {
 }
 
 impl RpcBroker {
+    /// Production defaults with a caller-chosen candidate order, so tests can fix tie order.
+    pub(crate) fn spawn_with_candidate_order(
+        client: reqwest::Client,
+        candidate_order: CandidateOrder,
+    ) -> Result<Arc<Self>, RpcBrokerSpawnError> {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(RpcBrokerSpawnError::NoRuntime)?;
+        Self::spawn_primitive(
+            client,
+            &handle,
+            DEFAULT_INTERVAL,
+            DEFAULT_MAX_IN_FLIGHT,
+            SUBMISSION_CAPACITY,
+            default_executor(),
+            candidate_order,
+        )
+    }
+
     pub(in crate::rpc_broker) fn spawn_with_test_config(
         client: reqwest::Client,
         interval: Duration,
@@ -71,6 +90,8 @@ impl RpcBroker {
             max_in_flight,
             submission_capacity,
             executor,
+            // Configured order breaks selection ties, as existing tests expect.
+            |_| {},
         )
     }
 }
@@ -271,7 +292,7 @@ async fn duplicate_callers_require_distinct_admission_credits() {
         let started = started.clone();
         let release = release.clone();
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             let started = started.clone();
             let release = release.clone();
             let first = executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;

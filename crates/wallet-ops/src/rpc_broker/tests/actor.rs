@@ -65,7 +65,7 @@ async fn actor_keeps_collection_window_across_later_arrival_and_deadline_wake() 
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 JobOutput {
@@ -142,7 +142,7 @@ async fn duplicate_waiters_share_one_execution_and_keep_independent_deadlines() 
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 time::sleep(Duration::from_millis(150)).await;
@@ -254,7 +254,7 @@ async fn aggregated_reads_keep_distinct_policies_and_per_member_deadlines() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let executor: JobExecutor = {
         let observed = observed.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             observed
                 .lock()
                 .expect("aggregate policy observation lock")
@@ -333,7 +333,7 @@ async fn a_queued_read_keeps_its_own_deadline_when_the_running_read_expires() {
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 time::sleep(Duration::from_millis(150)).await;
@@ -515,7 +515,7 @@ async fn route_threshold_flushes_before_admitting_the_next_read() {
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 JobOutput {
@@ -632,7 +632,7 @@ async fn individual_ready_work_is_bounded_by_top_level_concurrency() {
     let executor: JobExecutor = {
         let started = started.clone();
         let gate = gate.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             assert!(matches!(&group, ExecutionJob::Individual(_)));
             started.fetch_add(1, Ordering::SeqCst);
             let gate = gate.clone();
@@ -681,7 +681,7 @@ async fn aggregate_completion_is_delivered_while_individual_job_is_blocked() {
     let gate = Arc::new(Semaphore::new(0));
     let executor: JobExecutor = {
         let gate = gate.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             let aggregate = group.first().is_some_and(|item| {
                 item.execution_route.multicall().is_some() && item.read.is_multicall_eligible()
             });
@@ -761,7 +761,7 @@ async fn queued_duplicate_reads_expire_without_dispatch() {
     let executor: JobExecutor = {
         let executions = executions.clone();
         let gate = gate.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             let gate = gate.clone();
             Box::pin(async move {
@@ -844,7 +844,7 @@ async fn duplicate_submissions_attach_to_an_in_flight_execution() {
         let executions = executions.clone();
         let gate = gate.clone();
         let started = started.clone();
-        Arc::new(move |_client, _semaphore, group, endpoints| {
+        Arc::new(move |_resources, group, endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             let selected_endpoints = selected_endpoints.clone();
             let gate = gate.clone();
@@ -951,7 +951,7 @@ async fn unknown_block_latest_reads_do_not_deduplicate_in_flight() {
     let executor: JobExecutor = {
         let executions = executions.clone();
         let gate = gate.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(execution_job_len(&group), Ordering::SeqCst);
             let mut gate = gate.clone();
             Box::pin(async move {
@@ -1002,7 +1002,7 @@ async fn eth_call_and_balance_reads_do_not_share_cache_or_dedup_identity() {
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 JobOutput {
@@ -1075,9 +1075,12 @@ async fn aggregate_member_expiry_with_late_waiter(shutdown: bool) {
     let (polled, mut polls) = mpsc::unbounded_channel();
     let executor: JobExecutor = {
         let semaphore = semaphore.clone();
-        Arc::new(move |client, _semaphore, job, endpoints| {
-            let mut future =
-                super::super::execution::run_job(client, semaphore.clone(), job, endpoints);
+        Arc::new(move |resources, job, endpoints, control| {
+            let resources = JobResources {
+                http: semaphore.clone(),
+                ..resources
+            };
+            let mut future = super::super::execution::run_job(resources, job, endpoints, control);
             let polled = polled.clone();
             Box::pin(std::future::poll_fn(move |cx| {
                 let result = future.as_mut().poll(cx);
@@ -1096,6 +1099,7 @@ async fn aggregate_member_expiry_with_late_waiter(shutdown: bool) {
         Duration::from_secs(30),
         1,
         executor,
+        |_| {},
     );
     let actor_task = tokio::spawn(actor.run(block_rx));
     let route = RpcRoute::from(
@@ -1232,7 +1236,7 @@ async fn shutdown_drains_an_accepted_execution() {
     let executor: JobExecutor = {
         let started = started.clone();
         let release = release.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             let started = started.clone();
             let release = release.clone();
             Box::pin(async move {
@@ -1256,6 +1260,7 @@ async fn shutdown_drains_an_accepted_execution() {
         Duration::from_secs(30),
         1,
         executor,
+        |_| {},
     );
     let actor_task = tokio::spawn(actor.run(block_rx));
     let route = test_route().with_test_thresholds(1, DEFAULT_MAX_ESTIMATED_GAS);
@@ -1362,7 +1367,7 @@ async fn stale_head_notification_does_not_flush_pending_work() {
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 JobOutput {
@@ -1423,7 +1428,7 @@ async fn latest_cache_hits_within_a_block_and_invalidates_on_advance() {
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 let mut completions = Vec::new();
@@ -1485,7 +1490,7 @@ async fn latest_cache_lease_and_invalidation_preserve_numbered_entries() {
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = executions.clone();
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 JobOutput {
@@ -1581,7 +1586,7 @@ async fn renewed_latest_head_isolates_active_reads_across_validity_boundaries() 
     ] {
         for old_finishes_first in [true, false] {
             let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-            let executor: JobExecutor = Arc::new(move |_client, _semaphore, group, _endpoints| {
+            let executor: JobExecutor = Arc::new(move |_resources, group, _endpoints, _control| {
                 let (release, response) = oneshot::channel::<Bytes>();
                 started_tx
                     .send(release)

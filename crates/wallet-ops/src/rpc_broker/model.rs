@@ -789,7 +789,15 @@ pub struct RpcChainRoute {
     endpoints: Arc<[SensitiveUrl]>,
     multicall: Option<Address>,
     verify_identity: bool,
-    pub(super) verified_identities: Arc<[(SensitiveUrl, tokio::sync::OnceCell<()>)]>,
+    pub(super) verified_identities: Arc<VerifiedIdentities>,
+}
+
+/// Successful identity checks shared by a route and its clones.
+#[derive(Debug)]
+pub(super) struct VerifiedIdentities {
+    pub(super) endpoints: Box<[(SensitiveUrl, tokio::sync::OnceCell<()>)]>,
+    /// Signalled after each successful identity check on this route or a clone.
+    pub(super) checked: tokio::sync::Notify,
 }
 
 impl PartialEq for RpcChainRoute {
@@ -823,11 +831,13 @@ impl RpcChainRoute {
             .map(Into::into)
             .collect::<Vec<_>>()
             .into();
-        let verified_identities = endpoints
-            .iter()
-            .map(|endpoint| (endpoint.clone(), tokio::sync::OnceCell::new()))
-            .collect::<Vec<_>>()
-            .into();
+        let verified_identities = Arc::new(VerifiedIdentities {
+            endpoints: endpoints
+                .iter()
+                .map(|endpoint| (endpoint.clone(), tokio::sync::OnceCell::new()))
+                .collect(),
+            checked: tokio::sync::Notify::new(),
+        });
         Self {
             chain_id,
             endpoints,

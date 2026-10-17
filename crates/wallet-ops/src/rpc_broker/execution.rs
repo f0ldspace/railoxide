@@ -1,4 +1,6 @@
 use super::actor::{EndpointHealthOutcome, JobOutput, RequestEvent};
+use super::capacity::{JobControl, JobResources, SlotKind};
+use super::identity::ProbeRunner;
 use super::model::{
     FailureClass, MAX_REDUCTION_ATTEMPTS_PER_ENDPOINT, RpcBrokerError, RpcRead, RpcRemoteError,
     RpcResult, RpcRevert, RpcRoute,
@@ -20,7 +22,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{self, Instant};
 use url::Url;
 
@@ -76,28 +78,21 @@ impl<T> From<Result<T, RpcBrokerError>> for AttemptOutcome<T> {
 }
 
 pub(super) fn run_job(
-    client: reqwest::Client,
-    semaphore: Arc<Semaphore>,
+    resources: JobResources,
     job: ExecutionJob,
     endpoints: Vec<SensitiveUrl>,
+    control: JobControl,
 ) -> BoxFuture<'static, JobOutput> {
     Box::pin(async move {
-        let mut identity_events = Vec::new();
-        let endpoints =
-            verify_job_endpoints(&client, &semaphore, &job, endpoints, &mut identity_events).await;
-        let mut output = match job {
+        match job {
             ExecutionJob::Aggregate(group) => {
                 let Some(route) = group.first().map(|item| item.execution_route.clone()) else {
                     return JobOutput::noop();
                 };
-                let values = execute_aggregate_with_failover_attempt(
-                    client,
-                    semaphore,
-                    route.clone(),
-                    endpoints,
-                    &group,
-                )
-                .await;
+                let mut failover = AggregateFailover::new(route.clone(), &group);
+                let identity_events =
+                    drive_job(&resources, &route, &endpoints, &control, &mut failover).await;
+                let values = failover.into_output();
                 JobOutput {
                     completions: group
                         .into_iter()
@@ -114,21 +109,21 @@ pub(super) fn run_job(
                                 attempt.health_outcome,
                             )
                         })
+                        .chain(identity_events)
                         .collect(),
                 }
             }
             ExecutionJob::Individual(item) => {
                 let route = item.execution_route.clone();
-                let (value, attempted_endpoints) = execute_single_with_shared_waiters_attempt(
-                    &client,
-                    &semaphore,
+                let mut failover = SingleFailover::new(
                     &item.read,
-                    route.chain_id(),
-                    &endpoints,
                     item.waiters.clone(),
+                    route.chain_id(),
                     route.attempt_timeout,
-                )
-                .await;
+                );
+                let identity_events =
+                    drive_job(&resources, &route, &endpoints, &control, &mut failover).await;
+                let (value, attempted_endpoints) = failover.into_output();
                 JobOutput {
                     completions: vec![(item.key, value.into_result())],
                     requests: attempted_endpoints
@@ -136,86 +131,584 @@ pub(super) fn run_job(
                         .map(|(endpoint, outcome)| {
                             RequestEvent::new(route.chain_id(), endpoint, outcome)
                         })
+                        .chain(identity_events)
                         .collect(),
                 }
             }
-        };
-        output.requests.extend(identity_events);
-        output
+        }
     })
 }
 
-async fn verify_job_endpoints(
-    client: &reqwest::Client,
-    semaphore: &Arc<Semaphore>,
-    job: &ExecutionJob,
-    endpoints: Vec<SensitiveUrl>,
-    events: &mut Vec<RequestEvent>,
-) -> Vec<SensitiveUrl> {
-    let items: &[WorkItem] = match job {
-        ExecutionJob::Aggregate(items) => items,
-        ExecutionJob::Individual(item) => std::slice::from_ref(item),
-    };
-    let Some(route) = items.first().map(|item| &item.execution_route) else {
-        return endpoints;
-    };
-    if !route.chain_route().requires_identity_verification() {
-        return endpoints;
-    }
-    let members: Vec<_> = items
-        .iter()
-        .map(|item| AggregateMember {
-            read: item.read.clone(),
-            waiters: item.waiters.clone(),
-        })
-        .collect();
-    let indices: Vec<_> = (0..members.len()).collect();
-    let mut verified = Vec::new();
-    for endpoint in endpoints {
-        if route.chain_route().endpoint_identity_verified(&endpoint) {
-            verified.push(endpoint);
-            continue;
-        }
-        let permit = loop {
-            let current = ScopedView::new(&members, &indices, Instant::now());
-            if current.members.is_empty() {
-                return verified;
-            }
-            match acquire_permit(semaphore, current.earliest_permit_deadline()).await {
-                PermitAcquisition::Acquired(permit) => break permit,
-                PermitAcquisition::DeadlineElapsed => {}
-                PermitAcquisition::Closed => return verified,
-            }
-        };
-        let now = Instant::now();
-        let current = ScopedView::new(&members, &indices, now);
-        if current.members.is_empty() {
-            return verified;
-        }
-        let timeout = current.min_attempt_timeout(route.attempt_timeout);
-        let timeout = current
-            .latest_physical_deadline()
-            .map_or(timeout, |deadline| {
-                timeout.min(deadline.saturating_duration_since(now))
-            });
-        let result = route
-            .chain_route()
-            .verify_endpoint_identity(client, &endpoint, timeout)
-            .await;
-        if result.is_ok() {
-            verified.push(endpoint);
-        } else {
-            events.push(RequestEvent::new(
-                route.chain_id(),
-                endpoint.expose_url().clone(),
-                EndpointHealthOutcome::for_result(&result),
-            ));
-        }
-        drop(permit);
-    }
-    verified
+/// Identity state of one selected endpoint within a job.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Candidate {
+    /// Verified, or on a route without identity checks, and not yet tried.
+    Ready,
+    Unprobed,
+    Probing,
+    /// Failed its identity check, so it never receives requested reads.
+    Rejected,
+    Tried,
 }
 
+enum ProbeOutcome {
+    Verified,
+    /// The check was sent and failed.
+    Failed(RpcBrokerError),
+    /// No live waiter remained before the check was sent.
+    NotDispatched,
+    /// A permit semaphore closed.
+    Closed,
+}
+
+/// Some members still have live waiters; the next of them may expire at `earliest_deadline`.
+struct StillLive {
+    earliest_deadline: Option<Instant>,
+}
+
+/// Endpoint failover for the members of one job, advanced one endpoint attempt at a time.
+trait Failover {
+    type Outcome;
+
+    /// Settles members without live waiters, keeping a dispatched member's last result. Returns
+    /// `None` once no member is live.
+    fn live(&mut self, now: Instant) -> Option<StillLive>;
+
+    /// Waiters of the members still being resolved.
+    fn waiters(&self) -> Vec<Arc<WaiterState>>;
+
+    /// Starts one physical attempt on `endpoint`. The attempt borrows only immutable job data.
+    fn attempt<'a>(
+        &'a self,
+        resources: &'a JobResources,
+        endpoint: &'a Url,
+    ) -> BoxFuture<'a, Self::Outcome>;
+
+    /// Records an attempt and returns whether another endpoint should be tried.
+    fn apply(&mut self, endpoint: &Url, outcome: Self::Outcome) -> bool;
+
+    /// Settles never-dispatched members once the broker can no longer grant capacity.
+    fn shut_down(&mut self);
+}
+
+struct SingleFailover<'a> {
+    read: &'a RpcRead,
+    waiters: Arc<WaiterState>,
+    fallback_attempt_timeout: Duration,
+    result: AttemptOutcome<RpcResult>,
+    attempted: Vec<(Url, EndpointHealthOutcome)>,
+}
+
+impl<'a> SingleFailover<'a> {
+    const fn new(
+        read: &'a RpcRead,
+        waiters: Arc<WaiterState>,
+        chain_id: u64,
+        fallback_attempt_timeout: Duration,
+    ) -> Self {
+        Self {
+            read,
+            waiters,
+            fallback_attempt_timeout,
+            result: AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint { chain_id }),
+            attempted: Vec::new(),
+        }
+    }
+
+    fn into_output(self) -> (AttemptOutcome<RpcResult>, Vec<(Url, EndpointHealthOutcome)>) {
+        (self.result, self.attempted)
+    }
+}
+
+impl Failover for SingleFailover<'_> {
+    type Outcome = AttemptOutcome<RpcResult>;
+
+    fn live(&mut self, now: Instant) -> Option<StillLive> {
+        let snapshot = self.waiters.snapshot(now);
+        if snapshot.has_live {
+            return Some(StillLive {
+                earliest_deadline: snapshot.deadline,
+            });
+        }
+        if self.attempted.is_empty() {
+            self.result = AttemptOutcome::NotDispatched;
+        }
+        None
+    }
+
+    fn waiters(&self) -> Vec<Arc<WaiterState>> {
+        vec![Arc::clone(&self.waiters)]
+    }
+
+    fn attempt<'b>(
+        &'b self,
+        resources: &'b JobResources,
+        endpoint: &'b Url,
+    ) -> BoxFuture<'b, Self::Outcome> {
+        Box::pin(execute_single_shared_waiter_attempt(
+            &resources.client,
+            &resources.http,
+            self.read,
+            endpoint,
+            &self.waiters,
+            self.fallback_attempt_timeout,
+            None,
+        ))
+    }
+
+    fn apply(&mut self, endpoint: &Url, outcome: Self::Outcome) -> bool {
+        if matches!(&outcome, AttemptOutcome::NotDispatched) && !self.attempted.is_empty() {
+            return false;
+        }
+        self.result = outcome;
+        if !matches!(
+            &self.result,
+            AttemptOutcome::NotDispatched
+                | AttemptOutcome::CallerError(
+                    RpcBrokerError::Shutdown | RpcBrokerError::NoEndpoint { .. }
+                )
+        ) {
+            self.attempted.push((
+                endpoint.clone(),
+                EndpointHealthOutcome::for_result(&self.result.clone().into_result()),
+            ));
+        }
+        matches!(
+            &self.result,
+            AttemptOutcome::CallerError(error) | AttemptOutcome::Recoverable(error)
+                if should_failover_error(error)
+        )
+    }
+
+    fn shut_down(&mut self) {
+        if self.attempted.is_empty() {
+            self.result = AttemptOutcome::CallerError(RpcBrokerError::Shutdown);
+        }
+    }
+}
+
+struct AggregateFailover {
+    route: RpcRoute,
+    members: Arc<[AggregateMember]>,
+    unresolved: Vec<usize>,
+    final_values: Vec<AttemptOutcome<RpcResult>>,
+    attempts: Vec<PhysicalAttempt>,
+    dispatched: Vec<bool>,
+}
+
+impl AggregateFailover {
+    fn new(route: RpcRoute, items: &[WorkItem]) -> Self {
+        let members: Arc<[AggregateMember]> = items
+            .iter()
+            .map(|item| AggregateMember {
+                read: item.read.clone(),
+                waiters: item.waiters.clone(),
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let final_values = vec![
+            AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint {
+                chain_id: route.chain_id(),
+            });
+            members.len()
+        ];
+        Self {
+            route,
+            unresolved: (0..members.len()).collect(),
+            final_values,
+            attempts: Vec::new(),
+            dispatched: vec![false; members.len()],
+            members,
+        }
+    }
+
+    fn into_output(self) -> ReductionOutput {
+        ReductionOutput {
+            values: self.final_values,
+            attempts: self.attempts,
+        }
+    }
+}
+
+impl Failover for AggregateFailover {
+    type Outcome = ReductionOutput;
+
+    fn live(&mut self, now: Instant) -> Option<StillLive> {
+        let current = ScopedView::new(&self.members, &self.unresolved, now);
+        let live = current.indices();
+        for index in self
+            .unresolved
+            .iter()
+            .copied()
+            .filter(|index| !live.contains(index))
+        {
+            if !self.dispatched[index] {
+                self.final_values[index] = AttemptOutcome::NotDispatched;
+            }
+        }
+        self.unresolved = live;
+        (!self.unresolved.is_empty()).then(|| StillLive {
+            earliest_deadline: current.earliest_permit_deadline(),
+        })
+    }
+
+    fn waiters(&self) -> Vec<Arc<WaiterState>> {
+        self.unresolved
+            .iter()
+            .map(|&index| Arc::clone(&self.members[index].waiters))
+            .collect()
+    }
+
+    fn attempt<'b>(
+        &'b self,
+        resources: &'b JobResources,
+        endpoint: &'b Url,
+    ) -> BoxFuture<'b, Self::Outcome> {
+        let context = Arc::new(ReductionContext {
+            client: resources.client.clone(),
+            semaphore: resources.http.clone(),
+            route: self.route.clone(),
+            endpoint: endpoint.clone(),
+            members: Arc::clone(&self.members),
+            reduction_budget: Arc::new(AtomicUsize::new(0)),
+        });
+        reduce(context, self.unresolved.clone())
+    }
+
+    fn apply(&mut self, _endpoint: &Url, output: Self::Outcome) -> bool {
+        let previously_dispatched = self.dispatched.clone();
+        for attempt in &output.attempts {
+            for index in &attempt.indices {
+                self.dispatched[*index] = true;
+            }
+        }
+        self.attempts.extend(output.attempts);
+        let mut next = Vec::new();
+        for index in std::mem::take(&mut self.unresolved) {
+            let value = &output.values[index];
+            if !(matches!(value, AttemptOutcome::NotDispatched) && previously_dispatched[index]) {
+                self.final_values[index] = value.clone();
+            }
+            if should_failover_aggregate_outcome(value) {
+                next.push(index);
+            }
+        }
+        self.unresolved = next;
+        !self.unresolved.is_empty()
+    }
+
+    fn shut_down(&mut self) {
+        for &index in &self.unresolved {
+            if !self.dispatched[index] {
+                self.final_values[index] = AttemptOutcome::CallerError(RpcBrokerError::Shutdown);
+            }
+        }
+    }
+}
+
+/// Runs a job's endpoint failover while verifying endpoint identities progressively, and
+/// returns the identity request events.
+///
+/// Endpoints are tried in the actor's selection order once they are ready. Probes for the others
+/// run alongside reads and supply later fallback candidates. The job holds a read slot only while
+/// it can try an endpoint, and a probe runner only while probes remain. Dropping the job drops
+/// its queued and active probes.
+async fn drive_job<W: Failover>(
+    resources: &JobResources,
+    route: &RpcRoute,
+    endpoints: &[SensitiveUrl],
+    control: &JobControl,
+    failover: &mut W,
+) -> Vec<RequestEvent> {
+    let chain = route.chain_route();
+    let mut candidates = endpoints
+        .iter()
+        .map(|endpoint| {
+            if chain.endpoint_identity_verified(endpoint) {
+                Candidate::Ready
+            } else {
+                Candidate::Unprobed
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    let target = ProbeTarget {
+        control,
+        route,
+        endpoints,
+    };
+    let start_probe = move |index: usize, waiters: Vec<Arc<WaiterState>>| {
+        probe_endpoint(resources, route, &endpoints[index], waiters)
+    };
+    let mut probes = ProbeRunner::new(resources.probe_limit);
+    // An outstanding request is kept across iterations so the job keeps its place in line.
+    let mut read_grant: Option<oneshot::Receiver<()>> = None;
+    let mut runner_grant: Option<oneshot::Receiver<()>> = None;
+    loop {
+        // Created before the re-check so a park below wakes for any later verification on the
+        // route, whether by another job or a sync admission check on a clone.
+        let identity_checked = chain.identity_checked();
+        tokio::pin!(identity_checked);
+        // Another job may have verified an endpoint of this route since the last decision.
+        for (candidate, endpoint) in candidates.iter_mut().zip(endpoints) {
+            if matches!(candidate, Candidate::Unprobed | Candidate::Probing)
+                && chain.endpoint_identity_verified(endpoint)
+            {
+                *candidate = Candidate::Ready;
+            }
+        }
+        let Some(StillLive {
+            earliest_deadline: deadline,
+        }) = failover.live(Instant::now())
+        else {
+            break;
+        };
+        // A runner granted while the job was reading is picked up here.
+        if let Some(grant) = runner_grant.as_mut()
+            && grant.try_recv().is_ok()
+        {
+            runner_grant = None;
+        }
+        let ready = candidates
+            .iter()
+            .position(|candidate| *candidate == Candidate::Ready);
+        if may_refill(resources, control, runner_grant.is_some(), &candidates) {
+            refill_probes(&probes, &mut candidates, &failover.waiters(), &start_probe);
+        }
+        if probes.is_empty() && !candidates.contains(&Candidate::Unprobed) {
+            runner_grant = None;
+            control.release(SlotKind::Runner);
+        }
+        if let Some(index) = ready {
+            if read_grant.is_some() || !control.holds(SlotKind::Read) {
+                if read_grant.is_none() {
+                    read_grant = control.request(SlotKind::Read);
+                }
+                let Some(grant) = read_grant.as_mut() else {
+                    failover.shut_down();
+                    break;
+                };
+                tokio::select! {
+                    granted = grant => {
+                        read_grant = None;
+                        if granted.is_err() {
+                            failover.shut_down();
+                            break;
+                        }
+                    }
+                    Some((probe, outcome)) = probes.next(), if !probes.is_empty() => {
+                        target.apply(&mut candidates, &mut events, probe, outcome);
+                    }
+                    () = sleep_until_deadline(deadline) => {}
+                }
+                continue;
+            }
+            candidates[index] = Candidate::Tried;
+            let endpoint = endpoints[index].expose_url();
+            let outcome = {
+                // Probes keep running during the attempt, which is never restarted.
+                let mut attempt = failover.attempt(resources, endpoint);
+                loop {
+                    tokio::select! {
+                        outcome = &mut attempt => break outcome,
+                        Some((probe, outcome)) = probes.next(), if !probes.is_empty() => {
+                            target.apply(&mut candidates, &mut events, probe, outcome);
+                            if may_refill(resources, control, runner_grant.is_some(), &candidates) {
+                                let waiters = failover.waiters();
+                                refill_probes(&probes, &mut candidates, &waiters, &start_probe);
+                            }
+                        }
+                    }
+                }
+            };
+            if failover.apply(endpoint, outcome) {
+                continue;
+            }
+            break;
+        }
+        if probes.is_empty() && !candidates.contains(&Candidate::Unprobed) {
+            // Exhausted: no endpoint or probe can supply another attempt.
+            break;
+        }
+        // Park until a probe or another check verifies an endpoint, leaving the read slot to
+        // other work.
+        read_grant = None;
+        control.release(SlotKind::Read);
+        if probes.is_empty() {
+            // Unprobed endpoints remain, but this job has no probe runner yet.
+            if runner_grant.is_none() {
+                runner_grant = control.request(SlotKind::Runner);
+            }
+            let Some(grant) = runner_grant.as_mut() else {
+                failover.shut_down();
+                break;
+            };
+            tokio::select! {
+                granted = grant => {
+                    runner_grant = None;
+                    if granted.is_err() {
+                        failover.shut_down();
+                        break;
+                    }
+                }
+                () = &mut identity_checked => {}
+                () = sleep_until_deadline(deadline) => {}
+            }
+        } else {
+            tokio::select! {
+                Some((probe, outcome)) = probes.next() => {
+                    target.apply(&mut candidates, &mut events, probe, outcome);
+                }
+                () = &mut identity_checked => {}
+                () = sleep_until_deadline(deadline) => {}
+            }
+        }
+    }
+    events
+}
+
+/// Whether the job may start more probes: it holds its runner, and either the broker keeps an
+/// HTTP permit free of probes or no ready endpoint is waiting for a read.
+fn may_refill(
+    resources: &JobResources,
+    control: &JobControl,
+    awaiting_runner: bool,
+    candidates: &[Candidate],
+) -> bool {
+    !awaiting_runner
+        && control.holds(SlotKind::Runner)
+        && (resources.reserve || !candidates.contains(&Candidate::Ready))
+}
+
+/// Starts probes for unprobed endpoints in selection order while the runner has room.
+fn refill_probes<F: Future>(
+    probes: &ProbeRunner<usize, F>,
+    candidates: &mut [Candidate],
+    waiters: &[Arc<WaiterState>],
+    start: &impl Fn(usize, Vec<Arc<WaiterState>>) -> F,
+) {
+    while probes.has_capacity() {
+        let Some(index) = candidates
+            .iter()
+            .position(|candidate| *candidate == Candidate::Unprobed)
+        else {
+            break;
+        };
+        candidates[index] = Candidate::Probing;
+        probes.push(index, start(index, waiters.to_vec()));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProbeTarget<'a> {
+    control: &'a JobControl,
+    route: &'a RpcRoute,
+    endpoints: &'a [SensitiveUrl],
+}
+
+impl ProbeTarget<'_> {
+    /// Records a finished probe. A verified endpoint becomes ready and wakes the actor for other
+    /// jobs on the route; a sent check that failed keeps its health classification.
+    fn apply(
+        self,
+        candidates: &mut [Candidate],
+        events: &mut Vec<RequestEvent>,
+        index: usize,
+        outcome: ProbeOutcome,
+    ) {
+        let probing = candidates[index] == Candidate::Probing;
+        match outcome {
+            ProbeOutcome::Verified => {
+                if probing {
+                    candidates[index] = Candidate::Ready;
+                }
+                self.control.notify_verified();
+            }
+            ProbeOutcome::Failed(error) => {
+                if probing {
+                    candidates[index] = Candidate::Rejected;
+                }
+                events.push(RequestEvent::new(
+                    self.route.chain_id(),
+                    self.endpoints[index].expose_url().clone(),
+                    EndpointHealthOutcome::for_result::<()>(&Err(error)),
+                ));
+            }
+            // A later live waiter may still need this endpoint.
+            ProbeOutcome::NotDispatched if probing => candidates[index] = Candidate::Unprobed,
+            ProbeOutcome::Closed if probing => candidates[index] = Candidate::Rejected,
+            ProbeOutcome::NotDispatched | ProbeOutcome::Closed => {}
+        }
+    }
+}
+
+/// One identity check for a job. It waits for the broker-wide probe budget and then an HTTP
+/// permit, each bounded by live waiter deadlines, and is never retried. Only the captured
+/// route's verification cache is consulted and updated.
+async fn probe_endpoint(
+    resources: &JobResources,
+    route: &RpcRoute,
+    endpoint: &SensitiveUrl,
+    waiters: Vec<Arc<WaiterState>>,
+) -> ProbeOutcome {
+    let chain = route.chain_route();
+    if chain.endpoint_identity_verified(endpoint) {
+        return ProbeOutcome::Verified;
+    }
+    let _budget = match acquire_live_permit(&resources.probes, &waiters).await {
+        Ok(permit) => permit,
+        Err(outcome) => return outcome,
+    };
+    let _permit = match acquire_live_permit(&resources.http, &waiters).await {
+        Ok(permit) => permit,
+        Err(outcome) => return outcome,
+    };
+    let now = Instant::now();
+    let current = ScopedView::from_waiters(&waiters, now);
+    if current.members.is_empty() {
+        return ProbeOutcome::NotDispatched;
+    }
+    let timeout = current.min_attempt_timeout(route.attempt_timeout);
+    let timeout = current
+        .latest_physical_deadline()
+        .map_or(timeout, |deadline| {
+            timeout.min(deadline.saturating_duration_since(now))
+        });
+    match chain
+        .verify_endpoint_identity(&resources.client, endpoint, timeout)
+        .await
+    {
+        Ok(()) => ProbeOutcome::Verified,
+        Err(error) => ProbeOutcome::Failed(error),
+    }
+}
+
+/// Waits for a permit while any waiter is live, re-snapshotting when the earliest deadline passes.
+async fn acquire_live_permit(
+    semaphore: &Arc<Semaphore>,
+    waiters: &[Arc<WaiterState>],
+) -> Result<OwnedSemaphorePermit, ProbeOutcome> {
+    loop {
+        let current = ScopedView::from_waiters(waiters, Instant::now());
+        if current.members.is_empty() {
+            return Err(ProbeOutcome::NotDispatched);
+        }
+        match acquire_permit(semaphore, current.earliest_permit_deadline()).await {
+            PermitAcquisition::Acquired(permit) => return Ok(permit),
+            PermitAcquisition::DeadlineElapsed => {}
+            PermitAcquisition::Closed => return Err(ProbeOutcome::Closed),
+        }
+    }
+}
+
+async fn sleep_until_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
 async fn execute_aggregate_with_failover_attempt(
     client: reqwest::Client,
     semaphore: Arc<Semaphore>,
@@ -223,74 +716,21 @@ async fn execute_aggregate_with_failover_attempt(
     endpoints: Vec<SensitiveUrl>,
     items: &[WorkItem],
 ) -> ReductionOutput {
-    let members: Arc<[AggregateMember]> = items
-        .iter()
-        .map(|item| AggregateMember {
-            read: item.read.clone(),
-            waiters: item.waiters.clone(),
-        })
-        .collect::<Vec<_>>()
-        .into();
-    let mut unresolved = (0..members.len()).collect::<Vec<_>>();
-    let mut final_values = vec![
-        AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint {
-            chain_id: route.chain_id(),
-        });
-        members.len()
-    ];
-    let mut attempts = Vec::new();
-    let mut dispatched = vec![false; members.len()];
+    let resources = JobResources {
+        http: semaphore,
+        ..JobResources::new(client, 1)
+    };
+    let mut failover = AggregateFailover::new(route, items);
     for endpoint in endpoints.iter().map(SensitiveUrl::expose_url) {
-        if unresolved.is_empty() {
+        if failover.live(Instant::now()).is_none() {
             break;
         }
-        let now = Instant::now();
-        let live = ScopedView::new(&members, &unresolved, now).indices();
-        for index in unresolved
-            .iter()
-            .copied()
-            .filter(|index| !live.contains(index))
-        {
-            if !dispatched[index] {
-                final_values[index] = AttemptOutcome::NotDispatched;
-            }
-        }
-        unresolved = live;
-        if unresolved.is_empty() {
+        let output = failover.attempt(&resources, endpoint).await;
+        if !failover.apply(endpoint, output) {
             break;
         }
-        let previously_dispatched = dispatched.clone();
-        let context = Arc::new(ReductionContext {
-            client: client.clone(),
-            semaphore: semaphore.clone(),
-            route: route.clone(),
-            endpoint: endpoint.clone(),
-            members: Arc::clone(&members),
-            reduction_budget: Arc::new(AtomicUsize::new(0)),
-        });
-        let output = reduce(context, unresolved.clone()).await;
-        for attempt in &output.attempts {
-            for index in &attempt.indices {
-                dispatched[*index] = true;
-            }
-        }
-        attempts.extend(output.attempts);
-        let mut next = Vec::new();
-        for index in unresolved {
-            let value = &output.values[index];
-            if !(matches!(value, AttemptOutcome::NotDispatched) && previously_dispatched[index]) {
-                final_values[index] = value.clone();
-            }
-            if should_failover_aggregate_outcome(value) {
-                next.push(index);
-            }
-        }
-        unresolved = next;
     }
-    ReductionOutput {
-        values: final_values,
-        attempts,
-    }
+    failover.into_output()
 }
 
 /// Reverts and the fixed local body cap are terminal. Other failures retain endpoint failover.
@@ -344,6 +784,22 @@ impl ScopedView {
                 .filter_map(|&index| {
                     let member = &members[index];
                     let snapshot = member.waiters.snapshot(now);
+                    snapshot
+                        .has_live
+                        .then_some(ScopedMember { index, snapshot })
+                })
+                .collect(),
+        }
+    }
+
+    /// A view over independent waiter sets, indexed by position.
+    fn from_waiters(waiters: &[Arc<WaiterState>], now: Instant) -> Self {
+        Self {
+            members: waiters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, waiters)| {
+                    let snapshot = waiters.snapshot(now);
                     snapshot
                         .has_live
                         .then_some(ScopedMember { index, snapshot })
@@ -763,6 +1219,7 @@ async fn execute_aggregate(
         result,
     }
 }
+#[cfg(test)]
 async fn execute_single_with_shared_waiters_attempt(
     client: &reqwest::Client,
     semaphore: &Arc<Semaphore>,
@@ -772,44 +1229,18 @@ async fn execute_single_with_shared_waiters_attempt(
     waiters: Arc<WaiterState>,
     fallback_attempt_timeout: Duration,
 ) -> (AttemptOutcome<RpcResult>, Vec<(Url, EndpointHealthOutcome)>) {
-    let mut attempted = Vec::new();
-    let mut result = AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint { chain_id });
+    let resources = JobResources {
+        http: Arc::clone(semaphore),
+        ..JobResources::new(client.clone(), 1)
+    };
+    let mut failover = SingleFailover::new(read, waiters, chain_id, fallback_attempt_timeout);
     for endpoint in endpoints.iter().map(SensitiveUrl::expose_url) {
-        let next_outcome = execute_single_shared_waiter_attempt(
-            client,
-            semaphore,
-            read,
-            endpoint,
-            &waiters,
-            fallback_attempt_timeout,
-            None,
-        )
-        .await;
-        if matches!(&next_outcome, AttemptOutcome::NotDispatched) && !attempted.is_empty() {
-            break;
-        }
-        result = next_outcome;
-        if !matches!(
-            &result,
-            AttemptOutcome::NotDispatched
-                | AttemptOutcome::CallerError(
-                    RpcBrokerError::Shutdown | RpcBrokerError::NoEndpoint { .. }
-                )
-        ) {
-            attempted.push((
-                endpoint.clone(),
-                EndpointHealthOutcome::for_result(&result.clone().into_result()),
-            ));
-        }
-        if !matches!(
-            &result,
-            AttemptOutcome::CallerError(error) | AttemptOutcome::Recoverable(error)
-                if should_failover_error(error)
-        ) {
+        let outcome = failover.attempt(&resources, endpoint).await;
+        if !failover.apply(endpoint, outcome) {
             break;
         }
     }
-    (result, attempted)
+    failover.into_output()
 }
 
 async fn execute_single_shared_waiter_attempt(

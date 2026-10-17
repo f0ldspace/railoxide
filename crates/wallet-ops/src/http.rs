@@ -884,11 +884,17 @@ impl HttpContext {
 
     #[cfg(test)]
     pub(crate) fn direct_for_tests() -> Self {
+        Self::direct_for_tests_with_candidate_order(|_| {})
+    }
+
+    /// Like `direct_for_tests`, with `candidate_order` arranging the broker's endpoint ties.
+    #[cfg(test)]
+    pub(crate) fn direct_for_tests_with_candidate_order(candidate_order: fn(&mut [usize])) -> Self {
         let rpc_client = reqwest::Client::new();
         Self {
             client: reqwest::Client::new(),
             rpc_client: rpc_client.clone(),
-            broker: RpcBroker::spawn(rpc_client)
+            broker: RpcBroker::spawn_with_candidate_order(rpc_client, candidate_order)
                 .expect("HttpContext test constructor requires an active Tokio runtime"),
             gateway_pool: GatewayPool::new(),
             proxy_url: None,
@@ -907,7 +913,7 @@ impl HttpContext {
         rpc_client: reqwest::Client,
         mode: WalletNetworkMode,
     ) -> Self {
-        let broker = RpcBroker::spawn(rpc_client.clone())
+        let broker = RpcBroker::spawn_with_candidate_order(rpc_client.clone(), |_| {})
             .expect("HttpContext test constructor requires an active Tokio runtime");
         Self {
             client: reqwest::Client::new(),

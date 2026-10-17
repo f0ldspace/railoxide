@@ -1,9 +1,11 @@
 use alloy::providers::{Provider, ProviderBuilder};
 use broadcaster_core::query_rpc_pool::{QueryRpcPool, RpcAdmission};
-use futures_util::future::join_all;
+use futures_util::future::{self, Join, Ready, join_all};
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use poi::SensitiveUrl;
+use rand::seq::SliceRandom as _;
 use std::fmt::{self, Display};
+use std::future::Future;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -20,6 +22,50 @@ const SYNC_ADMISSION_BACKOFF: AdmissionBackoff = AdmissionBackoff {
     initial: Duration::from_secs(30),
     max: Duration::from_mins(5),
 };
+
+/// Orders candidate endpoint indices in place before probing or selection.
+pub(crate) type CandidateOrder = fn(&mut [usize]);
+
+/// Shuffles candidates so no configured position gets a fixed preference.
+pub(crate) fn random_candidate_order(indices: &mut [usize]) {
+    indices.shuffle(&mut rand::rng());
+}
+
+/// Runs at most `limit` probes at once and yields each keyed result as it completes. The owner
+/// decides when work becomes eligible; the runner never spawns tasks or retries.
+pub(super) struct ProbeRunner<K, F: Future> {
+    limit: usize,
+    in_flight: FuturesUnordered<Join<Ready<K>, F>>,
+}
+
+impl<K, F: Future> ProbeRunner<K, F> {
+    pub(super) fn new(limit: usize) -> Self {
+        debug_assert!(limit > 0, "a probe runner needs at least one slot");
+        Self {
+            limit: limit.max(1),
+            in_flight: FuturesUnordered::new(),
+        }
+    }
+
+    pub(super) fn has_capacity(&self) -> bool {
+        self.in_flight.len() < self.limit
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.in_flight.is_empty()
+    }
+
+    /// Callers check `has_capacity` first.
+    pub(super) fn push(&self, key: K, probe: F) {
+        debug_assert!(self.has_capacity(), "probe runner is full");
+        self.in_flight.push(future::join(future::ready(key), probe));
+    }
+
+    /// Returns the next finished probe, or `None` when nothing is in flight.
+    pub(super) async fn next(&mut self) -> Option<(K, F::Output)> {
+        self.in_flight.next().await
+    }
+}
 
 /// Per-endpoint retry delay after a failed probe; it doubles up to `max`.
 #[derive(Clone, Copy)]
@@ -101,6 +147,7 @@ impl RpcChainRoute {
     fn endpoint_verification(&self, endpoint: &SensitiveUrl) -> &tokio::sync::OnceCell<()> {
         &self
             .verified_identities
+            .endpoints
             .iter()
             .find(|(url, _)| url == endpoint)
             .expect("endpoint belongs to this route")
@@ -109,6 +156,12 @@ impl RpcChainRoute {
 
     pub(super) fn endpoint_identity_verified(&self, endpoint: &SensitiveUrl) -> bool {
         !self.requires_identity_verification() || self.endpoint_verification(endpoint).initialized()
+    }
+
+    /// Completes after a later successful identity check on this route or a clone. Create it
+    /// before reading the cache so a check that finishes in between still wakes it.
+    pub(super) fn identity_checked(&self) -> tokio::sync::futures::Notified<'_> {
+        self.verified_identities.checked.notified()
     }
 
     /// Successful checks belong to this immutable route and its clones. Failed checks
@@ -122,7 +175,7 @@ impl RpcChainRoute {
         if !self.requires_identity_verification() {
             return Ok(());
         }
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             timeout,
             self.endpoint_verification(endpoint)
                 .get_or_try_init(|| async {
@@ -140,7 +193,12 @@ impl RpcChainRoute {
         )
         .await
         .map_err(|_| RpcBrokerError::Timeout)?
-        .copied()
+        .copied();
+        if result.is_ok() {
+            // Wakes parked jobs on this route, whichever clone verified the endpoint.
+            self.verified_identities.checked.notify_waiters();
+        }
+        result
     }
 
     /// Logs the outcome under `label` (a configured index or `archive`), never the URL.
@@ -210,8 +268,14 @@ impl RpcChainRoute {
         pool: &Arc<QueryRpcPool>,
         archive: Option<SensitiveUrl>,
     ) -> Result<(), RpcBrokerError> {
-        self.admit_pool(client, pool, archive, SYNC_ADMISSION_BACKOFF)
-            .await
+        self.admit_pool(
+            client,
+            pool,
+            archive,
+            SYNC_ADMISSION_BACKOFF,
+            random_candidate_order,
+        )
+        .await
     }
 
     async fn admit_pool(
@@ -220,6 +284,7 @@ impl RpcChainRoute {
         pool: &Arc<QueryRpcPool>,
         archive: Option<SensitiveUrl>,
         backoff: AdmissionBackoff,
+        order: CandidateOrder,
     ) -> Result<(), RpcBrokerError> {
         let chain_id = self.chain_id();
         if self.endpoints().is_empty() {
@@ -231,6 +296,7 @@ impl RpcChainRoute {
             Arc::downgrade(pool),
             archive,
             backoff,
+            order,
             report,
         ));
         if admitted.await.unwrap_or(false) {
@@ -241,13 +307,15 @@ impl RpcChainRoute {
     }
 
     /// Runs until every endpoint is admitted or excluded, or until the pool is dropped. Only a
-    /// weak pool reference is held, so dropping the pool stops all probing.
+    /// weak pool reference is held, so dropping the pool stops all probing. `order` arranges the
+    /// initial regular probes once; retries and the archive are not reordered.
     async fn run_pool_admission(
         self,
         client: reqwest::Client,
         pool: Weak<QueryRpcPool>,
         archive: Option<SensitiveUrl>,
         backoff: AdmissionBackoff,
+        order: CandidateOrder,
         report: oneshot::Sender<bool>,
     ) {
         let archive = archive.map(|url| {
@@ -255,8 +323,11 @@ impl RpcChainRoute {
             (route, url)
         });
         let regular_count = self.endpoints().len();
+        let mut regular = (0..regular_count).collect::<Vec<_>>();
+        order(&mut regular);
         let now = Instant::now();
-        let mut queued = (0..regular_count)
+        let mut queued = regular
+            .into_iter()
             .map(AdmissionSlot::Provider)
             .chain(archive.is_some().then_some(AdmissionSlot::Archive))
             .map(|slot| AdmissionProbe {
@@ -267,8 +338,8 @@ impl RpcChainRoute {
             })
             .collect::<Vec<_>>();
         let client = &client;
-        let start_probe = |probe: AdmissionProbe| {
-            let (route, endpoint) = match probe.slot {
+        let start_probe = |slot: AdmissionSlot| {
+            let (route, endpoint) = match slot {
                 AdmissionSlot::Provider(index) => (&self, &self.endpoints()[index]),
                 AdmissionSlot::Archive => {
                     let (route, url) = archive.as_ref().expect("archive probes need an archive");
@@ -276,40 +347,40 @@ impl RpcChainRoute {
                 }
             };
             async move {
-                let result = route
-                    .verify_labeled_endpoint_identity(client, endpoint, &probe.slot)
-                    .await;
-                (probe, result)
+                route
+                    .verify_labeled_endpoint_identity(client, endpoint, &slot)
+                    .await
             }
         };
         let mut report = Some(report);
         let mut first_failures = 0;
-        let mut in_flight = FuturesUnordered::new();
+        let mut probes = ProbeRunner::new(MAX_IDENTITY_PROBES);
         loop {
             let now = Instant::now();
-            while in_flight.len() < MAX_IDENTITY_PROBES {
+            while probes.has_capacity() {
                 let Some(position) = queued.iter().position(|probe| probe.due <= now) else {
                     break;
                 };
                 if pool.strong_count() == 0 {
                     return;
                 }
-                in_flight.push(start_probe(queued.remove(position)));
+                let probe = queued.remove(position);
+                probes.push(probe, start_probe(probe.slot));
             }
-            if in_flight.is_empty() && queued.is_empty() {
+            if probes.is_empty() && queued.is_empty() {
                 return;
             }
             let mut wake = now + POOL_LIVENESS_INTERVAL;
-            if in_flight.len() < MAX_IDENTITY_PROBES
+            if probes.has_capacity()
                 && let Some(due) = queued.iter().map(|probe| probe.due).min()
             {
                 wake = wake.min(due);
             }
-            let finished = if in_flight.is_empty() {
+            let finished = if probes.is_empty() {
                 tokio::time::sleep_until(wake).await;
                 None
             } else {
-                tokio::time::timeout_at(wake, in_flight.next())
+                tokio::time::timeout_at(wake, probes.next())
                     .await
                     .ok()
                     .flatten()
@@ -531,6 +602,7 @@ mod tests {
                 &pool,
                 Some(wrong_archive.into()),
                 FAST_BACKOFF,
+                |_| {},
             )
             .await
             .expect("the good endpoint admits the pool");
@@ -579,6 +651,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_probe_order_fills_slots_and_keeps_configured_indices() {
+        let mut endpoints = Vec::new();
+        let mut held_servers = Vec::new();
+        for _ in 0..MAX_IDENTITY_PROBES {
+            let (endpoint, server, _) = held_chain_id_mock(CHAIN_ID).await;
+            endpoints.push(endpoint);
+            held_servers.push(server);
+        }
+        let (fast, fast_server) =
+            spawn_rpc_mock(chain_id_responder(CHAIN_ID), Arc::default(), Arc::default()).await;
+        endpoints.push(fast);
+        let http = crate::HttpContext::direct_for_tests();
+        let route = RpcChainRoute::new(CHAIN_ID, endpoints).with_identity_verification();
+        let pool = pending_pool(&route, &http.rpc_client, false);
+
+        // In configured order the held prefix would occupy every probe slot until it times out.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            route.admit_pool(&http.rpc_client, &pool, None, FAST_BACKOFF, |indices| {
+                indices.reverse();
+            }),
+        )
+        .await
+        .expect("the reordered fast endpoint is probed in the first window")
+        .expect("the fast endpoint admits the pool");
+        assert_eq!(available(&pool), vec![MAX_IDENTITY_PROBES]);
+        for server in held_servers {
+            server.abort();
+        }
+        fast_server.abort();
+    }
+
+    #[tokio::test]
     async fn failed_checks_retry_until_admitted_and_stop_with_the_pool() {
         let flaky_failing = Arc::new(AtomicBool::new(true));
         let (flaky, flaky_server, flaky_requests) =
@@ -593,7 +698,7 @@ mod tests {
         let pool = pending_pool(&route, &http.rpc_client, false);
 
         route
-            .admit_pool(&http.rpc_client, &pool, None, FAST_BACKOFF)
+            .admit_pool(&http.rpc_client, &pool, None, FAST_BACKOFF, |_| {})
             .await
             .expect("the good endpoint admits the pool");
         // A second request proves the failed check is retried; failures keep it pending.

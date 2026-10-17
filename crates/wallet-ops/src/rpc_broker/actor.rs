@@ -1,18 +1,22 @@
 use super::cache::ReadCache;
+use super::capacity::{CapacityLedger, JobControl, JobResources, JobSlots, SlotKind, SlotRequest};
+use super::identity::CandidateOrder;
 use super::model::RpcResult;
 use super::model::{
     JsonRpcFailurePolicy, RpcBrokerError, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
 };
 use super::profile::EndpointProfile;
 use super::resolution::{ActiveWork, ReadReply, WaiterPolicy, WaiterState, WorkItem, WorkKey};
-use super::scheduler::{ExecutionJob, ReadyScheduler, RouteLoad};
+use super::scheduler::{Claim, ExecutionJob, ReadyScheduler, RouteLoad};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::futures::Notified;
+use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use url::Url;
 
@@ -109,10 +113,10 @@ pub(super) enum BlockEvent {
 
 pub(super) type JobExecutor = Arc<
     dyn Fn(
-            reqwest::Client,
-            Arc<Semaphore>,
+            JobResources,
             ExecutionJob,
             Vec<poi::SensitiveUrl>,
+            JobControl,
         ) -> BoxFuture<'static, JobOutput>
         + Send
         + Sync,
@@ -126,21 +130,49 @@ pub(super) enum Command {
     },
 }
 
+/// How a claimed job starts.
+#[derive(Clone, Copy)]
+enum StartMode {
+    /// With a read slot, and a probe runner if it needs one and one is free.
+    Read,
+    /// With a probe runner only, because no selected endpoint can read yet.
+    Verify,
+}
+
+/// Whether a queued job can use a read slot now: its route needs no identity verification, or
+/// one of its endpoints is already verified.
+fn job_read_ready(job: &ExecutionJob) -> bool {
+    job.first().is_none_or(|item| {
+        let route = item.execution_route.chain_route();
+        !route.requires_identity_verification()
+            || route
+                .endpoints()
+                .iter()
+                .any(|endpoint| route.endpoint_identity_verified(endpoint))
+    })
+}
+
 pub(super) struct Actor {
-    client: reqwest::Client,
     rx: mpsc::Receiver<Command>,
     interval: Duration,
-    semaphore: Arc<Semaphore>,
+    resources: JobResources,
     executor: JobExecutor,
     pending: Vec<Pending>,
     active: HashMap<WorkKey, ActiveWork>,
     next_work_nonce: u64,
     jobs: FuturesUnordered<BoxFuture<'static, JobOutput>>,
+    /// Bounds read-active jobs and, separately, jobs owning a probe runner.
     max_in_flight: usize,
+    ledger: Arc<CapacityLedger>,
+    slot_tx: mpsc::UnboundedSender<SlotRequest>,
+    slot_rx: mpsc::UnboundedReceiver<SlotRequest>,
+    /// Started jobs waiting for a probe runner, oldest first.
+    runner_waiters: VecDeque<SlotRequest>,
     scheduler: ReadyScheduler,
-    profiles: HashMap<(u64, Url), EndpointProfile>,
+    pub(super) profiles: HashMap<(u64, Url), EndpointProfile>,
     cache: ReadCache,
     next_flush_at: Option<Instant>,
+    candidate_order: CandidateOrder,
 }
 
 impl Actor {
@@ -150,29 +182,47 @@ impl Actor {
         interval: Duration,
         max_in_flight: usize,
         executor: JobExecutor,
+        candidate_order: CandidateOrder,
     ) -> Self {
+        let (slot_tx, slot_rx) = mpsc::unbounded_channel();
         Self {
-            client,
             rx,
             interval,
-            // Top-level jobs are capped by `max_in_flight`; this semaphore independently caps
-            // physical HTTP attempts, including concurrent reduction fan-out within one job.
-            semaphore: Arc::new(Semaphore::new(max_in_flight)),
+            // Read slots and probe runners are counted by the ledger; these semaphores
+            // independently cap physical HTTP attempts, including concurrent reduction fan-out
+            // within one job, and identity probes.
+            resources: JobResources::new(client, max_in_flight),
             executor,
             pending: Vec::new(),
             active: HashMap::new(),
             next_work_nonce: 1,
             jobs: FuturesUnordered::new(),
             max_in_flight,
+            ledger: CapacityLedger::new(),
+            slot_tx,
+            slot_rx,
+            runner_waiters: VecDeque::new(),
             scheduler: ReadyScheduler::new(),
             profiles: HashMap::new(),
             cache: ReadCache::default(),
             next_flush_at: None,
+            candidate_order,
         }
     }
     pub(super) async fn run(mut self, mut block_rx: mpsc::UnboundedReceiver<BlockEvent>) {
         let mut block_events_closed = false;
         loop {
+            // Queued work that cannot read yet becomes ready when its route verifies an
+            // endpoint. A check outside the broker signals only that route's clones.
+            let watched = self.scheduler.unready_routes(job_read_ready);
+            let mut checks = watched
+                .iter()
+                .map(|route| Box::pin(route.identity_checked()))
+                .collect::<Vec<Pin<Box<Notified<'_>>>>>();
+            // Subscribed first, so this pump sees a check that finished since the last one and a
+            // later check wakes the select below.
+            self.pump_ready();
+            let ledger = Arc::clone(&self.ledger);
             let next_wake = self.next_wake_at();
             let timer = async move {
                 if let Some(deadline) = next_wake {
@@ -210,6 +260,10 @@ impl Actor {
                     }
                     None => {
                         self.fail_pending(&RpcBrokerError::Shutdown);
+                        // Running jobs waiting for a slot settle their work as shut down.
+                        self.slot_rx.close();
+                        while self.slot_rx.try_recv().is_ok() {}
+                        self.runner_waiters.clear();
                         self.fail_ready(&RpcBrokerError::Shutdown);
                         self.drain_jobs().await;
                         self.fail_ready(&RpcBrokerError::Shutdown);
@@ -253,6 +307,18 @@ impl Actor {
                     self.complete_job(output);
                     self.pump_ready();
                 },
+                Some(request) = self.slot_rx.recv() => {
+                    match request.kind {
+                        SlotKind::Read => self.admit_resume(request),
+                        SlotKind::Runner => self.runner_waiters.push_back(request),
+                    }
+                    self.pump_ready();
+                },
+                () = ledger.changed() => self.pump_ready(),
+                // Built inside the branch because `select_all` panics on an empty set.
+                () = async {
+                    futures_util::future::select_all(checks.iter_mut()).await;
+                }, if !checks.is_empty() => self.pump_ready(),
             }
         }
     }
@@ -448,13 +514,44 @@ impl Actor {
             });
         }
     }
+    /// Hands free read slots to fairly scheduled read-ready work, then free probe runners to
+    /// waiting jobs and queued work that cannot read yet.
     pub(super) fn pump_ready(&mut self) {
         self.expire_ready();
-        while let Some(job) = self.scheduler.next(self.jobs.len(), self.max_in_flight) {
-            self.start_job(job);
+        while self.ledger.held(SlotKind::Read) < self.max_in_flight {
+            match self.scheduler.next(job_read_ready) {
+                Some(Claim::Queued(job)) => self.start_job(job, StartMode::Read),
+                Some(Claim::Resume(request)) => request.grant(),
+                None => break,
+            }
+        }
+        while self.ledger.held(SlotKind::Runner) < self.max_in_flight {
+            if let Some(request) = self.runner_waiters.pop_front() {
+                request.grant();
+            } else if let Some(job) = self.scheduler.next_verification(job_read_ready) {
+                self.start_job(job, StartMode::Verify);
+            } else {
+                break;
+            }
         }
     }
-    fn start_job(&mut self, job: ExecutionJob) {
+    /// Queues a started job's read request under the current origins of its work, including
+    /// callers that joined it after the job started.
+    fn admit_resume(&mut self, request: SlotRequest) {
+        if request.grant.is_closed() {
+            return;
+        }
+        let mut origins: Vec<RpcOrigin> = Vec::new();
+        for active in request.keys.iter().filter_map(|key| self.active.get(key)) {
+            for origin in &active.origins {
+                if !origins.contains(origin) {
+                    origins.push(origin.clone());
+                }
+            }
+        }
+        self.scheduler.admit_resume(request, origins);
+    }
+    fn start_job(&mut self, job: ExecutionJob, mode: StartMode) {
         let now = Instant::now();
         let job = match job {
             ExecutionJob::Aggregate(items) => {
@@ -514,8 +611,37 @@ impl Actor {
                 return;
             }
         };
-        let future = (self.executor)(self.client.clone(), self.semaphore.clone(), job, selected);
-        self.jobs.push(future);
+        let route = first.execution_route.chain_route();
+        let needs_runner = selected
+            .iter()
+            .any(|endpoint| !route.endpoint_identity_verified(endpoint));
+        let keys = job.items().iter().map(|item| item.key.clone()).collect();
+        let slots = JobSlots::new(Arc::clone(&self.ledger));
+        match mode {
+            StartMode::Read => {
+                slots.acquire(SlotKind::Read);
+                // Jobs already waiting for a runner keep their turn.
+                if needs_runner
+                    && self.ledger.held(SlotKind::Runner) + self.runner_waiters.len()
+                        < self.max_in_flight
+                {
+                    slots.acquire(SlotKind::Runner);
+                }
+            }
+            StartMode::Verify => slots.acquire(SlotKind::Runner),
+        }
+        let control = JobControl::new(
+            Arc::clone(&slots),
+            self.slot_tx.clone(),
+            matches!(job, ExecutionJob::Aggregate(_)),
+            keys,
+        );
+        let future = (self.executor)(self.resources.clone(), job, selected, control);
+        // The actor keeps the slots until the job finishes, even if an executor drops its control.
+        self.jobs.push(Box::pin(async move {
+            let _slots = slots;
+            future.await
+        }));
     }
     pub(super) fn select_route(
         &mut self,
@@ -529,6 +655,7 @@ impl Actor {
         let now = Instant::now();
         let mut candidates = Vec::new();
         let mut withdrawn = Vec::new();
+        let mut counts = Vec::with_capacity(route.endpoints().len());
         for (index, endpoint) in route.endpoints().iter().enumerate() {
             let url = endpoint.expose_url().clone();
             let profile = self
@@ -542,10 +669,11 @@ impl Actor {
                     "RPC endpoint restored"
                 );
             }
+            counts.push(profile.request_count);
             if profile.is_withdrawn(now) {
-                withdrawn.push((profile.request_count, index));
+                withdrawn.push(index);
             } else {
-                candidates.push((profile.request_count, index));
+                candidates.push(index);
             }
         }
         let all_withdrawn = candidates.is_empty();
@@ -556,10 +684,12 @@ impl Actor {
             );
         }
         let mut ordered = if all_withdrawn { withdrawn } else { candidates };
-        ordered.sort_by_key(|(count, _)| *count);
+        // The hook orders ties; the stable sort still puts lower session counts first.
+        (self.candidate_order)(&mut ordered);
+        ordered.sort_by_key(|&index| counts[index]);
         let endpoints = ordered
             .into_iter()
-            .map(|(_, index)| route.endpoints()[index].clone())
+            .map(|index| route.endpoints()[index].clone())
             .collect::<Vec<_>>();
         Ok(endpoints)
     }

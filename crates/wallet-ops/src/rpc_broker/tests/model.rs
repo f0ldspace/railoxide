@@ -315,12 +315,12 @@ fn expired_aggregate_member_cannot_be_claimed_by_its_stale_origin_lane() {
     scheduler.admit_chunks(vec![vec![expired, survivor], vec![backlog]]);
     scheduler.expire(Instant::now());
 
-    let first = scheduler.next(0, 1).expect("origin A backlog");
+    let first = scheduler.next_ready().expect("origin A backlog");
     assert_eq!(
         read_calldata(&first.first().unwrap().read),
         Bytes::from_static(b"backlog")
     );
-    let second = scheduler.next(0, 1).expect("origin B survivor");
+    let second = scheduler.next_ready().expect("origin B survivor");
     assert_eq!(
         read_calldata(&second.first().unwrap().read),
         Bytes::from_static(b"survivor")
@@ -375,12 +375,12 @@ fn expired_individual_generation_cannot_claim_a_later_same_key_admission() {
     scheduler.expire(Instant::now());
     scheduler.admit_chunks(vec![vec![later]]);
 
-    let first = scheduler.next(0, 1).expect("origin A backlog");
+    let first = scheduler.next_ready().expect("origin A backlog");
     assert_eq!(
         read_calldata(&first.first().unwrap().read),
         Bytes::from_static(b"a-backlog")
     );
-    let second = scheduler.next(0, 1).expect("origin B later generation");
+    let second = scheduler.next_ready().expect("origin B later generation");
     assert_eq!(
         read_calldata(&second.first().unwrap().read),
         Bytes::from_static(b"same-key")
@@ -443,17 +443,17 @@ fn ready_origins_round_robin_across_aggregate_and_individual_work() {
     let mut scheduler = ReadyScheduler::new();
     scheduler.partition_and_admit(vec![aggregate_a, individual_a, aggregate_b]);
 
-    let first = scheduler.next(0, 1).expect("first origin work");
+    let first = scheduler.next_ready().expect("first origin work");
     assert_eq!(
         read_calldata(&first.first().expect("first item").read),
         Bytes::from_static(b"a-aggregate")
     );
-    let second = scheduler.next(0, 1).expect("second origin work");
+    let second = scheduler.next_ready().expect("second origin work");
     assert_eq!(
         read_calldata(&second.first().expect("second item").read),
         Bytes::from_static(b"b-aggregate")
     );
-    let third = scheduler.next(0, 1).expect("first origin's next work");
+    let third = scheduler.next_ready().expect("first origin's next work");
     assert_eq!(
         read_calldata(&third.first().expect("third item").read),
         Bytes::from_static(b"a-individual")
@@ -494,7 +494,7 @@ fn partition_grouping_preserves_first_seen_group_and_member_order() {
         item(route_b, b"b2"),
     ]);
 
-    let first = scheduler.next(0, 1).expect("first aggregate");
+    let first = scheduler.next_ready().expect("first aggregate");
     let ExecutionJob::Aggregate(first) = first else {
         panic!("expected first group to be aggregate");
     };
@@ -506,7 +506,7 @@ fn partition_grouping_preserves_first_seen_group_and_member_order() {
         vec![Bytes::from_static(b"a1"), Bytes::from_static(b"a2")]
     );
 
-    let second = scheduler.next(0, 1).expect("second aggregate");
+    let second = scheduler.next_ready().expect("second aggregate");
     let ExecutionJob::Aggregate(second) = second else {
         panic!("expected second group to be aggregate");
     };
@@ -561,22 +561,22 @@ fn ready_shared_work_is_claimed_once_by_the_attached_origin_lane() {
     scheduler.partition_and_admit(vec![first, second, shared]);
     assert!(scheduler.attach(&shared_key, &origin_b));
 
-    let first_job = scheduler.next(0, 1).expect("origin A backlog");
+    let first_job = scheduler.next_ready().expect("origin A backlog");
     assert_eq!(
         read_calldata(&first_job.first().expect("first item").read),
         Bytes::from_static(b"backlog")
     );
-    let shared_job = scheduler.next(0, 1).expect("origin B shared work");
+    let shared_job = scheduler.next_ready().expect("origin B shared work");
     assert_eq!(
         read_calldata(&shared_job.first().expect("shared item").read),
         Bytes::from_static(b"shared")
     );
-    let second_job = scheduler.next(0, 1).expect("origin A second backlog");
+    let second_job = scheduler.next_ready().expect("origin A second backlog");
     assert_eq!(
         read_calldata(&second_job.first().expect("second item").read),
         Bytes::from_static(b"backlog-2")
     );
-    assert!(scheduler.next(0, 1).is_none());
+    assert!(scheduler.next_ready().is_none());
 }
 
 #[test]
@@ -631,22 +631,22 @@ fn ready_shared_aggregate_is_claimed_once_by_the_attached_origin_lane() {
     scheduler.partition_and_admit(vec![first, second, shared]);
     assert!(scheduler.attach(&shared_key, &origin_b));
 
-    let first_job = scheduler.next(0, 1).expect("origin A first aggregate");
+    let first_job = scheduler.next_ready().expect("origin A first aggregate");
     assert_eq!(
         read_calldata(&first_job.first().expect("first item").read),
         Bytes::from_static(b"aggregate-a1")
     );
-    let shared_job = scheduler.next(0, 1).expect("origin B shared aggregate");
+    let shared_job = scheduler.next_ready().expect("origin B shared aggregate");
     assert_eq!(
         read_calldata(&shared_job.first().expect("shared item").read),
         Bytes::from_static(b"aggregate-shared")
     );
-    let second_job = scheduler.next(0, 1).expect("origin A second aggregate");
+    let second_job = scheduler.next_ready().expect("origin A second aggregate");
     assert_eq!(
         read_calldata(&second_job.first().expect("second item").read),
         Bytes::from_static(b"aggregate-a2")
     );
-    assert!(scheduler.next(0, 1).is_none());
+    assert!(scheduler.next_ready().is_none());
 }
 
 #[test]
@@ -745,6 +745,61 @@ async fn route_selection_spreads_requests_across_configured_endpoints() {
     drop(broker);
     first_server.abort();
     second_server.abort();
+}
+
+#[test]
+fn route_selection_orders_ties_by_hook_after_health_and_count() {
+    let (_tx, rx) = mpsc::channel(1);
+    let mut actor = Actor::new(
+        reqwest::Client::new(),
+        rx,
+        Duration::from_secs(30),
+        1,
+        test_executor(),
+        <[usize]>::reverse,
+    );
+    let urls = (0..4)
+        .map(|index| Url::parse(&format!("https://endpoint-{index}.invalid")).unwrap())
+        .collect::<Vec<_>>();
+    let route = RpcRoute::from(RpcChainRoute::new(1, urls.clone()));
+    let cooldown = Instant::now() + Duration::from_secs(60);
+    // Endpoints 0 and 1 tie, 2 has a higher count, and 3 is withdrawn despite the lowest count.
+    for (index, request_count) in [1, 1, 5, 0].into_iter().enumerate() {
+        actor.profiles.insert(
+            (1, urls[index].clone()),
+            EndpointProfile {
+                request_count,
+                withdrawn_until: (index == 3).then_some(cooldown),
+                ..EndpointProfile::default()
+            },
+        );
+    }
+    let selected = |actor: &mut Actor| {
+        actor
+            .select_route(&route)
+            .expect("route has endpoints")
+            .iter()
+            .map(|endpoint| endpoint.expose_url().clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        selected(&mut actor),
+        vec![urls[1].clone(), urls[0].clone(), urls[2].clone()]
+    );
+
+    for profile in actor.profiles.values_mut() {
+        profile.withdrawn_until = Some(cooldown);
+    }
+    assert_eq!(
+        selected(&mut actor),
+        vec![
+            urls[3].clone(),
+            urls[1].clone(),
+            urls[0].clone(),
+            urls[2].clone()
+        ]
+    );
 }
 
 #[test]

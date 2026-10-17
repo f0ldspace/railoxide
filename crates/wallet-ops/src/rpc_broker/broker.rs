@@ -1,5 +1,6 @@
 use super::actor::{Actor, BlockEvent, Command, JobExecutor};
 use super::execution::run_job;
+use super::identity::{CandidateOrder, random_candidate_order};
 use super::model::{
     DEFAULT_INTERVAL, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError, RpcBrokerSpawnError, RpcOrigin,
     RpcRead, RpcResult, RpcRoute, RpcSubmission,
@@ -43,6 +44,7 @@ impl RpcBroker {
             DEFAULT_MAX_IN_FLIGHT,
             SUBMISSION_CAPACITY,
             default_executor(),
+            random_candidate_order,
         )
     }
 
@@ -58,6 +60,7 @@ impl RpcBroker {
             DEFAULT_MAX_IN_FLIGHT,
             SUBMISSION_CAPACITY,
             default_executor(),
+            random_candidate_order,
         )
     }
 
@@ -68,6 +71,7 @@ impl RpcBroker {
         max_in_flight: usize,
         submission_capacity: NonZeroUsize,
         executor: JobExecutor,
+        candidate_order: CandidateOrder,
     ) -> Result<Arc<Self>, RpcBrokerSpawnError> {
         if submission_capacity.get() > Semaphore::MAX_PERMITS {
             return Err(RpcBrokerSpawnError::InvalidSubmissionCapacity);
@@ -79,8 +83,17 @@ impl RpcBroker {
             block_tx,
             admission: Arc::new(Semaphore::new(submission_capacity.get())),
         });
-        let actor = handle
-            .spawn(Actor::new(client, rx, interval, max_in_flight.max(1), executor).run(block_rx));
+        let actor = handle.spawn(
+            Actor::new(
+                client,
+                rx,
+                interval,
+                max_in_flight.max(1),
+                executor,
+                candidate_order,
+            )
+            .run(block_rx),
+        );
         if actor.is_finished() {
             return Err(RpcBrokerSpawnError::ActorStartup);
         }
@@ -98,7 +111,7 @@ impl RpcBroker {
 }
 
 pub(super) fn default_executor() -> JobExecutor {
-    Arc::new(|client, semaphore, group, endpoints| run_job(client, semaphore, group, endpoints))
+    Arc::new(|resources, group, endpoints, control| run_job(resources, group, endpoints, control))
 }
 
 impl RpcBroker {

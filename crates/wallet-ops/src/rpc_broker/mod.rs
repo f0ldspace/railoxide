@@ -5,13 +5,15 @@
 //! Exact transaction-hash reads require a typed dapp origin; upstream consumers must authenticate
 //! and authorize requests and resolve wallet-tracked hashes without exact-hash fallback.
 //!
-//! Execution has two concurrency levels: `max_in_flight` bounds top-level actor jobs, while the
-//! shared semaphore separately bounds concurrent physical HTTP attempts created by reduction
-//! fan-out inside a job.
+//! `max_in_flight` separately bounds jobs executing reads, jobs driving identity probes, and
+//! concurrent physical HTTP attempts, including reduction fan-out inside a job. Identity probes
+//! also share a smaller broker-wide budget so that verification alone cannot occupy every HTTP
+//! permit.
 
 mod actor;
 mod broker;
 mod cache;
+mod capacity;
 mod execution;
 mod identity;
 mod model;

@@ -1,7 +1,9 @@
+use super::capacity::SlotRequest;
 use super::model::RpcResult;
 use super::model::{BlockKey, RpcBrokerError, RpcChainRoute, RpcOrigin, RpcRoute, RpcSubmission};
 use super::resolution::{WorkItem, WorkKey};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use tokio::time::Instant;
 
 pub(super) enum ExecutionJob {
@@ -130,13 +132,31 @@ struct OriginLanes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReadyId(u64);
 
-/// Owns work that has been resolved but is waiting for an execution slot.
+enum Entry {
+    /// Resolved work that has not started.
+    Queued(ExecutionJob),
+    /// A started job asking for a read slot again. The job keeps its execution state; this entry
+    /// only holds its place in fair scheduling under the current origins of the job's work.
+    Resume {
+        request: SlotRequest,
+        origins: Vec<RpcOrigin>,
+    },
+}
+
+pub(super) enum Claim {
+    Queued(ExecutionJob),
+    Resume(SlotRequest),
+}
+
+/// Owns work that has been resolved but is waiting for a read slot, and started jobs waiting to
+/// resume reading.
 ///
-/// `jobs` is the sole owner of executable work. Origin queues contain only generation references
+/// `jobs` is the sole owner of these entries. Origin queues contain only generation references
 /// into that map, so a deduplicated item attached to several origins is claimed once and leaves
-/// stale references that can be discarded without consuming an execution slot.
+/// stale references that can be discarded without consuming a read slot. References to entries
+/// that cannot read yet stay in place so later eligible work in the same lane is not blocked.
 pub(super) struct ReadyScheduler {
-    jobs: HashMap<ReadyId, ExecutionJob>,
+    jobs: HashMap<ReadyId, Entry>,
     key_index: HashMap<WorkKey, ReadyId>,
     lanes: HashMap<RpcOrigin, OriginLanes>,
     origins: VecDeque<RpcOrigin>,
@@ -154,12 +174,43 @@ impl ReadyScheduler {
         }
     }
 
+    /// Queued work only; a resuming job wakes itself on its deadlines.
     pub(super) fn deadlines(&self, mut consider: impl FnMut(Option<Instant>)) {
-        for job in self.jobs.values() {
+        for entry in self.jobs.values() {
+            let Entry::Queued(job) = entry else {
+                continue;
+            };
             for item in job.items() {
                 consider(item.waiters.merged_deadline());
             }
         }
+    }
+
+    /// Chain routes of queued work for which `ready` fails, one per verification cache. Equal
+    /// routes from separate configurations keep separate caches, so they are not merged.
+    pub(super) fn unready_routes(
+        &self,
+        ready: impl Fn(&ExecutionJob) -> bool,
+    ) -> Vec<RpcChainRoute> {
+        let mut routes: Vec<RpcChainRoute> = Vec::new();
+        for entry in self.jobs.values() {
+            let Entry::Queued(job) = entry else {
+                continue;
+            };
+            if ready(job) {
+                continue;
+            }
+            let Some(item) = job.first() else {
+                continue;
+            };
+            let route = item.execution_route.chain_route();
+            if !routes.iter().any(|watched| {
+                Arc::ptr_eq(&watched.verified_identities, &route.verified_identities)
+            }) {
+                routes.push(route.clone());
+            }
+        }
+        routes
     }
 
     fn lane_mut(&mut self, origin: &RpcOrigin) -> &mut OriginLanes {
@@ -177,16 +228,13 @@ impl ReadyScheduler {
         self.lanes.get_mut(origin).expect("origin lane inserted")
     }
 
+    /// Adds a deduplicated caller's origin to the queued or resuming entry that owns `key`.
     pub(super) fn attach(&mut self, key: &WorkKey, origin: &RpcOrigin) -> bool {
         let Some(&ready_id) = self.key_index.get(key) else {
             return false;
         };
-        let Some(job) = self.jobs.get_mut(&ready_id) else {
-            self.remove_index_if_current(key, ready_id);
-            return false;
-        };
-        let (is_aggregate, already_eligible) = match job {
-            ExecutionJob::Aggregate(items) => {
+        let (is_aggregate, already_eligible) = match self.jobs.get_mut(&ready_id) {
+            Some(Entry::Queued(ExecutionJob::Aggregate(items))) => {
                 let already_eligible = items.iter().any(|item| item.origins.contains(origin));
                 let item = items
                     .iter_mut()
@@ -195,10 +243,21 @@ impl ReadyScheduler {
                 item.origins.push(origin.clone());
                 (true, already_eligible)
             }
-            ExecutionJob::Individual(item) => {
+            Some(Entry::Queued(ExecutionJob::Individual(item))) => {
                 let already_eligible = item.origins.contains(origin);
                 item.origins.push(origin.clone());
                 (false, already_eligible)
+            }
+            Some(Entry::Resume { request, origins }) if !request.grant.is_closed() => {
+                let already_eligible = origins.contains(origin);
+                if !already_eligible {
+                    origins.push(origin.clone());
+                }
+                (request.aggregate, already_eligible)
+            }
+            _ => {
+                self.remove_index_if_current(key, ready_id);
+                return false;
             }
         };
         if !already_eligible {
@@ -238,38 +297,81 @@ impl ReadyScheduler {
         )
     }
 
-    fn pop_valid_ref(
+    /// Whether `entry` still belongs in `origin`'s lane of the given class. A resuming job that
+    /// stopped waiting no longer belongs anywhere.
+    fn entry_belongs(entry: &Entry, origin: &RpcOrigin, aggregate: bool) -> bool {
+        match entry {
+            Entry::Queued(job) => {
+                Self::job_class_matches(job, aggregate) && Self::job_has_origin(job, origin)
+            }
+            Entry::Resume { request, origins } => {
+                request.aggregate == aggregate
+                    && origins.contains(origin)
+                    && !request.grant.is_closed()
+            }
+        }
+    }
+
+    /// Removes and returns the first reference that can read now, with its position. Stale
+    /// references before it are discarded; blocked ones stay in place.
+    fn take_eligible_ref(
         &self,
         refs: &mut VecDeque<ReadyId>,
         origin: &RpcOrigin,
         aggregate: bool,
-    ) -> Option<ReadyId> {
-        while let Some(ready_id) = refs.pop_front() {
-            if self.jobs.get(&ready_id).is_some_and(|job| {
-                Self::job_class_matches(job, aggregate) && Self::job_has_origin(job, origin)
-            }) {
-                return Some(ready_id);
+        ready: &impl Fn(&ExecutionJob) -> bool,
+    ) -> Option<(usize, ReadyId)> {
+        let mut index = 0;
+        while let Some(&ready_id) = refs.get(index) {
+            match self
+                .jobs
+                .get(&ready_id)
+                .filter(|entry| Self::entry_belongs(entry, origin, aggregate))
+            {
+                None => {
+                    refs.remove(index);
+                }
+                Some(Entry::Queued(job)) if !ready(job) => index += 1,
+                Some(_) => {
+                    refs.remove(index);
+                    return Some((index, ready_id));
+                }
             }
         }
         None
     }
 
-    /// Removes origin references to jobs that have expired or been claimed.
+    /// Removes origin references to entries that have expired, been claimed, or stopped waiting.
     ///
-    /// Each remaining reference must point at a live job of the right class whose current members
-    /// make that origin eligible. Empty lanes and their origin-queue entries are removed as well.
+    /// Each remaining reference must point at a live entry of the right class whose current
+    /// members make that origin eligible. Empty lanes and their origin-queue entries are removed as
+    /// well.
     fn prune_refs(&mut self) {
+        let closed = self
+            .jobs
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry, Entry::Resume { request, .. } if request.grant.is_closed())
+            })
+            .map(|(&ready_id, _)| ready_id)
+            .collect::<Vec<_>>();
+        for ready_id in closed {
+            if let Some(Entry::Resume { request, .. }) = self.jobs.remove(&ready_id) {
+                // The same work may have been readmitted under a newer entry.
+                for key in &request.keys {
+                    self.remove_index_if_current(key, ready_id);
+                }
+            }
+        }
         let jobs = &self.jobs;
         self.lanes.retain(|origin, lane| {
             lane.aggregate.retain(|ready_id| {
-                jobs.get(ready_id).is_some_and(|job| {
-                    Self::job_class_matches(job, true) && Self::job_has_origin(job, origin)
-                })
+                jobs.get(ready_id)
+                    .is_some_and(|entry| Self::entry_belongs(entry, origin, true))
             });
             lane.individual.retain(|ready_id| {
-                jobs.get(ready_id).is_some_and(|job| {
-                    Self::job_class_matches(job, false) && Self::job_has_origin(job, origin)
-                })
+                jobs.get(ready_id)
+                    .is_some_and(|entry| Self::entry_belongs(entry, origin, false))
             });
             !lane.aggregate.is_empty() || !lane.individual.is_empty()
         });
@@ -305,7 +407,7 @@ impl ReadyScheduler {
                     self.key_index.insert(item.key.clone(), ready_id);
                 }
                 self.jobs
-                    .insert(ready_id, ExecutionJob::Aggregate(aggregate));
+                    .insert(ready_id, Entry::Queued(ExecutionJob::Aggregate(aggregate)));
                 for origin in origins {
                     self.lane_mut(&origin).aggregate.push_back(ready_id);
                 }
@@ -320,11 +422,38 @@ impl ReadyScheduler {
                 }
                 let ready_id = self.allocate_ready_id();
                 self.key_index.insert(key, ready_id);
-                self.jobs
-                    .insert(ready_id, ExecutionJob::Individual(Box::new(item)));
+                self.jobs.insert(
+                    ready_id,
+                    Entry::Queued(ExecutionJob::Individual(Box::new(item))),
+                );
                 for origin in origins {
                     self.lane_mut(&origin).individual.push_back(ready_id);
                 }
+            }
+        }
+    }
+
+    /// Queues a started job's read request behind each of `origins`' existing work. Its keys
+    /// index the entry so later deduplicated callers can attach their origins.
+    pub(super) fn admit_resume(&mut self, request: SlotRequest, origins: Vec<RpcOrigin>) {
+        let ready_id = self.allocate_ready_id();
+        let aggregate = request.aggregate;
+        for key in &request.keys {
+            self.key_index.insert(key.clone(), ready_id);
+        }
+        self.jobs.insert(
+            ready_id,
+            Entry::Resume {
+                request,
+                origins: origins.clone(),
+            },
+        );
+        for origin in origins {
+            let lane = self.lane_mut(&origin);
+            if aggregate {
+                lane.aggregate.push_back(ready_id);
+            } else {
+                lane.individual.push_back(ready_id);
             }
         }
     }
@@ -361,8 +490,14 @@ impl ReadyScheduler {
         let mut expired = Vec::new();
         let ids = self.jobs.keys().copied().collect::<Vec<_>>();
         for ready_id in ids {
-            let Some(job) = self.jobs.remove(&ready_id) else {
-                continue;
+            // A resuming job keeps its execution state and settles its own expiry.
+            let job = match self.jobs.remove(&ready_id) {
+                Some(Entry::Queued(job)) => job,
+                Some(entry) => {
+                    self.jobs.insert(ready_id, entry);
+                    continue;
+                }
+                None => continue,
             };
             match job {
                 ExecutionJob::Aggregate(items) => {
@@ -383,7 +518,7 @@ impl ReadyScheduler {
                         continue;
                     }
                     self.jobs
-                        .insert(ready_id, ExecutionJob::Aggregate(survivors));
+                        .insert(ready_id, Entry::Queued(ExecutionJob::Aggregate(survivors)));
                 }
                 ExecutionJob::Individual(item) => {
                     if item
@@ -394,7 +529,8 @@ impl ReadyScheduler {
                         self.remove_index_if_current(&item.key, ready_id);
                         expired.push((item.key, Err(RpcBrokerError::TimeoutBeforeDispatch)));
                     } else {
-                        self.jobs.insert(ready_id, ExecutionJob::Individual(item));
+                        self.jobs
+                            .insert(ready_id, Entry::Queued(ExecutionJob::Individual(item)));
                     }
                 }
             }
@@ -403,59 +539,98 @@ impl ReadyScheduler {
         expired
     }
 
-    pub(super) fn next(&mut self, jobs: usize, max_in_flight: usize) -> Option<ExecutionJob> {
-        if jobs >= max_in_flight {
-            return None;
-        }
-        while let Some(origin) = self.origins.pop_front() {
+    /// Claims the next entry that can use a read slot: queued work for which `ready` holds, or a
+    /// resuming job. Origins rotate round-robin and each origin alternates aggregate and
+    /// individual work among eligible entries. One call visits each current origin at most once.
+    pub(super) fn next(&mut self, ready: impl Fn(&ExecutionJob) -> bool) -> Option<Claim> {
+        for _ in 0..self.origins.len() {
+            let Some(origin) = self.origins.pop_front() else {
+                break;
+            };
             let Some(mut lane) = self.lanes.remove(&origin) else {
                 continue;
             };
-            let aggregate_ref = self.pop_valid_ref(&mut lane.aggregate, &origin, true);
-            let individual_ref = self.pop_valid_ref(&mut lane.individual, &origin, false);
+            let aggregate_ref = self.take_eligible_ref(&mut lane.aggregate, &origin, true, &ready);
+            let individual_ref =
+                self.take_eligible_ref(&mut lane.individual, &origin, false, &ready);
             let ready_id = match (aggregate_ref, individual_ref) {
-                (None, None) => {
-                    continue;
-                }
-                (Some(aggregate_ref), None) => {
+                (None, None) => None,
+                (Some((_, aggregate_ref)), None) => {
                     lane.prefer_aggregate = false;
-                    aggregate_ref
+                    Some(aggregate_ref)
                 }
-                (None, Some(individual_ref)) => {
+                (None, Some((_, individual_ref))) => {
                     lane.prefer_aggregate = true;
-                    individual_ref
+                    Some(individual_ref)
                 }
-                (Some(aggregate_ref), Some(individual_ref)) => {
+                (
+                    Some((aggregate_index, aggregate_ref)),
+                    Some((individual_index, individual_ref)),
+                ) => {
                     let choose_aggregate = lane.prefer_aggregate;
                     lane.prefer_aggregate = !lane.prefer_aggregate;
                     if choose_aggregate {
-                        lane.individual.push_front(individual_ref);
-                        aggregate_ref
+                        lane.individual.insert(individual_index, individual_ref);
+                        Some(aggregate_ref)
                     } else {
-                        lane.aggregate.push_front(aggregate_ref);
-                        individual_ref
+                        lane.aggregate.insert(aggregate_index, aggregate_ref);
+                        Some(individual_ref)
                     }
                 }
             };
-            let job = self.claim(ready_id);
             if !lane.aggregate.is_empty() || !lane.individual.is_empty() {
                 self.origins.push_back(origin.clone());
                 self.lanes.insert(origin, lane);
             }
+            let Some(ready_id) = ready_id else {
+                continue;
+            };
+            let claim = self.claim(ready_id);
             self.prune_refs();
-            if let Some(job) = job {
-                return Some(job);
+            if claim.is_some() {
+                return claim;
             }
         }
         None
     }
 
-    fn claim(&mut self, ready_id: ReadyId) -> Option<ExecutionJob> {
-        let job = self.jobs.remove(&ready_id)?;
-        for item in job.items() {
-            self.remove_index_if_current(&item.key, ready_id);
+    /// Claims the oldest queued job for which `ready` fails, to start it with a probe runner and
+    /// no read slot. Origin rotation is unaffected because no read slot is consumed.
+    pub(super) fn next_verification(
+        &mut self,
+        ready: impl Fn(&ExecutionJob) -> bool,
+    ) -> Option<ExecutionJob> {
+        let ready_id = self
+            .jobs
+            .iter()
+            .filter_map(|(ready_id, entry)| match entry {
+                Entry::Queued(job) if !ready(job) => Some(*ready_id),
+                _ => None,
+            })
+            .min_by_key(|ready_id| ready_id.0)?;
+        let claim = self.claim(ready_id);
+        self.prune_refs();
+        match claim {
+            Some(Claim::Queued(job)) => Some(job),
+            _ => None,
         }
-        Some(job)
+    }
+
+    fn claim(&mut self, ready_id: ReadyId) -> Option<Claim> {
+        match self.jobs.remove(&ready_id)? {
+            Entry::Queued(job) => {
+                for item in job.items() {
+                    self.remove_index_if_current(&item.key, ready_id);
+                }
+                Some(Claim::Queued(job))
+            }
+            Entry::Resume { request, .. } => {
+                for key in &request.keys {
+                    self.remove_index_if_current(key, ready_id);
+                }
+                Some(Claim::Resume(request))
+            }
+        }
     }
 
     pub(super) fn drain(
@@ -463,8 +638,11 @@ impl ReadyScheduler {
         error: &RpcBrokerError,
     ) -> Vec<(WorkKey, Result<RpcResult, RpcBrokerError>)> {
         let mut completions = Vec::new();
-        for job in self.jobs.drain().map(|(_, job)| job) {
-            completions.extend(job.into_iter().map(|item| (item.key, Err(error.clone()))));
+        // Dropping a resuming job's request fails its grant, and the job settles its own work.
+        for entry in self.jobs.drain().map(|(_, entry)| entry) {
+            if let Entry::Queued(job) = entry {
+                completions.extend(job.into_iter().map(|item| (item.key, Err(error.clone()))));
+            }
         }
         self.key_index.clear();
         self.lanes.clear();

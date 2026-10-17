@@ -2270,6 +2270,212 @@ mod tests {
         assert_eq!(cache.cached_rate(42, pending_token), None);
     }
 
+    /// One production refresh cycle whose Chainlink reads go through `http`'s broker.
+    async fn refresh_oracle_anchors_through_broker(
+        cache: &TokenAnchorRateCache,
+        entries: &[RuntimeTokenAnchorInfo],
+        effective_chains: &EffectiveChainRegistry,
+        http: &HttpContext,
+    ) {
+        refresh_token_anchor_rates_with_fetch(
+            cache,
+            entries,
+            oracle_addresses_for_entries(entries),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            TOKEN_ANCHOR_CHAIN_REFRESH_TIMEOUT,
+            |plan| {
+                Box::pin(async move {
+                    let AnchorSourcePlan::Chainlink {
+                        chain_id,
+                        addresses,
+                    } = plan
+                    else {
+                        unreachable!("oracle-only test plan")
+                    };
+                    AnchorSourceResult::Chainlink {
+                        chain_id,
+                        result: fetch_oracle_answers_for_chain(
+                            chain_id,
+                            &addresses,
+                            effective_chains,
+                            http,
+                        )
+                        .await,
+                    }
+                })
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oracle_refresh_uses_verified_endpoint_while_other_identity_checks_stall() {
+        use alloy::primitives::I256;
+        use alloy::providers::bindings::IMulticall3;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        const STALLED: usize = 10;
+        // Far below the stalled checks' identity timeout and the oracle request deadline.
+        const PROMPT: Duration = Duration::from_secs(3);
+        let oracle = address!("0x0000000000000000000000000000000000000100");
+        let token = address!("0x0000000000000000000000000000000000000001");
+        let settings = crate::settings::WalletSettings::default();
+        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
+            .expect("effective chain configs");
+        let multicall = effective_chains
+            .get(1)
+            .and_then(|chain| chain.rpc_route.multicall())
+            .expect("multicall");
+
+        // Listeners that never accept hold every identity check sent to them until they drop.
+        let stalled = (0..STALLED)
+            .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind stalled RPC"))
+            .collect::<Vec<_>>();
+        let mut endpoints = stalled
+            .iter()
+            .map(|listener| {
+                reqwest::Url::parse(&format!(
+                    "http://{}",
+                    listener.local_addr().expect("stalled RPC address")
+                ))
+                .expect("stalled RPC URL")
+            })
+            .collect::<Vec<_>>();
+        let answer = SharedArc::new(AtomicU64::new(300_000_000_000));
+        let mut identity_checks = Vec::new();
+        let mut reads = Vec::new();
+        let mut servers = Vec::new();
+        for _ in STALLED..2 * STALLED {
+            let endpoint_identity_checks = SharedArc::new(AtomicUsize::new(0));
+            let endpoint_reads = SharedArc::new(AtomicUsize::new(0));
+            let (identity_count, read_count, answer) = (
+                endpoint_identity_checks.clone(),
+                endpoint_reads.clone(),
+                answer.clone(),
+            );
+            let (url, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+                SharedArc::new(move |request: Value| {
+                    let result = match request["method"].as_str() {
+                        Some("eth_chainId") => {
+                            identity_count.fetch_add(1, Ordering::SeqCst);
+                            json!("0x1")
+                        }
+                        Some("eth_call") => {
+                            read_count.fetch_add(1, Ordering::SeqCst);
+                            let encoded = AggregatorInterface::latestAnswerCall::abi_encode_returns(
+                                &I256::try_from(answer.load(Ordering::SeqCst))
+                                    .expect("oracle answer"),
+                            );
+                            let params = &request["params"][0];
+                            let to = params["to"]
+                                .as_str()
+                                .and_then(|value| value.parse::<Address>().ok());
+                            if to == Some(multicall) {
+                                let call_data = params
+                                    .get("input")
+                                    .or_else(|| params.get("data"))
+                                    .and_then(Value::as_str)
+                                    .expect("eth_call calldata missing input/data")
+                                    .parse::<Bytes>()
+                                    .expect("call bytes");
+                                let returns = IMulticall3::tryAggregateCall::abi_decode(&call_data)
+                                    .expect("tryAggregate calldata")
+                                    .calls
+                                    .iter()
+                                    .map(|_| IMulticall3::Result {
+                                        success: true,
+                                        returnData: encoded.clone().into(),
+                                    })
+                                    .collect::<Vec<_>>();
+                                json!(Bytes::from(
+                                    IMulticall3::tryAggregateCall::abi_encode_returns(&returns)
+                                ))
+                            } else {
+                                json!(Bytes::from(encoded))
+                            }
+                        }
+                        _ => {
+                            return json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": {"code": -32601, "message": "unexpected method"}
+                            });
+                        }
+                    };
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                }),
+                SharedArc::default(),
+                SharedArc::default(),
+            )
+            .await;
+            endpoints.push(url);
+            identity_checks.push(endpoint_identity_checks);
+            reads.push(endpoint_reads);
+            servers.push(server);
+        }
+        effective_chains
+            .get_mut(1)
+            .expect("Ethereum config")
+            .rpc_route = RpcChainRoute::new(1, endpoints)
+            .with_multicall(multicall)
+            .with_identity_verification();
+        // Configured order would fill the three-probe window with stalled endpoints; moving the
+        // first healthy endpoint into it probes stalled endpoints 0 and 1 beside endpoint 10.
+        let http = HttpContext::direct_for_tests_with_candidate_order(|order| {
+            if let Some(position) = order.iter().position(|&index| index == STALLED) {
+                order.swap(2, position);
+            }
+        });
+        let entries = [RuntimeTokenAnchorInfo {
+            chain_id: 1,
+            token,
+            anchor_sources: vec![RuntimeTokenAnchorSource::ChainlinkOracle {
+                chain_id: 1,
+                addr: oracle,
+                token_decimals: 6,
+                oracle_decimals: 8,
+                is_inversed: false,
+            }],
+        }];
+        let cache = TokenAnchorRateCache::new();
+
+        timeout(
+            PROMPT,
+            refresh_oracle_anchors_through_broker(&cache, &entries, &effective_chains, &http),
+        )
+        .await
+        .expect("startup refresh does not wait for stalled identity checks");
+        assert_eq!(cache.cached_rate(1, token), Some(uint!(3_000_000_000_U256)));
+        assert_eq!(identity_checks[0].load(Ordering::SeqCst), 1);
+        assert_eq!(reads[0].load(Ordering::SeqCst), 1);
+
+        // Latest reads are not result-cached without an observed head, so this read reaches an
+        // endpoint again while the stalled checks remain unresolved.
+        answer.store(310_000_000_000, Ordering::SeqCst);
+        timeout(
+            PROMPT,
+            refresh_oracle_anchors_through_broker(&cache, &entries, &effective_chains, &http),
+        )
+        .await
+        .expect("later refresh reuses the verified identity");
+        assert_eq!(cache.cached_rate(1, token), Some(uint!(3_100_000_000_U256)));
+        assert_eq!(identity_checks[0].load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reads
+                .iter()
+                .map(|count| count.load(Ordering::SeqCst))
+                .sum::<usize>(),
+            2
+        );
+
+        drop(http);
+        drop(stalled);
+        for server in servers {
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn anchor_source_fetch_warnings_redact_opaque_errors() {
         let logs = SharedArc::new(Mutex::new(Vec::new()));

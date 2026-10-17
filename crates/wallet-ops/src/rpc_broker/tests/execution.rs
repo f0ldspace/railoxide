@@ -248,10 +248,13 @@ async fn empty_aggregate_job_completes_without_waiting_for_a_permit() {
     let output = time::timeout(
         Duration::from_secs(1),
         run_job(
-            reqwest::Client::new(),
-            Arc::new(Semaphore::new(0)),
+            JobResources {
+                http: Arc::new(Semaphore::new(0)),
+                ..JobResources::new(reqwest::Client::new(), 1)
+            },
             ExecutionJob::Aggregate(Vec::new()),
             Vec::new(),
+            JobControl::granted(),
         ),
     )
     .await
@@ -269,7 +272,7 @@ alloy::sol! {
 
 #[tokio::test]
 async fn typed_submit_helper_decodes_members_and_preserves_errors() {
-    let executor: JobExecutor = Arc::new(|_client, _semaphore, group, _endpoints| {
+    let executor: JobExecutor = Arc::new(|_resources, group, _endpoints, _control| {
         Box::pin(async move {
             let completions = group
                 .into_iter()
@@ -1384,10 +1387,10 @@ async fn individual_read_fails_over_on_recoverable_error() {
     };
     let endpoints = item.execution_route.endpoints().to_vec();
     let output = run_job(
-        reqwest::Client::new(),
-        Arc::new(Semaphore::new(1)),
+        JobResources::new(reqwest::Client::new(), 1),
         ExecutionJob::Individual(Box::new(item)),
         endpoints,
+        JobControl::granted(),
     )
     .await;
     assert_eq!(
@@ -1630,10 +1633,10 @@ async fn started_request_timeout_is_recorded_as_an_attributed_request() {
     };
     let endpoints = item.execution_route.endpoints().to_vec();
     let job = tokio::spawn(run_job(
-        reqwest::Client::new(),
-        Arc::new(Semaphore::new(1)),
+        JobResources::new(reqwest::Client::new(), 1),
         ExecutionJob::Individual(Box::new(item)),
         endpoints,
+        JobControl::granted(),
     ));
     gate.request_started.notified().await;
     time::advance(Duration::from_secs(6)).await;
@@ -2214,14 +2217,21 @@ async fn reverted_member_is_not_retried_on_the_next_endpoint() {
 }
 
 #[tokio::test]
-async fn verified_routes_reuse_identity_and_withdraw_failed_identity_endpoints() {
+async fn verified_routes_reuse_identity_and_never_read_from_wrong_chain_endpoints() {
     let rejected_checks = Arc::new(AtomicUsize::new(0));
     let rejected = rejected_checks.clone();
+    // A panic in the mock task would only close the connection, so count unexpected reads instead.
+    let wrong_chain_reads = Arc::new(AtomicUsize::new(0));
+    let unexpected_reads = wrong_chain_reads.clone();
     let (bad, bad_server) = spawn_rpc_mock(
         Arc::new(move |request| {
-            assert_eq!(request["method"], "eth_chainId");
-            rejected.fetch_add(1, Ordering::SeqCst);
-            rpc_result(&request, &json!("0x2"))
+            if request["method"] == "eth_chainId" {
+                rejected.fetch_add(1, Ordering::SeqCst);
+                rpc_result(&request, &json!("0x2"))
+            } else {
+                unexpected_reads.fetch_add(1, Ordering::SeqCst);
+                rpc_error(&request, -32603)
+            }
         }),
         Arc::default(),
         Arc::default(),
@@ -2261,7 +2271,9 @@ async fn verified_routes_reuse_identity_and_withdraw_failed_identity_endpoints()
     }
     assert_eq!(identity_checks.load(Ordering::SeqCst), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 4);
-    assert_eq!(rejected_checks.load(Ordering::SeqCst), 3);
+    // Later jobs read the verified endpoint without first re-checking the rejected one.
+    assert!(rejected_checks.load(Ordering::SeqCst) >= 1);
+    assert_eq!(wrong_chain_reads.load(Ordering::SeqCst), 0);
     bad_server.abort();
     good_server.abort();
 }

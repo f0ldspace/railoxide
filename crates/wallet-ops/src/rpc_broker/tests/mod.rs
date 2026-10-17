@@ -1,12 +1,13 @@
 use super::actor::{Actor, Command, EndpointHealthOutcome, JobExecutor, JobOutput, RequestEvent};
 use super::broker::{RpcBroker, default_executor};
+use super::capacity::{JobControl, JobResources};
 use super::execution::wire_request_for;
 use super::model::*;
 use super::operation::RpcOperation;
 use super::profile::*;
 use super::resolution;
 use super::resolution::{WaiterPolicy, WaiterSnapshot, WaiterState, WorkItem, WorkKey};
-use super::scheduler::{ExecutionJob, ReadyScheduler, partition_work};
+use super::scheduler::{Claim, ExecutionJob, ReadyScheduler, partition_work};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, Bytes, U256, hex};
 use alloy::providers::bindings::IMulticall3;
@@ -66,7 +67,7 @@ pub(super) fn rpc_read_from_request(
 }
 
 pub(super) fn test_executor() -> JobExecutor {
-    Arc::new(|_client, _semaphore, group, _endpoints| {
+    Arc::new(|_resources, group, _endpoints, _control| {
         Box::pin(async move {
             JobOutput {
                 completions: group
@@ -77,6 +78,16 @@ pub(super) fn test_executor() -> JobExecutor {
             }
         })
     })
+}
+
+impl ReadyScheduler {
+    /// Claims the next queued job as if every job could read now.
+    pub(in crate::rpc_broker) fn next_ready(&mut self) -> Option<ExecutionJob> {
+        match self.next(|_| true)? {
+            Claim::Queued(job) => Some(job),
+            Claim::Resume(_) => panic!("only queued work was admitted"),
+        }
+    }
 }
 
 fn execution_job_len(job: &ExecutionJob) -> usize {
@@ -111,7 +122,7 @@ pub(crate) fn spawn_counting_test_broker() -> (Arc<RpcBroker>, Arc<AtomicUsize>)
     let executions = Arc::new(AtomicUsize::new(0));
     let executor: JobExecutor = {
         let executions = Arc::clone(&executions);
-        Arc::new(move |_client, _semaphore, group, _endpoints| {
+        Arc::new(move |_resources, group, _endpoints, _control| {
             executions.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 let mut completions = Vec::new();
@@ -318,3 +329,4 @@ mod actor;
 mod methods;
 mod model;
 mod profile;
+mod progressive;
