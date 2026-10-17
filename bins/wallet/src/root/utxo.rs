@@ -6,9 +6,9 @@ use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    App, Context, Edges, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    div, prelude::FluentBuilder as _, px, rgb,
+    App, Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px, relative, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
@@ -27,7 +27,7 @@ use ui::controls::{
     app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
 };
 use ui::icons;
-use ui::theme::{self, APP_MONO_FONT_FAMILY};
+use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
 #[cfg(feature = "hardware")]
 use wallet_ops::hardware::HardwareDeviceKind;
 use wallet_ops::{
@@ -63,8 +63,7 @@ enum UtxoNavigation {
     End,
 }
 
-const POI_COLUMN_INDEX: usize = 4;
-const POI_COLUMN_WIDTH: f32 = 200.0;
+const POI_COLUMN_WIDTH: f32 = 190.0;
 const BLOCKED_SHIELD_RESCUE_RESOLVING_REASON: &str = "Resolving source transaction origin...";
 const BLOCKED_SHIELD_REFUND_IN_FLIGHT_REASON: &str =
     "Blocked Shield refund submission is already in progress.";
@@ -181,6 +180,20 @@ impl WalletRoot {
                 &self.blocked_shield_refunds_in_flight,
             );
         }
+        // The debug UI fixture shows its synthesized rows. No release build has any.
+        if let Some(mut fixture_rows) =
+            super::private_swap::ui_fixture_utxo_rows(self.selected_chain)
+        {
+            let query = self.tx_search_query.as_ref();
+            fixture_rows.retain(|row| {
+                row.source_tx_hash.contains(query)
+                    || row
+                        .spent_tx_hash
+                        .as_ref()
+                        .is_some_and(|hash| hash.contains(query))
+            });
+            rows = fixture_rows;
+        }
         let poi_refreshing = self
             .chain_states
             .get(&self.selected_chain)
@@ -207,6 +220,10 @@ impl WalletRoot {
     }
 
     fn utxo_finality_context(&self) -> UtxoFinalityContext {
+        // The debug UI fixture's rows count from its own head. No release build has one.
+        if let Some(context) = super::private_swap::ui_fixture_utxo_finality_context() {
+            return context;
+        }
         let sync_tip = self
             .chain_states
             .get(&self.selected_chain)
@@ -1075,8 +1092,11 @@ impl WalletRoot {
         if self.view_session.is_none() {
             return centered_message("Choose a wallet to view activity");
         }
+        // The debug UI fixture's rows show in the table whatever the chain's state. No release
+        // build has any.
+        let fixture_rows = super::private_swap::ui_fixture_shows_utxos();
         match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Error { message, .. }) => div()
+            Some(ChainUtxoState::Error { message, .. }) if !fixture_rows => div()
                 .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
@@ -1090,7 +1110,7 @@ impl WalletRoot {
                 ),
             Some(ChainUtxoState::Ready {
                 snapshot, session, ..
-            }) if snapshot.utxo_count == 0 => div()
+            }) if snapshot.utxo_count == 0 && !fixture_rows => div()
                 .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
@@ -1102,7 +1122,7 @@ impl WalletRoot {
                     "No UTXOs found. Synced from block {}.",
                     session.start_block
                 ))),
-            Some(state) if state.renders_table() => div()
+            state if fixture_rows || state.is_some_and(ChainUtxoState::renders_table) => div()
                 .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
@@ -1160,7 +1180,7 @@ impl WalletRoot {
                         .icon(IconName::Close)
                         .on_click(move |_event, window, cx| {
                             clear_search_input.update(cx, |input, cx| {
-                                input.set_value("", window, cx);
+                                input.replace_all("", window, cx);
                             });
                             clear_search_table.update(cx, |table, cx| {
                                 table.focus_handle(cx).focus(window, cx);
@@ -1414,12 +1434,6 @@ impl UtxoDelegate {
                     .movable(false),
                 Column::new("generated", "generated")
                     .width(px(130.0))
-                    .paddings(Edges {
-                        top: px(2.0),
-                        right: px(12.0),
-                        bottom: px(2.0),
-                        left: px(12.0),
-                    })
                     .movable(false),
                 Column::new("token", "token")
                     .width(px(150.0))
@@ -1429,18 +1443,12 @@ impl UtxoDelegate {
                     .movable(false),
                 Column::new("poi", "PPOI")
                     .width(px(POI_COLUMN_WIDTH))
-                    .paddings(Edges {
-                        top: px(2.0),
-                        right: px(12.0),
-                        bottom: px(2.0),
-                        left: px(12.0),
-                    })
                     .movable(false),
                 Column::new("source_tx", "source tx")
-                    .width(px(200.0))
+                    .width(px(201.0))
                     .movable(false),
                 Column::new("spent_tx", "spent tx")
-                    .width(px(200.0))
+                    .width(px(201.0))
                     .movable(false),
             ],
             tx_search_input,
@@ -1505,19 +1513,7 @@ impl TableDelegate for UtxoDelegate {
         _window: &mut Window,
         _cx: &mut Context<'_, TableState<Self>>,
     ) -> impl IntoElement {
-        if col_ix != POI_COLUMN_INDEX {
-            return div()
-                .size_full()
-                .child(self.columns[col_ix].name.clone())
-                .into_any_element();
-        }
-
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .child("PPOI")
-            .into_any_element()
+        utxo_cell(self.columns[col_ix].name.clone())
     }
 
     fn render_tr(
@@ -1548,7 +1544,7 @@ impl TableDelegate for UtxoDelegate {
         _cx: &mut Context<'_, TableState<Self>>,
     ) -> impl IntoElement {
         let row = &self.rows[row_ix];
-        match col_ix {
+        utxo_cell(match col_ix {
             0 => div()
                 .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
                 .child(SharedString::from(row.tree_position.clone()))
@@ -1698,8 +1694,20 @@ impl TableDelegate for UtxoDelegate {
                     .child("-")
                     .into_any_element(),
             },
-        }
+        })
     }
+}
+
+/// A UTXO table cell's content, centred in the row at the wallet's body text size. The table
+/// sizes its own cell text for `Size::Large`, so the cell has to set it again.
+fn utxo_cell(content: impl IntoElement) -> gpui::Div {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .text_size(APP_TEXT_SIZE)
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+        .child(content)
 }
 
 pub(super) fn local_pending_spent_summary(count: usize) -> String {
@@ -2035,6 +2043,7 @@ fn tx_hash_cell(
                 )))
                 .flex_none()
                 .font_family(APP_MONO_FONT_FAMILY)
+                .text_size(px(12.0))
                 .text_color(utxo_cell_text_color(row, color))
                 .child(SharedString::from(display_hash)),
         )
@@ -2075,7 +2084,7 @@ fn tx_hash_cell(
                     .icon(IconName::Search)
                     .on_click(move |_event, window, cx| {
                         tx_search_input.update(cx, |input, cx| {
-                            input.set_value(search_hash.clone(), window, cx);
+                            input.replace_all(search_hash.clone(), window, cx);
                         });
                     }),
                 ),

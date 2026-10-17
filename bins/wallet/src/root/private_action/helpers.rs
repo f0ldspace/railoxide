@@ -382,6 +382,9 @@ impl WalletRoot {
         }
 
         for (kind, key) in reschedule {
+            if kind == DeliveryFormKind::Unshield {
+                self.refresh_unshield_native_top_up_state(key, cx);
+            }
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
         }
     }

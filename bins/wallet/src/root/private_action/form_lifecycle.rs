@@ -1956,6 +1956,7 @@ impl WalletRoot {
         if mode == DeliveryMode::PublicBroadcaster || adjusted.is_some() {
             form.cost_estimate = None;
         }
+        let amount_adjusted = adjusted.is_some();
         if let Some(adjusted) = adjusted {
             form.pending_programmatic_amount_input = Some(adjusted.clone());
             set_programmatic_amount_input_value(&form.amount_input, adjusted, window, cx);
@@ -1964,6 +1965,9 @@ impl WalletRoot {
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+        if amount_adjusted {
+            self.refresh_unshield_native_top_up_state(key, cx);
+        }
         if mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         } else if mode == DeliveryMode::SelfBroadcast {

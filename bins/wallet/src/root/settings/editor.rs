@@ -784,16 +784,12 @@ impl WalletSettingsEditor {
                         let subscription = cx.subscribe_in(&input, window, {
                             let set = set.clone();
                             let editor = editor.clone();
-                            move |state: &mut SyncedStringFieldState,
+                            move |_state: &mut SyncedStringFieldState,
                                   input,
                                   event: &InputEvent,
                                   _window,
                                   cx| {
                                 if !matches!(event, InputEvent::Change) {
-                                    return;
-                                }
-                                if state.ignore_next_change {
-                                    state.ignore_next_change = false;
                                     return;
                                 }
                                 let value = input.read(cx).value().to_string();
@@ -806,7 +802,6 @@ impl WalletSettingsEditor {
                         SyncedStringFieldState {
                             input,
                             synced_revision: revision,
-                            ignore_next_change: false,
                             _subscription: subscription,
                         }
                     }
@@ -821,7 +816,6 @@ impl WalletSettingsEditor {
                 if state.input.read(cx).value().as_ref() == value.as_ref() {
                     return;
                 }
-                state.ignore_next_change = true;
                 state
                     .input
                     .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
@@ -1025,7 +1019,7 @@ impl WalletSettingsEditor {
                                                 }
                                             }
                                             .clamp(number_options.min, number_options.max);
-                                            input.set_value(new_value.to_string(), window, cx);
+                                            input.replace_all(new_value.to_string(), window, cx);
                                         }
                                     });
                                 }
@@ -1034,16 +1028,12 @@ impl WalletSettingsEditor {
                                 let set = set.clone();
                                 let editor = editor.clone();
                                 let number_options = number_options.clone();
-                                move |state: &mut SyncedNumberFieldState,
+                                move |_state: &mut SyncedNumberFieldState,
                                       input,
                                       event: &InputEvent,
                                       window,
                                       cx| {
                                     if !matches!(event, InputEvent::Change) {
-                                        return;
-                                    }
-                                    if state.ignore_next_change {
-                                        state.ignore_next_change = false;
                                         return;
                                     }
                                     input.update(cx, |input, cx| {
@@ -1059,7 +1049,6 @@ impl WalletSettingsEditor {
                                             editor.draft_changed(cx);
                                         });
                                         if was_clamped {
-                                            state.ignore_next_change = true;
                                             input.set_value(clamped.to_string(), window, cx);
                                         }
                                     });
@@ -1069,7 +1058,6 @@ impl WalletSettingsEditor {
                         SyncedNumberFieldState {
                             input,
                             synced_revision: revision,
-                            ignore_next_change: false,
                             _subscriptions: subscriptions,
                         }
                     }
@@ -1084,7 +1072,6 @@ impl WalletSettingsEditor {
                 if state.input.read(cx).value().as_ref() == value_text.as_ref() {
                     return;
                 }
-                state.ignore_next_change = true;
                 state.input.update(cx, |input, cx| {
                     input.set_value(value_text.clone(), window, cx);
                 });

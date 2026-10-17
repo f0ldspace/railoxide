@@ -1,9 +1,9 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
 //! retry review, failed quote, speed-up, split outcome, reported fill, setup progress and
-//! cancelled preparation, at the Stealth accounts inspector and at the refund dialog of a
-//! blocked Shield: it opens them on a scratch wallet without private funds and holds a chosen
-//! state on screen. It is compiled only with `debug_assertions`, and does nothing unless
-//! `RAILOXIDE_UI_FIXTURE` is set.
+//! cancelled preparation, at the Stealth accounts inspector, at the refund dialog of a blocked
+//! Shield and at the rows of the UTXO table: it opens them on a scratch wallet without private
+//! funds and holds a chosen state on screen. It is compiled only with `debug_assertions`, and
+//! does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
 //! The variable names one mode, read once:
 //!
@@ -50,6 +50,17 @@
 //!   `accounts` mode, whose two accounts Stealth accounts then shows, and that of `inactive`
 //!   is an inactive Public account labelled Savings. `unresolved` is a Shield transaction
 //!   that couldn't be read, which has no origin.
+//! - `utxos` shows nine synthesized rows in the UTXO table of Wallet activity in place of the
+//!   wallet's own, on any network and whatever its sync state. Each shows another form of a
+//!   cell: an output received at 3 of its 12 finality blocks, a pending spend at 7 of 12, a
+//!   Shield whose PPOI is due in about 40 minutes, a private output whose proof was submitted
+//!   23 minutes ago, with its Retry, a verified Shield, a blocked Shield with its Refund, an
+//!   amount with all 18 decimals under a long token symbol, a spent Shield, and a Shield
+//!   whose PPOI is taking longer than usual. The blocks count from a head block of the
+//!   fixture's own, so they hold still. The rows take the network's USDC and WETH, or
+//!   Ethereum's where the network lists none. Search filters them, and Show spent doesn't.
+//!   Refund does nothing. Retry is enabled while the network has a session, and retries the
+//!   wallet's own submissions, as the button above the table does.
 //! - `retry-review` opens the private swap form in place of a Public account's, on Ethereum
 //!   with its private session started: the retry of a synthesized swap that sells 0.05 WETH
 //!   for USDC delivered by Across to a public receiver on Arbitrum One. Its first order
@@ -215,6 +226,10 @@ use std::time::Duration;
 use alloy::eips::BlockNumHash;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use gpui::{App, Context, Window};
+use railgun_ui::{
+    KnownTokenInfo, format_scaled_amount, format_token_amount, known_tokens_for_chain,
+    token_icon_asset_path,
+};
 use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderLimitError, OrderUid};
 use wallet_ops::settings::SwapProfile;
 use wallet_ops::vault::{
@@ -233,7 +248,7 @@ use wallet_ops::{
     ExecutorRecoveryFeeEstimate, OperationNetworkIsolation, PairAnchorRate,
     PublicBroadcasterResultKind, SwapBridgeReport, SwapContinuingApproval, SwapDeliverySeen,
     SwapHandoffHint, SwapQuoteAnchor, SwapQuoteDiagnostics, SwapReview, SwapReviewChange,
-    SwapSettlementHint, SwapSpeedUpRefusal, TransactionGenerationStage,
+    SwapSettlementHint, SwapSpeedUpRefusal, TransactionGenerationStage, UtxoPpoiState,
 };
 
 use super::dialog::SwapDialogView;
@@ -241,8 +256,9 @@ use super::form::SetupSide;
 use super::model::SwapIdentity;
 use super::setup_progress::SetupProgress;
 use super::{PrivateSwapsView, SwapEarlyHint, SwapJob, SwapJobKind, SwapOrderHint, now_unix};
+use crate::assets::WalletIconSource;
 use crate::root::WalletRoot;
-use crate::root::utxo::BlockedShieldRefundDialogState;
+use crate::root::utxo::{BlockedShieldRefundDialogState, UtxoDisplayRow, UtxoFinalityContext};
 
 const VARIABLE: &str = "RAILOXIDE_UI_FIXTURE";
 /// How long a scripted job takes before it answers.
@@ -254,6 +270,10 @@ const REFUND_UTXO: BlockedShieldRescueUtxoId = BlockedShieldRescueUtxoId {
     commitment: B256::ZERO,
     blinded_commitment: B256::ZERO,
 };
+/// The head block the `utxos` mode counts finality from.
+const UTXO_HEAD: u64 = 21_480_215;
+/// The finality depth of the `utxos` mode, whose safe head is that many blocks below its head.
+const UTXO_FINALITY_DEPTH: u64 = 12;
 
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -264,6 +284,7 @@ enum Mode {
     Detail(Detail),
     Accounts,
     Refund(Refund),
+    Utxos,
     RetryReview,
     QuoteError,
     Split(Split),
@@ -432,6 +453,9 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "accounts" {
         return Some(Mode::Accounts);
+    }
+    if value == "utxos" {
+        return Some(Mode::Utxos);
     }
     if value == "retry-review" {
         return Some(Mode::RetryReview);
@@ -2475,5 +2499,191 @@ impl WalletRoot {
         }
         Self::open_blocked_shield_refund_dialog(REFUND_UTXO, window, cx);
         true
+    }
+}
+
+/// Whether the UTXO table shows the rows of the `utxos` mode in place of the wallet's own,
+/// whatever the network's sync state.
+pub(in crate::root) fn shows_utxos() -> bool {
+    matches!(mode(), Some(Mode::Utxos))
+}
+
+/// The finality the `utxos` mode counts from its own head block, in place of the network's.
+/// `None` in every other mode.
+pub(in crate::root) fn utxo_finality_context() -> Option<UtxoFinalityContext> {
+    shows_utxos().then_some(UtxoFinalityContext::new(
+        Some(UTXO_HEAD),
+        Some(UTXO_HEAD - UTXO_FINALITY_DEPTH),
+        Some(UTXO_FINALITY_DEPTH),
+    ))
+}
+
+/// The rows of the `utxos` mode, newest first, with ages from the time of the call. They take
+/// the USDC and WETH of `chain_id`, or Ethereum's where it lists none. `None` in every other
+/// mode, or without either token.
+pub(in crate::root) fn utxo_rows(chain_id: u64) -> Option<Vec<UtxoDisplayRow>> {
+    const HOUR: u64 = 3_600;
+    const DAY: u64 = 24 * HOUR;
+    /// 123,456.789012345678901234 units of an 18-decimal token.
+    const LONG_AMOUNT: u128 = 123_456_789_012_345_678_901_234;
+    if !shows_utxos() {
+        return None;
+    }
+    let token = |symbol: &str| {
+        [chain_id, 1]
+            .into_iter()
+            .find_map(|chain| known_tokens_for_chain(chain).find(|token| token.symbol == symbol))
+    };
+    let (usdc, weth) = (token("USDC")?, token("WETH")?);
+    let now = now_unix();
+    let ago = |seconds: u64| now.saturating_sub(seconds);
+    let hash = |seed: &str| Some(alloy::hex::encode_prefixed(keccak256(seed)));
+    let private = || "Private Output".to_owned();
+    Some(vec![
+        // Received 3 blocks below the head, with 3 of its 12 finality blocks passed.
+        UtxoDisplayRow {
+            activity_classification: private(),
+            poi_status: "Pending receive".to_owned(),
+            ppoi_state: UtxoPpoiState::Unknown,
+            poi_spendable: false,
+            pending_new: true,
+            ..utxo_row(usdc, 250_000_000, 65_020, UTXO_HEAD - 3, ago(36))
+        },
+        // Spent 7 blocks below the head, with 7 of its 12 finality blocks passed.
+        UtxoDisplayRow {
+            poi_status: "Pending spend".to_owned(),
+            spent_tx_hash: hash("ui-fixture-utxo-spend-65019"),
+            spent_block_number: Some(UTXO_HEAD - 7),
+            pending_spent: true,
+            ..utxo_row(
+                usdc,
+                1_500_000_000,
+                65_019,
+                UTXO_HEAD - 3_300,
+                ago(11 * HOUR),
+            )
+        },
+        // A Shield 20 minutes old, whose PPOI is due in about 40 minutes.
+        UtxoDisplayRow {
+            poi_status: "Missing".to_owned(),
+            ppoi_state: UtxoPpoiState::Missing,
+            poi_spendable: false,
+            ..utxo_row(
+                weth,
+                200_000_000_000_000_000,
+                65_018,
+                UTXO_HEAD - 100,
+                ago(1_200),
+            )
+        },
+        // A proof submitted 23 minutes ago and not verified yet, which can be retried.
+        UtxoDisplayRow {
+            activity_classification: private(),
+            poi_status: "ProofSubmitted".to_owned(),
+            ppoi_state: UtxoPpoiState::ProofSubmitted,
+            ppoi_last_submission_at: Some(ago(1_380)),
+            poi_spendable: false,
+            ..utxo_row(usdc, 42_500_000, 65_017, UTXO_HEAD - 600, ago(2 * HOUR))
+        },
+        utxo_row(
+            usdc,
+            1_000_000_000,
+            65_016,
+            UTXO_HEAD - 4_100,
+            ago(14 * HOUR),
+        ),
+        // A blocked Shield whose origin can refund it. It has no UTXO ID, so Refund does
+        // nothing.
+        UtxoDisplayRow {
+            activity_classification: "BlockedShield".to_owned(),
+            poi_status: "ShieldBlocked".to_owned(),
+            ppoi_state: UtxoPpoiState::ShieldBlocked,
+            poi_spendable: false,
+            blocked_shield_rescue: Some(BlockedShieldRescueInfo {
+                eligible: true,
+                disabled_reason: None,
+                origin_address: Some(Address::repeat_byte(0x4e).to_checksum(None)),
+                public_account_uuid: Some("ui-fixture".to_owned()),
+                public_account_label: Some("Savings".to_owned()),
+            }),
+            ..utxo_row(
+                usdc,
+                5_000_000_000,
+                65_015,
+                UTXO_HEAD - 7_800,
+                ago(26 * HOUR),
+            )
+        },
+        // Every decimal of an 18-decimal amount, under a long symbol.
+        UtxoDisplayRow {
+            token: "stkWETH-USDC-LPv2".to_owned(),
+            amount: format_scaled_amount(U256::from(LONG_AMOUNT), weth.decimals),
+            activity_classification: private(),
+            ..utxo_row(weth, LONG_AMOUNT, 65_014, UTXO_HEAD - 21_600, ago(3 * DAY))
+        },
+        UtxoDisplayRow {
+            spent_tx_hash: hash("ui-fixture-utxo-spend-65013"),
+            spent_block_number: Some(UTXO_HEAD - 14_400),
+            is_spent: true,
+            ..utxo_row(
+                weth,
+                500_000_000_000_000_000,
+                65_013,
+                UTXO_HEAD - 43_200,
+                ago(6 * DAY),
+            )
+        },
+        // A Shield whose PPOI is taking longer than the usual hour.
+        UtxoDisplayRow {
+            poi_status: "Missing".to_owned(),
+            ppoi_state: UtxoPpoiState::Missing,
+            poi_spendable: false,
+            ..utxo_row(
+                weth,
+                300_000_000_000_000_000,
+                65_012,
+                UTXO_HEAD - 50_400,
+                ago(7 * DAY),
+            )
+        },
+    ])
+}
+
+/// An unspent, verified Shield of `raw` units of `token` at `position` in tree 1, made in
+/// `block` at `timestamp`, which each row of the `utxos` mode changes as it needs.
+fn utxo_row(
+    token: KnownTokenInfo,
+    raw: u128,
+    position: u64,
+    block: u64,
+    timestamp: u64,
+) -> UtxoDisplayRow {
+    let raw_value = U256::from(raw);
+    UtxoDisplayRow {
+        utxo_id: None,
+        tree_position: format!("1/{position}"),
+        token: token.symbol.to_owned(),
+        token_icon_path: token_icon_asset_path(token.chain_id, &token.token)
+            .map(WalletIconSource::embedded),
+        amount: format_token_amount(raw_value, token.decimals),
+        raw_value: Some(raw_value),
+        activity_classification: "Shield".to_owned(),
+        poi_status: "Valid".to_owned(),
+        ppoi_state: UtxoPpoiState::Valid,
+        ppoi_last_submission_at: None,
+        poi_spendable: true,
+        source_tx_hash: alloy::hex::encode_prefixed(keccak256(format!(
+            "ui-fixture-utxo-{position}"
+        ))),
+        source_block_number: block,
+        source_block_timestamp: timestamp,
+        spent_tx_hash: None,
+        spent_block_number: None,
+        token_address: token.token.to_checksum(None),
+        is_spent: false,
+        pending_new: false,
+        pending_spent: false,
+        local_pending_spent: false,
+        blocked_shield_rescue: None,
     }
 }

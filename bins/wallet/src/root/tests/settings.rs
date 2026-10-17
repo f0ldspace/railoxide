@@ -1517,3 +1517,133 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[gpui::test]
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn settings_fields_commit_first_edit_after_sync_and_number_steps(cx: &mut gpui::TestAppContext) {
+    use gpui::{
+        AppContext as _, IntoElement, ParentElement as _, Render, Styled as _, VisualTestContext,
+        div,
+    };
+    use gpui_component::setting::{
+        NumberFieldOptions, SettingGroup, SettingItem, SettingPage, Settings as ComponentSettings,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    /// Renders one number field followed by one string field, so the string input is the
+    /// window's last tab stop and the number input the one before it.
+    struct FieldsHost(Entity<WalletSettingsEditor>);
+
+    impl Render for FieldsHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            let timeout = WalletSettingsEditor::number_field(
+                "test-response-timeout",
+                self.0.clone(),
+                NumberFieldOptions {
+                    min: 1.0,
+                    max: 86_400.0,
+                    step: 1.0,
+                },
+                |settings| settings.broadcaster.response_timeout_secs as f64,
+                |settings, value| settings.broadcaster.response_timeout_secs = value as u64,
+            );
+            let nwaku = WalletSettingsEditor::shared_string_field(
+                "test-nwaku-url",
+                self.0.clone(),
+                |settings| settings.waku.nwaku_url.clone().unwrap_or_default(),
+                |settings, value| settings.waku.nwaku_url = Some(value),
+            );
+            div().size_full().child(
+                ComponentSettings::new("test-settings-fields").page(
+                    SettingPage::new("Fields").group(
+                        SettingGroup::new()
+                            .item(SettingItem::new("Timeout", timeout))
+                            .item(SettingItem::new("nwaku", nwaku)),
+                    ),
+                ),
+            )
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let path = temp_wallet_db_root("settings-field-sync");
+    let store = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let owner_slot = Rc::new(RefCell::new(None));
+    let slot = owner_slot.clone();
+    let handle = cx.add_window(|window, cx| {
+        let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
+        let editor = cx.new(|cx| {
+            WalletSettingsEditor::new(
+                store.clone(),
+                runtime.handle().clone(),
+                WalletSettings::default(),
+                maintenance,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        let host = cx.new(|_| FieldsHost(editor.clone()));
+        *slot.borrow_mut() = Some(editor);
+        gpui_component::Root::new(host, window, cx)
+    });
+    let owner = owner_slot.borrow_mut().take().unwrap();
+    let cx = VisualTestContext::from_window(*handle, cx).into_mut();
+    cx.simulate_resize(gpui::size(px(1000.0), px(700.0)));
+    let redraw = |cx: &mut VisualTestContext| {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    };
+    redraw(cx);
+
+    // A programmatic draft change rewrites both inputs without emitting edits.
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, cx| {
+            editor.draft.broadcaster.response_timeout_secs = 10;
+            editor.draft.waku.nwaku_url = Some("http://a".to_owned());
+            editor.programmatic_draft_changed(cx);
+        });
+    });
+    redraw(cx);
+
+    // The user's first keystroke after that sync must reach the draft.
+    cx.update(gpui::Window::focus_prev);
+    cx.simulate_input("b");
+    redraw(cx);
+    let nwaku_url = cx.update(|_, cx| owner.read(cx).draft.waku.nwaku_url.clone());
+    assert_eq!(nwaku_url.as_deref(), Some("http://ab"));
+
+    cx.update(gpui::Window::focus_prev);
+    cx.simulate_input("5");
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_, cx| owner.read(cx).draft.broadcaster.response_timeout_secs),
+        105
+    );
+
+    // Stepping the number input updates the draft, not only the visible text.
+    cx.simulate_keystrokes("up");
+    redraw(cx);
+    assert_eq!(
+        cx.update(|_, cx| owner.read(cx).draft.broadcaster.response_timeout_secs),
+        106
+    );
+
+    // Dropping the window and entities releases the test database before removal.
+    cx.update(|window, _| window.remove_window());
+    drop(owner);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}

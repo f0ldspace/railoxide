@@ -112,14 +112,12 @@ pub(in crate::root) struct WalletSettingsEditor {
 pub(in crate::root) struct SyncedStringFieldState {
     pub(in crate::root) input: Entity<InputState>,
     pub(in crate::root) synced_revision: u64,
-    pub(in crate::root) ignore_next_change: bool,
     pub(in crate::root) _subscription: Subscription,
 }
 
 pub(in crate::root) struct SyncedNumberFieldState {
     pub(in crate::root) input: Entity<InputState>,
     pub(in crate::root) synced_revision: u64,
-    pub(in crate::root) ignore_next_change: bool,
     pub(in crate::root) _subscriptions: Vec<Subscription>,
 }
 
