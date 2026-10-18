@@ -17,7 +17,7 @@ use eyre::{Result, eyre};
 use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 use reqwest::Url;
 
-use super::gas::hook_data_cost_from_rpc_pool;
+use super::gas::hook_data_cost_from_candidates;
 use super::order::{anchor_token, placeholder_private_delivery_message_len};
 use super::{SwapInputPlan, SwapReview, SwapReviewChange};
 use crate::bridge::{
@@ -29,8 +29,7 @@ use crate::cow::{
     delivery_allowance, destination_minimum_after_allowance, private_delivery_gas,
 };
 use crate::desktop::{
-    effective_desktop_chain_config, gas_price_from_rpc_pool_with_policy,
-    query_rpc_pool_with_http_client,
+    acquire_fee_candidates, effective_desktop_chain_config, gas_price_from_candidates_with_policy,
 };
 use crate::settings::{
     BridgeReceiverRejection, EffectiveChainConfig, EffectiveTokenRegistry, SwapProfile,
@@ -495,13 +494,13 @@ async fn private_delivery_allowance(
             (0, U256::ZERO)
         } else {
             let chain = effective_desktop_chain_config(chain_id, destination_chain)?;
-            let pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+            let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
             // The data cost counts two hex characters per byte, as in app data.
             let message_len = placeholder_private_delivery_message_len(delivery)?;
             let (gas_price_wei, data_cost_wei) = tokio::try_join!(
-                gas_price_from_rpc_pool_with_policy(&pool, 1, 1),
-                hook_data_cost_from_rpc_pool(
-                    &pool,
+                gas_price_from_candidates_with_policy(&fee_candidates, 1, 1),
+                hook_data_cost_from_candidates(
+                    &fee_candidates,
                     chain_id,
                     message_len.saturating_mul(2),
                     &chain.gas,

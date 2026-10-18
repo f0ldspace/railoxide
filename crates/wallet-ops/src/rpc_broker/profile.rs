@@ -24,6 +24,22 @@ impl EndpointProfile {
         if self.recent_failures.len() < HEALTH_STRIKE_THRESHOLD {
             return false;
         }
+        self.withdraw(now);
+        true
+    }
+
+    /// Withdraws at once after a failed warmup check, without the ordinary threshold. An active
+    /// cooldown is neither shortened nor escalated, and `false` is returned.
+    pub(super) fn withdraw_after_warmup_strike(&mut self, now: Instant) -> bool {
+        if self.is_withdrawn(now) {
+            return false;
+        }
+        self.withdraw(now);
+        true
+    }
+
+    /// Starts the next, longer cooldown; failures toward a later withdrawal start over.
+    fn withdraw(&mut self, now: Instant) {
         self.recent_failures.clear();
         self.withdrawal_level = self.withdrawal_level.saturating_add(1);
         let exponent = self.withdrawal_level.saturating_sub(1).min(10);
@@ -31,7 +47,6 @@ impl EndpointProfile {
             .saturating_mul(1_u32 << exponent)
             .min(HEALTH_WITHDRAWAL_MAX);
         self.withdrawn_until = Some(now + cooldown);
-        true
     }
 
     pub(super) fn restore_if_ready(&mut self, now: Instant) -> bool {

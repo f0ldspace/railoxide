@@ -720,3 +720,78 @@ fn gateway_errors_use_typed_failures_and_ignore_remote_rejection_text() {
         GatewayApprovalFailure::Local(LocalProviderFailure::UserRejected)
     );
 }
+
+#[gpui::test]
+fn transaction_approval_activates_its_chain_without_changing_selection(
+    cx: &mut gpui::TestAppContext,
+) {
+    let path = temp_db_root();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        ui::theme::apply_zenburn_component_theme(cx);
+    });
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let entity = crate::root::tests::public_accounts::fixture_root(&path, &runtime, window, cx);
+        root = Some(entity.clone());
+        gpui_component::Root::new(entity, window, cx)
+    });
+    let root = root.unwrap();
+    root.update_in(cx, |root, window, cx| {
+        let template = root.effective_chain_configs.get(1).unwrap().clone();
+        root.effective_chain_configs = [10, 20, 30]
+            .into_iter()
+            .map(|chain_id| {
+                let mut chain = template.clone();
+                chain.chain_id = chain_id;
+                chain.railgun = None;
+                chain.rpc_route =
+                    wallet_ops::RpcChainRoute::new(chain_id, Vec::<reqwest::Url>::new());
+                chain
+            })
+            .collect();
+        root.selected_chain = 10;
+        root.install_chain_background();
+        assert!(!root.active_rpc_chains.contains(&20));
+
+        let request_key = "approval:7";
+        let mut request = test_walletconnect_request(request_key, None);
+        request.item.chain_id = "eip155:20".into();
+        request.parsed = WalletConnectParsedRequest::EthSendTransaction {
+            transaction: WalletConnectEvmTransaction {
+                from: request.item.account.unwrap(),
+                to: Some(alloy::primitives::Address::repeat_byte(1)),
+                value: None,
+                data: None,
+                access_list: None,
+                gas: None,
+                gas_price: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                chain_id: Some(20),
+                nonce: None,
+                transaction_type: None,
+                raw: json!({}),
+            },
+        };
+        root.walletconnect
+            .pending_requests
+            .insert(request_key.to_owned(), request);
+        root.attach_walletconnect_fee_state(request_key, window, cx);
+
+        assert!(root.walletconnect.walletconnect_fee_state.is_some());
+        assert!(root.active_rpc_chains.contains(&20));
+        assert_eq!(root.selected_chain, 10);
+        assert!(!root.active_rpc_chains.contains(&30));
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}

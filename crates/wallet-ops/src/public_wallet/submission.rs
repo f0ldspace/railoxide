@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -5,6 +6,7 @@ use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, FixedBytes, TxKind, U256, keccak256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
+use alloy::transports::{RpcError, TransportError, TransportErrorKind};
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, WrapErr, eyre};
 
@@ -20,7 +22,7 @@ use super::types::{
 use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
 use crate::{
-    HttpContext, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
+    HttpContext, RpcChainRoute, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
     self_broadcast_replacement_bumped_fee,
     self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
@@ -29,6 +31,23 @@ pub(super) struct PublicActionStepOutcome {
     pub(super) receipt: TxReceiptOutput,
     pub(super) next_nonce: u64,
     pub(super) gas_fee: PublicActionGasFeeSelection,
+}
+
+/// A model-based funding check before estimation, plus fees reserved for a later Shield.
+#[derive(Clone, Copy)]
+pub(super) struct PublicShieldFundingBudget {
+    pub(super) gas_units: u64,
+    pub(super) remaining_shield_gas_units: u64,
+    // Railway Auto still refreshes the later Shield under its captured ceiling after an
+    // approval retry. Other flows carry the current approval fee into that Shield.
+    pub(super) remaining_max_fee_per_gas: Option<u128>,
+}
+
+impl PublicShieldFundingBudget {
+    fn remaining_reserve(self, max_fee_per_gas: u128) -> U256 {
+        U256::from(self.remaining_shield_gas_units)
+            * U256::from(self.remaining_max_fee_per_gas.unwrap_or(max_fee_per_gas))
+    }
 }
 
 pub(super) struct PublicActionPreflight {
@@ -42,17 +61,6 @@ pub(super) struct PublicActionPreflight {
     live_native_balance: U256,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PublicActionPreflightMode {
-    Managed,
-}
-
-impl PublicActionPreflightMode {
-    const fn needs_fee_quote(self, gas_fee: PublicActionGasFeeSelection) -> bool {
-        matches!(self, Self::Managed) && matches!(gas_fee, PublicActionGasFeeSelection::Auto)
-    }
-}
-
 #[derive(Debug)]
 pub(super) enum PublicActionPreflightError {
     FeeAuthorizationRequired {
@@ -60,6 +68,7 @@ pub(super) enum PublicActionPreflightError {
         max_priority_fee_per_gas: u128,
         message: String,
     },
+    InsufficientShieldFunding(eyre::Report),
     Other(eyre::Report),
 }
 
@@ -73,7 +82,9 @@ impl std::fmt::Display for PublicActionPreflightError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FeeAuthorizationRequired { message, .. } => formatter.write_str(message),
-            Self::Other(error) => std::fmt::Display::fmt(error, formatter),
+            Self::InsufficientShieldFunding(error) | Self::Other(error) => {
+                std::fmt::Display::fmt(error, formatter)
+            }
         }
     }
 }
@@ -84,7 +95,7 @@ impl PublicActionPreflightError {
     pub(super) fn into_report(self) -> eyre::Report {
         match self {
             Self::FeeAuthorizationRequired { message, .. } => eyre!("{}", message),
-            Self::Other(error) => error,
+            Self::InsufficientShieldFunding(error) | Self::Other(error) => error,
         }
     }
 }
@@ -134,6 +145,9 @@ impl PublicActionStepResult {
     }
 }
 
+/// Each preflight, including a replacement's, quotes fees from its own candidates on
+/// `rpc_route`, including its nonce, estimate and balance reads. Broadcast and observation
+/// continue using `query_rpc_pool`.
 pub(super) async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
     base_tx_req: TransactionRequest,
@@ -142,12 +156,14 @@ pub(super) async fn submit_public_action_step_session(
     signer: &VaultedPublicSigner,
     label: &str,
     query_rpc_pool: Arc<QueryRpcPool>,
+    rpc_route: &RpcChainRoute,
     finality_depth: u64,
     http: &HttpContext,
     transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
     chain_id: u64,
     from_address: Address,
     gas: &EffectiveChainGasSettings,
+    funding_budget: Option<PublicShieldFundingBudget>,
     authorized_gas_limit: Option<u64>,
     mut nonce: Option<u64>,
     gas_fee: PublicActionGasFeeSelection,
@@ -183,7 +199,8 @@ pub(super) async fn submit_public_action_step_session(
 
         let preflight = match public_action_preflight_from_rpc_pool(
             query_rpc_pool.as_ref(),
-            http.network_mode(),
+            http,
+            rpc_route,
             chain_id,
             from_address,
             base_tx_req.clone(),
@@ -196,6 +213,7 @@ pub(super) async fn submit_public_action_step_session(
             None,
             authorized_fee_ceiling,
             railway_auto,
+            funding_budget,
         )
         .await
         {
@@ -388,7 +406,8 @@ pub(super) async fn submit_public_action_step_session(
                             .map_or(0, |attempt| attempt.info.gas_limit);
                         let replacement = match public_action_preflight_from_rpc_pool(
                             query_rpc_pool.as_ref(),
-                            http.network_mode(),
+                            http,
+                            rpc_route,
                             chain_id,
                             from_address,
                             base_tx_req.clone(),
@@ -401,6 +420,7 @@ pub(super) async fn submit_public_action_step_session(
                             Some(gas_limit),
                             authorized_fee_ceiling,
                             railway_auto,
+                            funding_budget,
                         )
                         .await
                         {
@@ -672,9 +692,10 @@ impl PublicActionAttemptError {
     }
 }
 
-async fn public_action_preflight_from_rpc_pool(
+pub(super) async fn public_action_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
-    network_mode: crate::WalletNetworkMode,
+    http: &HttpContext,
+    rpc_route: &RpcChainRoute,
     chain_id: u64,
     from: Address,
     base_tx_req: TransactionRequest,
@@ -687,10 +708,12 @@ async fn public_action_preflight_from_rpc_pool(
     gas_limit: Option<u64>,
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
+    funding_budget: Option<PublicShieldFundingBudget>,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
-    public_action_preflight_from_rpc_pool_with_mode(
+    public_action_preflight_from_rpc_pool_with_reads(
         query_rpc_pool,
-        network_mode,
+        http,
+        rpc_route,
         chain_id,
         from,
         base_tx_req,
@@ -701,54 +724,21 @@ async fn public_action_preflight_from_rpc_pool(
         authorized_gas_limit,
         nonce,
         gas_limit,
-        PublicActionPreflightMode::Managed,
-        authorized_fee_ceiling,
-        railway_auto,
-    )
-    .await
-}
-
-pub(super) async fn public_action_preflight_from_rpc_pool_with_mode(
-    query_rpc_pool: &QueryRpcPool,
-    network_mode: crate::WalletNetworkMode,
-    chain_id: u64,
-    from: Address,
-    base_tx_req: TransactionRequest,
-    gas_fee: PublicActionGasFeeSelection,
-    gas: &EffectiveChainGasSettings,
-    profile: PublicShieldTransactionProfile,
-    gas_limit_strategy: PublicActionGasLimitStrategy,
-    authorized_gas_limit: Option<u64>,
-    nonce: Option<u64>,
-    gas_limit: Option<u64>,
-    mode: PublicActionPreflightMode,
-    authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
-    railway_auto: bool,
-) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
-    public_action_preflight_from_rpc_pool_with_mode_and_reads(
-        query_rpc_pool,
-        network_mode,
-        chain_id,
-        from,
-        base_tx_req,
-        gas_fee,
-        gas,
-        profile,
-        gas_limit_strategy,
-        authorized_gas_limit,
-        nonce,
-        gas_limit,
-        mode,
         authorized_fee_ceiling,
         railway_auto,
         None,
+        funding_budget,
     )
     .await
 }
 
-pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
+/// Quotes fees, when needed, from candidates on `rpc_route` that this preflight alone owns, then
+/// reads the nonce, estimate and balance on one candidate per native attempt. Admitted dapp
+/// reads retain their original pool and gateway admission.
+pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
     query_rpc_pool: &QueryRpcPool,
-    network_mode: crate::WalletNetworkMode,
+    http: &HttpContext,
+    rpc_route: &RpcChainRoute,
     chain_id: u64,
     from: Address,
     base_tx_req: TransactionRequest,
@@ -759,32 +749,35 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
     authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
     gas_limit: Option<u64>,
-    mode: PublicActionPreflightMode,
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
     rpc_reads: Option<&super::DappRpcReadClient>,
+    funding_budget: Option<PublicShieldFundingBudget>,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
     if rpc_reads.is_some() && profile != PublicShieldTransactionProfile::Railoxide {
         return Err(eyre!("admitted dapp reads require the Railoxide transaction profile").into());
     }
+    let candidates = super::gas::public_fee_candidates(http, rpc_route, rpc_reads)
+        .await
+        .wrap_err("select public action query RPC candidates")?;
     let quote = if profile == PublicShieldTransactionProfile::Railoxide
-        || (mode.needs_fee_quote(gas_fee) && railway_auto)
+        || (matches!(gas_fee, PublicActionGasFeeSelection::Auto) && railway_auto)
     {
         Some(
             match rpc_reads {
                 Some(reads) => {
-                    super::gas::public_action_gas_fee_quote_from_rpc_pool_with_reads(
-                        query_rpc_pool,
-                        network_mode,
+                    super::gas::public_action_gas_fee_quote_from_candidates_with_reads(
+                        &candidates,
+                        http.network_mode(),
                         chain_id,
                         Some(reads),
                     )
                     .await
                 }
                 None => {
-                    super::gas::public_action_gas_fee_quote_from_rpc_pool_with_profile(
-                        query_rpc_pool,
-                        network_mode,
+                    super::gas::public_action_gas_fee_quote_from_candidates_with_profile(
+                        &candidates,
+                        http.network_mode(),
                         chain_id,
                         profile,
                     )
@@ -797,10 +790,28 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
         None
     };
     let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+    let mut tried = HashSet::new();
+    let attempts = if rpc_reads.is_some() {
+        query_rpc_pool.len()
+    } else {
+        candidates.len()
+    };
+    for attempt in 1..=attempts {
+        let provider_handle = if rpc_reads.is_some() {
+            query_rpc_pool.random_provider()
+        } else {
+            candidates.next_untried(&mut tried).await
+        };
+        let Some(provider_handle) = provider_handle else {
             break;
         };
+        let rpc_index = rpc_route
+            .endpoints()
+            .iter()
+            .position(|endpoint| endpoint.expose_url() == &provider_handle.url);
+        let endpoint = crate::http::redact_url_for_display(&provider_handle.url);
+        let started = std::time::Instant::now();
+        let mut stage = "fee_resolution";
         match public_action_preflight(
             provider_handle,
             chain_id,
@@ -817,6 +828,8 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
             authorized_fee_ceiling,
             railway_auto,
             rpc_reads,
+            &mut stage,
+            funding_budget,
         )
         .await
         {
@@ -824,7 +837,12 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
             Err(error @ PublicActionPreflightError::FeeAuthorizationRequired { .. }) => {
                 return Err(error);
             }
-            Err(PublicActionPreflightError::Other(error)) => {
+            Err(error) => {
+                let insufficient_funding = matches!(
+                    &error,
+                    PublicActionPreflightError::InsufficientShieldFunding(_)
+                );
+                let error = error.into_report();
                 if rpc_reads.is_some() {
                     if error
                         .downcast_ref::<crate::rpc_broker::RpcBrokerError>()
@@ -833,7 +851,53 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_mode_and_reads(
                         return Err(PublicActionPreflightError::Other(error));
                     }
                 } else {
-                    tracing::warn!("public action preflight failed");
+                    // Error messages and bodies can contain RPC credentials or transaction data.
+                    let transport_error = error.downcast_ref::<TransportError>();
+                    let rpc_code = transport_error
+                        .and_then(RpcError::as_error_resp)
+                        .map(|payload| payload.code);
+                    let transport = transport_error.and_then(RpcError::as_transport_err);
+                    let http_status = transport
+                        .and_then(TransportErrorKind::as_http_error)
+                        .map(|error| error.status);
+                    let request_error = transport
+                        .and_then(TransportErrorKind::as_custom)
+                        .and_then(|error| error.downcast_ref::<reqwest::Error>());
+                    let failure = match transport_error {
+                        Some(RpcError::Transport(_)) if http_status.is_some() => "http",
+                        Some(RpcError::Transport(_))
+                            if request_error.is_some_and(reqwest::Error::is_timeout) =>
+                        {
+                            "timeout"
+                        }
+                        Some(RpcError::Transport(_))
+                            if request_error.is_some_and(reqwest::Error::is_connect) =>
+                        {
+                            "connect"
+                        }
+                        Some(RpcError::Transport(_)) => "transport",
+                        Some(RpcError::NullResp) => "missing_response",
+                        Some(RpcError::DeserError { .. }) => "decode",
+                        Some(RpcError::ErrorResp(_)) => "rpc_error",
+                        Some(_) => "rpc_client",
+                        None => "validation",
+                    };
+                    tracing::warn!(
+                        chain_id,
+                        rpc_index,
+                        endpoint = %endpoint,
+                        attempt,
+                        attempts,
+                        stage,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        failure,
+                        rpc_code,
+                        http_status,
+                        "public action preflight failed"
+                    );
+                }
+                if insufficient_funding {
+                    return Err(PublicActionPreflightError::InsufficientShieldFunding(error));
                 }
                 last_error = Some(error);
             }
@@ -866,10 +930,13 @@ async fn public_action_preflight(
     authorized_fee_ceiling: Option<PublicActionGasFeeSelection>,
     railway_auto: bool,
     rpc_reads: Option<&super::DappRpcReadClient>,
+    stage: &mut &'static str,
+    funding_budget: Option<PublicShieldFundingBudget>,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
     let provider = &provider_handle.provider;
     let resolved = resolve_public_action_gas_fee(chain_id, profile, gas_fee, quote)?;
     if railway_auto {
+        *stage = "fee_authorization";
         let within_ceiling = railway_auto_fee_within_authorized_ceiling(
             chain_id,
             authorized_fee_ceiling
@@ -886,6 +953,42 @@ async fn public_action_preflight(
             });
         }
     }
+    let remaining_reserve = funding_budget.map_or(U256::ZERO, |budget| {
+        budget.remaining_reserve(resolved.max_fee_per_gas)
+    });
+    let funding_balance = if let Some(budget) = funding_budget {
+        *stage = "balance";
+        let balance = match rpc_reads {
+            Some(reads) => reads
+                .get_balance(provider_handle.url.clone().into(), chain_id, from)
+                .await
+                .map_err(eyre::Report::new),
+            None => provider.get_balance(from).await.map_err(eyre::Report::new),
+        }
+        .wrap_err("fetch public Shield native balance")?;
+        *stage = "shield_funding_validation";
+        // Replacements already have a signed limit; use the model only before a limit is known.
+        let funding_gas_limit = authorized_gas_limit
+            .or(gas_limit)
+            .unwrap_or(budget.gas_units);
+        let estimated_cost = public_action_native_exposure(
+            base_tx_req.value.unwrap_or_default(),
+            funding_gas_limit,
+            resolved.max_fee_per_gas,
+        )
+        .saturating_add(remaining_reserve);
+        if balance < estimated_cost {
+            return Err(PublicActionPreflightError::InsufficientShieldFunding(
+                eyre!(
+                    "insufficient native balance for estimated Shield fees and transaction value; include fees for any required approval and the remaining Shield"
+                ),
+            ));
+        }
+        Some(balance)
+    } else {
+        None
+    };
+    *stage = "nonce";
     let nonce = if let Some(nonce) = nonce {
         nonce
     } else {
@@ -930,11 +1033,13 @@ async fn public_action_preflight(
             resolved.max_priority_fee_per_gas
         }
     });
+    *stage = "estimate";
     let gas_limit = if let Some(authorized_gas_limit) = authorized_gas_limit {
         let estimated_gas =
             public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
                 .await
                 .wrap_err("re-estimate authorized advanced public transaction gas")?;
+        *stage = "gas_limit_authorization";
         ensure_advanced_gas_estimate_authorized(estimated_gas, authorized_gas_limit)?;
         authorized_gas_limit
     } else if let Some(gas_limit) = gas_limit {
@@ -957,23 +1062,35 @@ async fn public_action_preflight(
     };
     let estimated_native_gas_cost =
         public_action_native_exposure(tx_req.value.unwrap_or_default(), gas_limit, max_fee_per_gas);
-    let live_native_balance = match rpc_reads {
-        Some(reads) => reads
-            .get_balance(provider_handle.url.clone().into(), chain_id, from)
-            .await
-            .map_err(eyre::Report::new),
-        None => provider.get_balance(from).await.map_err(eyre::Report::new),
-    }
-    .wrap_err("fetch public action native balance")?;
-    if live_native_balance < estimated_native_gas_cost {
+    *stage = "balance";
+    let live_native_balance = if let Some(balance) = funding_balance {
+        balance
+    } else {
+        match rpc_reads {
+            Some(reads) => reads
+                .get_balance(provider_handle.url.clone().into(), chain_id, from)
+                .await
+                .map_err(eyre::Report::new),
+            None => provider.get_balance(from).await.map_err(eyre::Report::new),
+        }
+        .wrap_err("fetch public action native balance")?
+    };
+    *stage = "native_balance_validation";
+    let required_native_balance = estimated_native_gas_cost.saturating_add(remaining_reserve);
+    if live_native_balance < required_native_balance {
         let action = if authorized_gas_limit.is_some() {
             "advanced public transaction"
         } else {
             "public action"
         };
-        return Err(PublicActionPreflightError::Other(eyre!(
-            "insufficient native balance for {action}: live balance {live_native_balance}, required value plus maximum gas cost {estimated_native_gas_cost}"
-        )));
+        let error = eyre!(
+            "insufficient native balance for {action}: live balance {live_native_balance}, required value plus maximum gas cost {required_native_balance}"
+        );
+        return Err(if funding_budget.is_some() {
+            PublicActionPreflightError::InsufficientShieldFunding(error)
+        } else {
+            PublicActionPreflightError::Other(error)
+        });
     }
     Ok(PublicActionPreflight {
         tx_req: tx_req.with_gas_limit(gas_limit),
@@ -1346,9 +1463,10 @@ mod tests {
                     })
                 })
             });
-            let prepared = public_action_preflight_from_rpc_pool_with_mode_and_reads(
+            let prepared = public_action_preflight_from_rpc_pool_with_reads(
                 &pool,
-                crate::WalletNetworkMode::Direct,
+                &http,
+                &chain.rpc_route,
                 CHAIN,
                 from,
                 TransactionRequest::default()
@@ -1364,10 +1482,10 @@ mod tests {
                 Some(50_000),
                 None,
                 None,
-                PublicActionPreflightMode::Managed,
                 None,
                 false,
                 Some(&reads),
+                None,
             )
             .await;
             if failed_header || estimated_gas > 50_000 {

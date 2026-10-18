@@ -410,6 +410,9 @@ impl WalletStartupRoot {
                 cx,
             )
         });
+        root.update(cx, |root, _| {
+            root.install_chain_background();
+        });
         self.error = None;
         self.wallet_root = Some(root);
         if ready_is_tor {

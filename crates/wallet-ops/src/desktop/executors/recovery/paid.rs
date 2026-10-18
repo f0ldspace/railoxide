@@ -19,9 +19,9 @@ use crate::desktop::executor_observation::trace_step;
 use crate::desktop::executors::IssueRetry;
 use crate::desktop::executors::swap::swap_recovery_call_bound;
 use crate::desktop::{
-    ApproximateTransactionShape, PUBLIC_BROADCASTER_FEE_ATTEMPTS,
+    ApproximateTransactionShape, PUBLIC_BROADCASTER_FEE_ATTEMPTS, acquire_fee_candidates,
     approximate_public_broadcaster_gas, artifact_source, bounded_public_broadcaster_fee,
-    buffered_gas_price_from_rpc_pool, effective_desktop_chain_config,
+    buffered_gas_price_from_candidates, effective_desktop_chain_config,
     estimate_public_broadcaster_fee_from_rpc_pool, query_rpc_pool_with_http_client,
     submit_public_broadcaster_transaction, update_transaction_generation_stage,
 };
@@ -278,9 +278,11 @@ impl ExecutorOwner {
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone())).admit(profile)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
-        let pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
         let min_gas_price = self
-            .while_active(buffered_gas_price_from_rpc_pool(&pool, &chain.gas))
+            .while_active(async {
+                let candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
+                buffered_gas_price_from_candidates(&candidates, &chain.gas).await
+            })
             .await?;
         let builder = TransactionBuilder {
             chain_type: 0,
@@ -451,11 +453,12 @@ impl ExecutorOwner {
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         preparation.require_broadcaster(candidate)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
-        let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
-        let min_gas_price = trace_step(
-            "paid_gas_price",
-            buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas),
-        )
+        let query_rpc_pool =
+            query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &self.http);
+        let min_gas_price = trace_step("paid_gas_price", async {
+            let candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
+            buffered_gas_price_from_candidates(&candidates, &chain.gas).await
+        })
         .await?;
         let bound_min_gas_price =
             public_broadcaster_bound_min_gas_price(self.chain.chain_id, min_gas_price);

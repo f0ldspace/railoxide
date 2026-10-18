@@ -1,6 +1,5 @@
 use super::{
-    AggregatorInterface, TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL,
-    TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT, TOKEN_ANCHOR_REFRESH_INTERVAL,
+    AggregatorInterface, TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT, TOKEN_ANCHOR_REFRESH_INTERVAL,
     TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL, TokenAnchorRateCache,
 };
 use crate::settings::EffectiveChainConfig;
@@ -11,6 +10,7 @@ use eyre::Result;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use railgun_ui::chain_editor::{NativeUsdQuote, NativeUsdState, NativeUsdStatus};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
@@ -22,6 +22,7 @@ use tokio::{
 pub(super) struct NativePricing {
     next_generation: u64,
     chains: BTreeMap<u64, NativeChain>,
+    active_chains: BTreeSet<u64>,
     pub(super) rates: BTreeMap<u64, (U256, u8)>,
 }
 
@@ -39,6 +40,31 @@ pub(super) struct NativeRead {
 }
 
 impl TokenAnchorRateCache {
+    pub(super) fn set_active_native_chains(&self, chain_ids: &[u64]) -> bool {
+        let Ok(mut native) = self.native_pricing.write() else {
+            return false;
+        };
+        let active_chains: BTreeSet<_> = chain_ids.iter().copied().collect();
+        if native.active_chains == active_chains {
+            return false;
+        }
+        let retired: Vec<_> = native
+            .active_chains
+            .difference(&active_chains)
+            .copied()
+            .collect();
+        // Retire pending publication while retaining the last usable quote.
+        for id in retired {
+            native.next_generation += 1;
+            let generation = native.next_generation;
+            if let Some(chain) = native.chains.get_mut(&id) {
+                chain.generation = generation;
+            }
+        }
+        native.active_chains = active_chains;
+        true
+    }
+
     /// Retires native work and quotes atomically with publication admission.
     pub(super) fn reconcile_native_sources(
         &self,
@@ -116,7 +142,9 @@ impl TokenAnchorRateCache {
                     .chains
                     .values()
                     .filter(|entry| {
-                        entry.config.enabled && entry.config.native_usd_oracle.is_some()
+                        native.active_chains.contains(&entry.config.chain_id)
+                            && entry.config.enabled
+                            && entry.config.native_usd_oracle.is_some()
                     })
                     .map(|entry| NativeRead {
                         chain: entry.config.clone(),
@@ -292,45 +320,85 @@ fn decode_native_quote(
 pub(super) async fn run_worker(
     cache: &TokenAnchorRateCache,
     http: &HttpContext,
+    configuration_rx: watch::Receiver<u64>,
+    wake_rx: watch::Receiver<u64>,
+) {
+    run_worker_with(cache, configuration_rx, wake_rx, |chain| async move {
+        fetch_native_quote(&chain, http).await
+    })
+    .await;
+}
+
+async fn run_worker_with<F, R>(
+    cache: &TokenAnchorRateCache,
     mut configuration_rx: watch::Receiver<u64>,
     mut wake_rx: watch::Receiver<u64>,
-) {
+    fetch: F,
+) where
+    F: Fn(EffectiveChainConfig) -> R,
+    R: Future<Output = Result<(U256, u8), String>>,
+{
     let mut pending = FuturesUnordered::new();
     let mut active = BTreeSet::new();
     let mut scheduled = BTreeSet::new();
+    let mut retries = BTreeMap::<_, (Instant, Duration)>::new();
     let mut periodic = true;
     let mut next_refresh = Instant::now();
     let mut last_refresh = Instant::now();
     loop {
-        for read in cache.native_reads() {
-            let key = (read.chain.chain_id, read.generation);
-            if !active.contains(&key) && (periodic || !scheduled.contains(&key)) {
-                active.insert(key);
-                scheduled.insert(key);
-                pending.push(async move {
-                    let result = fetch_native_quote(&read.chain, http).await;
-                    cache.publish_native(&read, result);
-                    key
-                });
-            }
-        }
-        // Retired generations need no scheduling history. Their completions still face admission.
-        let current: BTreeSet<_> = cache
-            .native_reads()
+        let reads = cache.native_reads();
+        let current: BTreeSet<_> = reads
             .iter()
             .map(|read| (read.chain.chain_id, read.generation))
             .collect();
+        // Retired generations need no scheduling history. Their completions still face admission.
         scheduled.retain(|key| current.contains(key));
+        retries.retain(|key, _| current.contains(key));
+        for read in reads {
+            let key = (read.chain.chain_id, read.generation);
+            let due = retries
+                .get(&key)
+                .map_or(periodic, |(deadline, _)| *deadline <= Instant::now());
+            if !active.contains(&key) && (due || !scheduled.contains(&key)) {
+                active.insert(key);
+                scheduled.insert(key);
+                let request = fetch(read.chain.clone());
+                pending.push(async move {
+                    let result = request.await;
+                    let failed = result.is_err();
+                    cache.publish_native(&read, result);
+                    (key, failed)
+                });
+            }
+        }
         if periodic {
             last_refresh = Instant::now();
             next_refresh = last_refresh + TOKEN_ANCHOR_REFRESH_INTERVAL;
         }
         periodic = false;
+        let next_retry = retries
+            .iter()
+            .filter(|(key, _)| !active.contains(*key))
+            .map(|(_, (deadline, _))| *deadline)
+            .min()
+            .unwrap_or(next_refresh);
         tokio::select! {
-            Some(key) = pending.next(), if !pending.is_empty() => {
+            Some((key, failed)) = pending.next(), if !pending.is_empty() => {
                 active.remove(&key);
-                if cache.native_reads().iter().any(|read| cache.cached_native_usd_rate(read.chain.chain_id).is_none()) {
-                    next_refresh = next_refresh.min(Instant::now() + TOKEN_ANCHOR_MISSING_RATE_RETRY_INTERVAL);
+                if cache.native_reads().iter().any(|read| (read.chain.chain_id, read.generation) == key) {
+                    if failed {
+                        let delay = retries.get(&key).map_or(Duration::from_secs(5), |(_, delay)| {
+                            (*delay * 2).min(Duration::from_secs(30))
+                        });
+                        retries.insert(key, (Instant::now() + delay, delay));
+                        tracing::debug!(
+                            chain_id = key.0,
+                            retry_in_secs = delay.as_secs(),
+                            "scheduling native USD oracle retry"
+                        );
+                    } else {
+                        retries.remove(&key);
+                    }
                 }
             }
             changed = configuration_rx.changed() => { if changed.is_err() { break; } }
@@ -338,7 +406,9 @@ pub(super) async fn run_worker(
                 if changed.is_err() { break; }
                 periodic = last_refresh.elapsed() >= TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL;
             }
-            () = sleep_until(next_refresh) => { periodic = true; }
+            () = sleep_until(next_refresh.min(next_retry)) => {
+                periodic = Instant::now() >= next_refresh;
+            }
         }
     }
 }
@@ -349,6 +419,194 @@ mod tests {
     use crate::settings::{NativeUsdPricing, WalletSettings, build_effective_chain_configs};
     use alloy::primitives::{Address, I256, uint};
     use std::sync::Arc;
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_sources_back_off_independently_and_recovery_resets_retries() {
+        use futures_util::FutureExt;
+        use std::cell::RefCell;
+
+        let settings = WalletSettings::default();
+        let configs = build_effective_chain_configs(&settings).unwrap();
+        let configs: EffectiveChainRegistry = configs
+            .iter()
+            .filter(|(id, _)| matches!(**id, 1 | 56))
+            .map(|(_, chain)| chain.clone())
+            .collect();
+        let cache = TokenAnchorRateCache::new();
+        cache.reconcile_native_sources(&configs, &[]);
+        cache.set_active_native_chains(&[1, 56]);
+        let attempts = RefCell::new(BTreeMap::<u64, usize>::new());
+        let (_configuration_tx, configuration_rx) = watch::channel(0);
+        let (_wake_tx, wake_rx) = watch::channel(0);
+        let worker = run_worker_with(&cache, configuration_rx, wake_rx, |chain| {
+            let mut attempts = attempts.borrow_mut();
+            let attempt = attempts.entry(chain.chain_id).or_default();
+            *attempt += 1;
+            std::future::ready(if chain.chain_id == 1 && (*attempt <= 5 || *attempt == 7) {
+                Err("Oracle unavailable".to_owned())
+            } else {
+                Ok((U256::from(3_000_000_000_u64), 8))
+            })
+        });
+        tokio::pin!(worker);
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(attempts.borrow()[&1], 1);
+        assert_eq!(attempts.borrow()[&56], 1);
+        assert_eq!(cache.cached_native_usd_rate(1), None);
+
+        // Each deadline belongs only to the failing source, and sustained failure caps at 30s.
+        for (delay, expected_attempts) in [(5, 2), (10, 3), (20, 4), (30, 5), (30, 6)] {
+            tokio::time::advance(Duration::from_secs(delay - 1)).await;
+            assert!(worker.as_mut().now_or_never().is_none());
+            assert_eq!(attempts.borrow()[&1], expected_attempts - 1);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(worker.as_mut().now_or_never().is_none());
+            assert_eq!(attempts.borrow()[&1], expected_attempts);
+            assert_eq!(attempts.borrow()[&56], 1);
+        }
+        assert_eq!(
+            cache.native_usd_statuses()["1"].state,
+            NativeUsdState::Available
+        );
+        let recovered = cache.cached_native_usd_rate(1).unwrap();
+
+        // Recovery restores the normal refresh cadence; its next failure retains the quote.
+        tokio::time::advance(Duration::from_secs(204)).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(attempts.borrow()[&1], 6);
+        assert_eq!(attempts.borrow()[&56], 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(attempts.borrow()[&1], 7);
+        assert_eq!(attempts.borrow()[&56], 2);
+        assert_eq!(
+            cache.native_usd_statuses()["1"].state,
+            NativeUsdState::Failed
+        );
+        assert_eq!(cache.cached_native_usd_rate(1), Some(recovered));
+        assert!(cache.native_usd_statuses()["1"].quote.is_some());
+
+        // A new failure after success starts again at five seconds, even with a cached quote.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(attempts.borrow()[&1], 7);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(attempts.borrow()[&1], 8);
+        assert_eq!(attempts.borrow()[&56], 2);
+        assert_eq!(
+            cache.native_usd_statuses()["1"].state,
+            NativeUsdState::Available
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_worker_waits_for_activation_and_fences_retired_reads() {
+        use futures_util::FutureExt;
+        use std::cell::RefCell;
+
+        let mut chain = build_effective_chain_configs(&WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .clone();
+        chain.chain_id = 31337;
+        chain.railgun = None;
+        let mut configs: EffectiveChainRegistry = std::iter::once(chain).collect();
+        let cache = TokenAnchorRateCache::new();
+        cache.reconcile_native_sources(&configs, &[]);
+        let requests = RefCell::new(Vec::new());
+        let (configuration_tx, configuration_rx) = watch::channel(0_u64);
+        let (_wake_tx, wake_rx) = watch::channel(0);
+        let set_active = |ids: &[u64]| {
+            if cache.set_active_native_chains(ids) {
+                configuration_tx.send_modify(|revision| *revision += 1);
+            }
+        };
+        let worker = run_worker_with(&cache, configuration_rx, wake_rx, |chain| {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            requests.borrow_mut().push((chain.native_usd_oracle, send));
+            async move { receive.await.unwrap() }
+        });
+        tokio::pin!(worker);
+
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert!(requests.borrow().is_empty());
+        assert_eq!(
+            cache.native_usd_statuses()["31337"].state,
+            NativeUsdState::Pending
+        );
+        tokio::time::advance(TOKEN_ANCHOR_REFRESH_INTERVAL).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert!(requests.borrow().is_empty());
+        set_active(&[31337]);
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(requests.borrow().len(), 1);
+        set_active(&[31337, 31337]);
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(requests.borrow().len(), 1);
+        requests
+            .borrow_mut()
+            .pop()
+            .unwrap()
+            .1
+            .send(Ok((U256::from(2_000_000), 8)))
+            .unwrap();
+        assert!(worker.as_mut().now_or_never().is_none());
+        let published = cache.native_usd_statuses();
+        assert_eq!(
+            cache.cached_native_usd_rate(31337),
+            Some(U256::from(2_000_000))
+        );
+        set_active(&[31337]);
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert!(requests.borrow().is_empty());
+
+        tokio::time::advance(TOKEN_ANCHOR_REFRESH_INTERVAL).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(requests.borrow().len(), 1);
+        set_active(&[]);
+        assert!(worker.as_mut().now_or_never().is_none());
+        requests
+            .borrow_mut()
+            .pop()
+            .unwrap()
+            .1
+            .send(Ok((U256::MAX, 8)))
+            .unwrap();
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(cache.native_usd_statuses(), published);
+        assert_eq!(
+            cache.cached_native_usd_rate(31337),
+            Some(U256::from(2_000_000))
+        );
+
+        let replacement_source = Address::repeat_byte(7);
+        configs.get_mut(31337).unwrap().native_usd_oracle = Some(replacement_source);
+        assert!(cache.reconcile_native_sources(&configs, &[]));
+        configuration_tx.send_modify(|revision| *revision += 1);
+        assert_eq!(cache.cached_native_usd_rate(31337), None);
+        assert!(worker.as_mut().now_or_never().is_none());
+        tokio::time::advance(TOKEN_ANCHOR_REFRESH_INTERVAL).await;
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert!(requests.borrow().is_empty());
+
+        set_active(&[31337]);
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(
+            requests.borrow().len(),
+            1,
+            "reactivation refreshes immediately"
+        );
+        let (source, send) = requests.borrow_mut().pop().unwrap();
+        assert_eq!(source, Some(replacement_source));
+        send.send(Ok((U256::from(3_000_000), 8))).unwrap();
+        assert!(worker.as_mut().now_or_never().is_none());
+        assert_eq!(
+            cache.cached_native_usd_rate(31337),
+            Some(U256::from(3_000_000))
+        );
+    }
 
     #[tokio::test]
     async fn native_worker_batches_metadata_and_refreshes_saved_sources_without_token_work() {
@@ -442,6 +700,7 @@ mod tests {
             crate::settings::build_effective_token_registry(&settings).unwrap(),
             http,
         );
+        worker.set_active_chains(&[31337]);
         for replacement in [None, Some(Address::repeat_byte(7))] {
             if let Some(address) = replacement {
                 configs.get_mut(31337).unwrap().native_usd_oracle = Some(address);
@@ -462,6 +721,7 @@ mod tests {
         }
         assert_eq!(batches.load(Ordering::SeqCst), 2);
         // A Test reads the same source through the broker and publishes nothing.
+        worker.set_active_chains(&[]);
         let published = cache.native_usd_statuses();
         let quote = probe_native_usd_quote(configs.get(31337).unwrap(), &probe_http)
             .await
@@ -547,6 +807,7 @@ mod tests {
         settings.chains.custom.insert(31337, definition);
         let mut configs = build_effective_chain_configs(&settings).unwrap();
         cache.reconcile_native_sources(&configs, &[]);
+        cache.set_active_native_chains(&[31337]);
         let read = cache
             .native_reads()
             .into_iter()
@@ -596,6 +857,7 @@ mod tests {
         let mut settings = WalletSettings::default();
         let mut configs = build_effective_chain_configs(&settings).unwrap();
         cache.reconcile_native_sources(&configs, &[]);
+        cache.set_active_native_chains(&[1, 56]);
         let read = |id| {
             cache
                 .native_reads()

@@ -478,8 +478,7 @@ pub async fn quote_desktop_self_broadcast_gas_fee(
     http: &HttpContext,
 ) -> Result<SelfBroadcastGasFeeQuote> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    self_broadcast_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode()).await
+    self_broadcast_gas_fee_quote_from_route(http, &chain.rpc_route).await
 }
 
 pub struct DesktopUnshieldSelfBroadcastRequest {

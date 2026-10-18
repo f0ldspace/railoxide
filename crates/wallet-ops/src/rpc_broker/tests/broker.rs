@@ -1,5 +1,7 @@
 use crate::rpc_broker::actor::{Command, JobExecutor, JobOutput};
-use crate::rpc_broker::broker::{RpcBroker, SUBMISSION_CAPACITY, default_executor};
+use crate::rpc_broker::broker::{
+    METADATA_LOOKUP_LIMIT, RpcBroker, SUBMISSION_CAPACITY, default_executor,
+};
 use crate::rpc_broker::identity::CandidateOrder;
 use crate::rpc_broker::model::{
     DEFAULT_INTERVAL, DEFAULT_MAX_ESTIMATED_GAS, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError,
@@ -119,6 +121,8 @@ async fn oversized_submission_is_rejected_before_command_send() {
         tx,
         block_tx,
         admission: Arc::new(Semaphore::new(256)),
+        warmups: mpsc::unbounded_channel().0,
+        warmup: Arc::default(),
     };
     let reads = (0..65)
         .map(|_| RpcRead::get_balance(Address::ZERO))
@@ -143,6 +147,8 @@ async fn admission_credit_covers_batch_replies_and_pre_enqueue_paths() {
         tx,
         block_tx,
         admission: admission.clone(),
+        warmups: mpsc::unbounded_channel().0,
+        warmup: Arc::default(),
     });
     let origin = test_origin();
     let batch = |marker: &'static [u8], route: RpcRoute| {
@@ -161,7 +167,9 @@ async fn admission_credit_covers_batch_replies_and_pre_enqueue_paths() {
         let broker = broker.clone();
         async move { broker.submit(first_submission).await }
     });
-    let Command::Submit { replies, .. } = commands.recv().await.expect("first command");
+    let Some(Command::Submit { replies, .. }) = commands.recv().await else {
+        panic!("first command");
+    };
     let mut replies = replies.into_iter();
     assert!(admission.try_acquire().is_err());
 
@@ -192,10 +200,13 @@ async fn admission_credit_covers_batch_replies_and_pre_enqueue_paths() {
         ]
     );
 
-    let Command::Submit { replies, .. } = time::timeout(Duration::from_secs(1), commands.recv())
-        .await
-        .expect("second command should be released")
-        .expect("second command");
+    let Some(Command::Submit { replies, .. }) =
+        time::timeout(Duration::from_secs(1), commands.recv())
+            .await
+            .expect("second command should be released")
+    else {
+        panic!("second command");
+    };
     for reply in replies {
         reply.send(Ok(data_result(Bytes::from_static(b"second"))));
     }
@@ -253,6 +264,8 @@ async fn admission_credit_covers_batch_replies_and_pre_enqueue_paths() {
         tx: failed_tx.clone(),
         block_tx: failed_block_tx,
         admission: failed_admission.clone(),
+        warmups: mpsc::unbounded_channel().0,
+        warmup: Arc::default(),
     });
     failed_tx
         .send(Command::Submit {
@@ -390,4 +403,121 @@ async fn duplicate_callers_require_distinct_admission_credits() {
     );
     assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(broker.admission.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn candidate_lookup_is_answered_while_reads_hold_admission_and_execution() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor: JobExecutor = {
+        let started = started.clone();
+        let release = release.clone();
+        let executions = executions.clone();
+        Arc::new(move |_resources, group, _endpoints, _control| {
+            let started = started.clone();
+            let release = release.clone();
+            executions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                JobOutput {
+                    completions: group
+                        .into_iter()
+                        .map(|item| (item.key, Ok(data_result(read_calldata(&item.read)))))
+                        .collect(),
+                    requests: Vec::new(),
+                }
+            })
+        })
+    };
+    let broker = RpcBroker::spawn_with_test_config_and_capacity(
+        reqwest::Client::new(),
+        Duration::ZERO,
+        1,
+        NonZeroUsize::new(1).unwrap(),
+        executor,
+    )
+    .expect("test broker requires an active Tokio runtime");
+    let route = test_route();
+    let held = tokio::spawn({
+        let broker = broker.clone();
+        let route = route.clone();
+        async move {
+            broker
+                .submit(RpcSubmission::new(
+                    route,
+                    vec![RpcRead::eth_call(Address::ZERO, Bytes::new())],
+                    test_origin(),
+                ))
+                .await
+        }
+    });
+    started.notified().await;
+    assert_eq!(broker.admission.available_permits(), 0);
+
+    // The only submission credit and read slot are held, yet the actor answers at once.
+    let candidates = time::timeout(
+        Duration::from_secs(1),
+        broker.endpoint_candidates(route.chain_route(), None),
+    )
+    .await
+    .expect("the lookup does not wait for held capacity")
+    .expect("eligible endpoints");
+    assert_eq!(candidates, route.endpoints());
+    assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release.notify_one();
+    assert!(held.await.expect("held submission").is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn candidate_lookup_is_bounded_and_reports_shutdown() {
+    let (tx, mut commands) = mpsc::channel(1);
+    let (block_tx, _block_rx) = mpsc::unbounded_channel();
+    let broker = RpcBroker {
+        tx,
+        block_tx,
+        admission: Arc::new(Semaphore::new(1)),
+        warmups: mpsc::unbounded_channel().0,
+        warmup: Arc::default(),
+    };
+    let route = test_route();
+    let route = route.chain_route();
+
+    // An unanswered lookup ends at the internal limit even without a caller deadline.
+    let started = time::Instant::now();
+    assert_eq!(
+        broker.endpoint_candidates(route, None).await,
+        Err(RpcBrokerError::Timeout)
+    );
+    assert!(started.elapsed() >= METADATA_LOOKUP_LIMIT);
+    // That lookup fills the mailbox, so the next one waits to enqueue until its earlier deadline.
+    let started = time::Instant::now();
+    assert_eq!(
+        broker
+            .endpoint_candidates(route, Some(started + Duration::from_millis(20)))
+            .await,
+        Err(RpcBrokerError::Timeout)
+    );
+    assert!(started.elapsed() < METADATA_LOOKUP_LIMIT);
+
+    // A dropped reply and a closed mailbox both report shutdown.
+    assert!(matches!(
+        commands.recv().await,
+        Some(Command::Candidates { .. })
+    ));
+    let lookup = broker.endpoint_candidates(route, None);
+    tokio::pin!(lookup);
+    assert!(matches!(poll!(&mut lookup), std::task::Poll::Pending));
+    let Some(Command::Candidates { reply, .. }) = commands.recv().await else {
+        panic!("candidate lookup");
+    };
+    drop(reply);
+    assert_eq!(lookup.await, Err(RpcBrokerError::Shutdown));
+    drop(commands);
+    assert_eq!(
+        broker.endpoint_candidates(route, None).await,
+        Err(RpcBrokerError::Shutdown)
+    );
 }

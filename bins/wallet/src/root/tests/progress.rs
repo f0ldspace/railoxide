@@ -430,6 +430,25 @@ fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() 
         message: Some(Arc::from("insufficient native balance for public action")),
         ..gas_error.clone()
     };
+    let shield_estimate_error = PublicActionStepState {
+        step: PublicActionProgressStep::Shield,
+        message: Some(Arc::from(
+            "all public action query RPC attempts failed: estimate public action gas: server returned an error response: error code 3: execution reverted, data: \"0x\"",
+        )),
+        ..gas_error.clone()
+    };
+    let receipt_error = PublicActionStepState {
+        step: PublicActionProgressStep::Shield,
+        tx_hash: Some(Arc::from("0x1234")),
+        message: Some(Arc::from("shield transaction reverted on-chain")),
+        ..gas_error
+    };
+    let advanced_estimate_error = PublicActionStepState {
+        message: Some(Arc::from(
+            "re-estimate authorized advanced public transaction gas: execution reverted",
+        )),
+        ..gas_error.clone()
+    };
 
     assert_eq!(
         public_action_error_retry_kind(&gas_error),
@@ -443,6 +462,31 @@ fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() 
         public_action_error_retry_kind(&balance_error),
         PublicActionGasRetryKind::RetryEstimate,
     );
+    for step in [&shield_estimate_error, &advanced_estimate_error] {
+        assert_eq!(
+            public_action_error_retry_kind(step),
+            PublicActionGasRetryKind::RetryEstimate,
+        );
+        let summary = public_action_error_summary(step.step, step.message.as_deref(), "WETH");
+        assert!(summary.starts_with("Could not estimate gas"));
+        assert!(!summary.contains("on-chain"));
+    }
+    assert_eq!(
+        public_action_error_retry_kind(&receipt_error),
+        PublicActionGasRetryKind::RetryStep,
+    );
+    assert!(
+        public_action_error_summary(receipt_error.step, receipt_error.message.as_deref(), "WETH")
+            .contains("reverted on-chain")
+    );
+    let summary = public_action_error_summary(
+        PublicActionProgressStep::Shield,
+        balance_error.message.as_deref(),
+        "WETH",
+    );
+    assert!(summary.contains("native balance"));
+    assert!(summary.contains("network fees"));
+    assert!(!summary.contains("WETH"));
     assert_eq!(
         public_action_error_summary(
             PublicActionProgressStep::Wrap,

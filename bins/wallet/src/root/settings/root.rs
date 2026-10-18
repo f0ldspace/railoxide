@@ -282,6 +282,7 @@ impl WalletRoot {
                 self.ui_state.last_chain_id = Some(chain.chain_id);
                 self.save_ui_state();
             }
+            self.install_chain_background();
             let items = self
                 .effective_chain_configs
                 .enabled_chains()

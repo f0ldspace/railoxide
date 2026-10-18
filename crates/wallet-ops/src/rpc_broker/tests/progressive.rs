@@ -2,14 +2,18 @@
 //!
 //! Every wait is bounded in real time so a verification barrier fails quickly instead of hanging.
 
+use super::candidates::ready;
 use super::*;
+use crate::HttpContext;
+use crate::rpc_broker::RpcCandidates;
+use crate::rpc_broker::capacity::DEFAULT_MAX_IDENTITY_PROBES;
 
 const BOUND: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(5);
 /// Time for the broker to start a further probe if it would exceed the probe budget.
 const SETTLE: Duration = Duration::from_millis(200);
-/// Production identity-probe budget: one of the broker's HTTP slots stays available to reads.
-const PROBE_BUDGET: usize = DEFAULT_MAX_IN_FLIGHT - 1;
+const PROBE_BUDGET: usize = DEFAULT_MAX_IDENTITY_PROBES;
+const WARMUP_BUDGET: usize = PROBE_BUDGET / 2;
 const IDENTITY_METHOD: &str = "eth_chainId";
 const LONG_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -46,6 +50,8 @@ struct Traffic {
     maximum: Arc<AtomicUsize>,
     active_identity: Arc<AtomicUsize>,
     maximum_identity: Arc<AtomicUsize>,
+    active_reads: Arc<AtomicUsize>,
+    maximum_reads: Arc<AtomicUsize>,
 }
 
 impl Traffic {
@@ -55,6 +61,9 @@ impl Traffic {
         if identity {
             let current = self.active_identity.fetch_add(1, Ordering::SeqCst) + 1;
             self.maximum_identity.fetch_max(current, Ordering::SeqCst);
+        } else {
+            let current = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum_reads.fetch_max(current, Ordering::SeqCst);
         }
         InFlight {
             traffic: self.clone(),
@@ -69,13 +78,18 @@ impl Traffic {
     fn assert_within_production_bounds(&self) {
         let identity = self.maximum_identity.load(Ordering::SeqCst);
         let total = self.maximum.load(Ordering::SeqCst);
+        let reads = self.maximum_reads.load(Ordering::SeqCst);
         assert!(
             identity <= PROBE_BUDGET,
             "{identity} concurrent identity requests exceed the probe budget of {PROBE_BUDGET}"
         );
         assert!(
-            total <= DEFAULT_MAX_IN_FLIGHT,
-            "{total} concurrent physical requests exceed {DEFAULT_MAX_IN_FLIGHT}"
+            reads <= DEFAULT_MAX_IN_FLIGHT,
+            "{reads} concurrent reads exceed {DEFAULT_MAX_IN_FLIGHT}"
+        );
+        assert!(
+            total <= DEFAULT_MAX_IN_FLIGHT + PROBE_BUDGET,
+            "{total} concurrent physical requests exceed the combined budgets"
         );
     }
 }
@@ -90,6 +104,8 @@ impl Drop for InFlight {
         self.traffic.active.fetch_sub(1, Ordering::SeqCst);
         if self.identity {
             self.traffic.active_identity.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            self.traffic.active_reads.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -97,6 +113,7 @@ impl Drop for InFlight {
 struct EndpointState {
     responder: RpcResponder,
     identity_gate: Option<Latch>,
+    read_gate: Option<Latch>,
     read_received: Latch,
     methods: Arc<Mutex<Vec<String>>>,
     traffic: Traffic,
@@ -128,6 +145,15 @@ async fn spawn_endpoint(
     identity_gate: Option<Latch>,
     traffic: &Traffic,
 ) -> MockEndpoint {
+    spawn_endpoint_with_read_gate(responder, identity_gate, None, traffic).await
+}
+
+async fn spawn_endpoint_with_read_gate(
+    responder: RpcResponder,
+    identity_gate: Option<Latch>,
+    read_gate: Option<Latch>,
+    traffic: &Traffic,
+) -> MockEndpoint {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind RPC mock");
@@ -137,6 +163,7 @@ async fn spawn_endpoint(
     let state = Arc::new(EndpointState {
         responder,
         identity_gate,
+        read_gate,
         read_received: read_received.clone(),
         methods: Arc::clone(&methods),
         traffic: traffic.clone(),
@@ -173,6 +200,13 @@ async fn serve_endpoint(mut stream: TcpStream, state: Arc<EndpointState>) -> std
         }
     } else {
         state.read_received.open();
+        if let Some(gate) = &state.read_gate {
+            let mut probe = [0_u8; 1];
+            tokio::select! {
+                () = gate.wait() => {}
+                _ = stream.read(&mut probe) => return Ok(()),
+            }
+        }
     }
     let response = serde_json::to_vec(&(state.responder)(request)).expect("RPC mock JSON response");
     drop(in_flight);
@@ -226,8 +260,12 @@ fn member_results() -> [Bytes; 2] {
 
 /// Verifies chain 1 and serves every read: aggregates with `member_results`, others with `0x42`.
 fn healthy_responder() -> RpcResponder {
-    Arc::new(|request: Value| match request["method"].as_str() {
-        Some(IDENTITY_METHOD) => rpc_result(&request, &json!("0x1")),
+    healthy_responder_for_chain(1)
+}
+
+fn healthy_responder_for_chain(chain_id: u64) -> RpcResponder {
+    Arc::new(move |request: Value| match request["method"].as_str() {
+        Some(IDENTITY_METHOD) => rpc_result(&request, &json!(format!("0x{chain_id:x}"))),
         Some("eth_call") => aggregate_response(
             &request,
             member_results()
@@ -431,40 +469,101 @@ async fn individual_read_fails_over_to_endpoint_verified_after_first_attempt() {
 }
 
 #[tokio::test]
-async fn cached_ready_read_runs_while_four_jobs_await_identity_verification() {
+async fn eight_identity_checks_leave_four_read_slots_available_across_chains() {
     let traffic = Traffic::default();
     let broker = test_broker(Duration::from_millis(1), DEFAULT_MAX_IN_FLIGHT);
-    let (ready, ready_route) = warmed_ready_route(&broker, &traffic).await;
-    let stall = Latch::new();
-    // Three of these jobs probe; the fourth waits for probe capacity.
-    let mut stalled = Vec::new();
-    for _ in 0..DEFAULT_MAX_IN_FLIGHT {
-        stalled.push(stalled_verification_job(&broker, &traffic, &stall).await);
+    let reads_gate = Latch::new();
+    let mut ready = Vec::new();
+    for chain_id in 1..=DEFAULT_MAX_IN_FLIGHT as u64 + 1 {
+        let endpoint = spawn_endpoint_with_read_gate(
+            healthy_responder_for_chain(chain_id),
+            None,
+            Some(reads_gate.clone()),
+            &traffic,
+        )
+        .await;
+        let route = RpcRoute::from(
+            RpcChainRoute::new(chain_id, vec![endpoint.url.clone()]).with_identity_verification(),
+        );
+        warm_identity(&route, &endpoint.url).await;
+        ready.push((endpoint, route));
     }
+    let stall = Latch::new();
+    let mut stalled = Vec::new();
+    let mut extra_endpoints = Vec::new();
+    // Separate chains and a multi-endpoint job share one probe budget. Further checks wait.
+    for chain_id in 100..=100 + PROBE_BUDGET as u64 {
+        let endpoint = spawn_endpoint(
+            healthy_responder_for_chain(chain_id),
+            Some(stall.clone()),
+            &traffic,
+        )
+        .await;
+        let mut urls = vec![endpoint.url.clone()];
+        if chain_id == 100 {
+            let extra = spawn_endpoint(
+                healthy_responder_for_chain(chain_id),
+                Some(stall.clone()),
+                &traffic,
+            )
+            .await;
+            urls.push(extra.url.clone());
+            extra_endpoints.push(extra);
+        }
+        let route = long_lived(RpcRoute::from(
+            RpcChainRoute::new(chain_id, urls).with_identity_verification(),
+        ));
+        let task = spawn_submit(&broker, route, Shape::Individual.reads(0));
+        stalled.push((endpoint, task));
+    }
+    wait_until("eight identity requests are active", || {
+        traffic.identity_in_flight() == PROBE_BUDGET
+    })
+    .await;
+    time::sleep(SETTLE).await;
+    assert_eq!(
+        traffic.maximum_identity.load(Ordering::SeqCst),
+        PROBE_BUDGET
+    );
+
+    let reads = ready
+        .iter()
+        .map(|(_, route)| {
+            spawn_submit(&broker, route.clone(), vec![method_read("eth_blockNumber")])
+        })
+        .collect::<Vec<_>>();
     wait_until(
-        "the probe budget is occupied by stalled identity checks",
-        || traffic.identity_in_flight() >= PROBE_BUDGET,
+        "four cached-ready reads dispatch during verification",
+        || traffic.active_reads.load(Ordering::SeqCst) == DEFAULT_MAX_IN_FLIGHT,
     )
     .await;
     time::sleep(SETTLE).await;
-    // A fifth verification-only job now heads the shared origin lane ahead of the ready read.
-    stalled.push(stalled_verification_job(&broker, &traffic, &stall).await);
-    time::sleep(SETTLE).await;
-
-    let results = submit_within(
-        &broker,
-        &ready_route,
-        vec![method_read("eth_blockNumber")],
-        "cached-ready read behind stalled verification",
-    )
-    .await;
-
-    assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
-    assert_eq!(ready.reads(), ["eth_gasPrice", "eth_blockNumber"]);
+    assert!(!stall.is_open());
+    assert_eq!(traffic.identity_in_flight(), PROBE_BUDGET);
+    assert_eq!(
+        traffic.active.load(Ordering::SeqCst),
+        PROBE_BUDGET + DEFAULT_MAX_IN_FLIGHT
+    );
     traffic.assert_within_production_bounds();
+
+    reads_gate.open();
+    for read in reads {
+        let results = time::timeout(BOUND, read)
+            .await
+            .expect("cached-ready read completes while probes remain stalled")
+            .expect("submission task")
+            .expect("broker admits the submission");
+        assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
+    }
+    assert!(!stall.is_open());
     release_stalled_jobs(&stall, stalled).await;
     drop(broker);
-    ready.server.abort();
+    for endpoint in extra_endpoints {
+        endpoint.server.abort();
+    }
+    for (endpoint, _) in ready {
+        endpoint.server.abort();
+    }
 }
 
 #[tokio::test]
@@ -540,19 +639,22 @@ async fn parked_jobs_wake_when_a_route_clone_verifies_an_endpoint() {
     ]));
     warm_identity(&route, &failing.url).await;
     let mut stalled = Vec::new();
-    for _ in 0..PROBE_BUDGET {
+    for _ in 0..PROBE_BUDGET - 1 {
         stalled.push(stalled_verification_job(&broker, &traffic, &stall).await);
     }
     wait_until(
         "the probe budget is occupied by stalled identity checks",
-        || traffic.identity_in_flight() >= PROBE_BUDGET,
+        || traffic.identity_in_flight() >= PROBE_BUDGET - 1,
     )
     .await;
 
-    // Takes the last probe runner; its probes wait for the occupied budget.
+    // Takes the last probe runner. Its first fallback fills the final physical probe permit.
     let probing = spawn_submit(&broker, route.clone(), Shape::Individual.reads(0));
     wait_until("the first job's read fails", || failing.reads().len() == 1).await;
-    time::sleep(SETTLE).await;
+    wait_until("the final runner fills the probe budget", || {
+        traffic.identity_in_flight() == PROBE_BUDGET
+    })
+    .await;
     // Starts without a runner, so after its read fails it waits for one.
     let runnerless = spawn_submit(&broker, route.clone(), vec![method_read("eth_blockNumber")]);
     wait_until("the second job's read fails", || failing.reads().len() == 2).await;
@@ -588,9 +690,9 @@ async fn queued_reads_start_when_their_own_route_verifies_outside_the_broker() {
     let traffic = Traffic::default();
     let broker = test_broker(Duration::from_millis(1), DEFAULT_MAX_IN_FLIGHT);
     let stall = Latch::new();
-    // Three of these jobs probe; the fourth waits for probe capacity. Every runner is held.
+    // Eight jobs occupy the independent probe budget. Every runner is held.
     let mut stalled = Vec::new();
-    for _ in 0..DEFAULT_MAX_IN_FLIGHT {
+    for _ in 0..PROBE_BUDGET {
         stalled.push(stalled_verification_job(&broker, &traffic, &stall).await);
     }
     wait_until(
@@ -710,14 +812,14 @@ async fn parked_read_keeps_its_dispatched_failure_when_the_caller_expires() {
 }
 
 #[tokio::test]
-async fn single_slot_broker_verifies_and_reads_serially() {
+async fn single_read_slot_broker_verifies_independently_and_serializes_reads() {
     let traffic = Traffic::default();
     let first = spawn_endpoint(healthy_responder(), None, &traffic).await;
     let second = spawn_endpoint(healthy_responder(), None, &traffic).await;
     let route = Shape::Individual.route(vec![first.url.clone(), second.url.clone()]);
     let broker = test_broker(Duration::from_millis(1), 1);
 
-    // Both jobs need verification, and one slot of each kind must still let them progress.
+    // A single read slot still lets both jobs make progress alongside their verification.
     let submissions = ["eth_gasPrice", "eth_blockNumber"]
         .map(|method| spawn_submit(&broker, route.clone(), vec![method_read(method)]));
     for submission in submissions {
@@ -729,8 +831,187 @@ async fn single_slot_broker_verifies_and_reads_serially() {
         assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
     }
 
-    assert_eq!(traffic.maximum.load(Ordering::SeqCst), 1);
+    assert_eq!(traffic.maximum_reads.load(Ordering::SeqCst), 1);
+    traffic.assert_within_production_bounds();
     drop(broker);
     first.server.abort();
     second.server.abort();
+}
+
+#[tokio::test]
+async fn warmup_leaves_capacity_for_cold_reads_and_releases_probes_when_dropped() {
+    let traffic = Traffic::default();
+    let broker = test_broker(Duration::from_millis(1), DEFAULT_MAX_IN_FLIGHT);
+    let (ready, ready_route) = warmed_ready_route(&broker, &traffic).await;
+    let stall = Latch::new();
+    let mut stalled = Vec::new();
+    let mut routes = Vec::new();
+    for _ in 0..2 {
+        let mut urls = Vec::new();
+        for _ in 0..WARMUP_BUDGET {
+            let endpoint = spawn_endpoint(healthy_responder(), Some(stall.clone()), &traffic).await;
+            urls.push(endpoint.url.clone());
+            stalled.push(endpoint);
+        }
+        routes.push(RpcChainRoute::new(1, urls).with_identity_verification());
+    }
+
+    let warmup = broker.warm_identities(routes, None);
+    wait_until("warmup occupies the probe budget", || {
+        traffic.identity_in_flight() >= WARMUP_BUDGET
+    })
+    .await;
+    time::sleep(SETTLE).await;
+    // One budget bounds the whole pass rather than each route.
+    assert_eq!(
+        traffic.maximum_identity.load(Ordering::SeqCst),
+        WARMUP_BUDGET
+    );
+
+    // Warmup uses no read permits.
+    let results = submit_within(
+        &broker,
+        &ready_route,
+        vec![method_read("eth_blockNumber")],
+        "cached-ready read during stalled warmup",
+    )
+    .await;
+    assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
+
+    // Foreground checks fill the remaining shared permits while warmup remains stalled.
+    let foreground_gate = Latch::new();
+    let mut foreground = Vec::new();
+    for _ in 0..PROBE_BUDGET - WARMUP_BUDGET {
+        foreground.push(stalled_verification_job(&broker, &traffic, &foreground_gate).await);
+    }
+    wait_until("foreground and warmup fill the shared probe budget", || {
+        traffic.identity_in_flight() == PROBE_BUDGET
+    })
+    .await;
+
+    // A fifth foreground check cannot bypass the shared limit.
+    let overflow = stalled_verification_job(&broker, &traffic, &foreground_gate).await;
+    time::sleep(SETTLE).await;
+    assert!(
+        overflow
+            .0
+            .methods
+            .lock()
+            .expect("method log lock")
+            .is_empty()
+    );
+    assert!(!overflow.1.is_finished());
+    foreground.push(overflow);
+    assert_eq!(traffic.identity_in_flight(), PROBE_BUDGET);
+    assert_eq!(
+        traffic.maximum_identity.load(Ordering::SeqCst),
+        PROBE_BUDGET
+    );
+    assert!(foreground.iter().all(|(_, task)| !task.is_finished()));
+    assert!(!stall.is_open());
+    traffic.assert_within_production_bounds();
+
+    // Releasing foreground checks lets all five reads finish before any warmup check does.
+    release_stalled_jobs(&foreground_gate, foreground).await;
+    assert!(!stall.is_open());
+    assert_eq!(traffic.identity_in_flight(), WARMUP_BUDGET);
+    traffic.assert_within_production_bounds();
+
+    // Dropping the owner cancels the stalled checks and releases their capacity.
+    drop(warmup);
+    wait_until("cancelled warmup releases its probe permits", || {
+        traffic.identity_in_flight() == 0
+    })
+    .await;
+    assert!(!stall.is_open());
+    stall.open();
+    drop(broker);
+    ready.server.abort();
+    for endpoint in stalled {
+        endpoint.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn trusted_endpoint_serves_reads_and_candidates_while_its_warmup_probe_is_held() {
+    let traffic = Traffic::default();
+    let probe = Latch::new();
+    let trusted = spawn_endpoint(healthy_responder(), Some(probe.clone()), &traffic).await;
+    let http = HttpContext::direct_for_tests();
+    let route = RpcChainRoute::new(1, vec![trusted.url.clone()]);
+
+    let warmup = http.rpc_broker().warm_identities(vec![route.clone()], None);
+    // A trusted route's identity check sends nothing, so only the warmup probe can be in flight.
+    wait_until("warmup probes the trusted endpoint", || {
+        traffic.identity_in_flight() == 1
+    })
+    .await;
+
+    let results = submit_within(
+        &http.rpc_broker(),
+        &RpcRoute::from(route.clone()),
+        vec![method_read("eth_blockNumber")],
+        "read on a trusted route during its warmup probe",
+    )
+    .await;
+    assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
+    let candidates = time::timeout(BOUND, RpcCandidates::acquire(&http, &route, None))
+        .await
+        .expect("candidates are captured during the probe")
+        .expect("candidates");
+    assert_eq!(ready(&candidates), vec![0]);
+    // Neither foreground path started an identity check of its own.
+    let methods = trusted.methods.lock().expect("method log lock").clone();
+    assert_eq!(methods, [IDENTITY_METHOD, "eth_blockNumber"]);
+    drop(warmup);
+    probe.open();
+    trusted.server.abort();
+}
+
+#[tokio::test]
+async fn one_failed_warmup_probe_withdraws_a_trusted_endpoint_from_reads_and_snapshots() {
+    let traffic = Traffic::default();
+    let failing = spawn_endpoint(
+        Arc::new(|request: Value| rpc_error(&request, -32603)),
+        None,
+        &traffic,
+    )
+    .await;
+    // Passes its probe, but its read failure would fail over to any other eligible endpoint.
+    let fallback = spawn_endpoint(failing_read_responder(), None, &traffic).await;
+    let http = HttpContext::direct_for_tests();
+    let route = RpcChainRoute::new(1, vec![failing.url.clone(), fallback.url.clone()]);
+
+    let warmup = http.rpc_broker().warm_identities(vec![route.clone()], None);
+    time::timeout(BOUND, async {
+        loop {
+            let snapshot = http
+                .rpc_broker()
+                .endpoint_candidates(&route, None)
+                .await
+                .expect("candidates");
+            if snapshot.len() == 1 && *snapshot[0].expose_url() == fallback.url {
+                break;
+            }
+            time::sleep(POLL).await;
+        }
+    })
+    .await
+    .expect("a fresh snapshot excludes the endpoint whose probe failed");
+
+    let results = submit_within(
+        &http.rpc_broker(),
+        &RpcRoute::from(route.clone()),
+        vec![method_read("eth_blockNumber")],
+        "read after the failed warmup probe",
+    )
+    .await;
+    assert!(matches!(results.as_slice(), [Err(_)]));
+    assert_eq!(fallback.reads(), ["eth_blockNumber"]);
+    // One failed probe, below the ordinary threshold, kept the read from failing over to it.
+    let methods = failing.methods.lock().expect("method log lock").clone();
+    assert_eq!(methods, [IDENTITY_METHOD]);
+    drop(warmup);
+    failing.server.abort();
+    fallback.server.abort();
 }

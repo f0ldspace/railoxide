@@ -409,6 +409,10 @@ pub(crate) struct WalletRoot {
     #[cfg(feature = "hardware")]
     trezor_passphrase_mode_focus: FocusHandle,
     http: HttpContext,
+    /// Identity warmup for the installed routes on `http`; replaced with the settings and
+    /// cleared before the network context is handed off.
+    rpc_identity_warmup: Option<wallet_ops::RpcIdentityWarmup>,
+    active_rpc_chains: BTreeSet<u64>,
     network_context_id: String,
     network_health: WalletNetworkHealth,
     tor_bridge_activity: Option<wallet_ops::TorBridgeActivitySnapshot>,
@@ -1468,6 +1472,8 @@ impl WalletRoot {
             #[cfg(feature = "hardware")]
             trezor_passphrase_mode_focus,
             http,
+            rpc_identity_warmup: None,
+            active_rpc_chains: BTreeSet::new(),
             network_context_id: format!("{:032x}", rand::random::<u128>()),
             network_health,
             tor_bridge_activity,

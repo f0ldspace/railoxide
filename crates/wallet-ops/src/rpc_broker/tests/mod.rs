@@ -28,6 +28,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::{self, Instant};
 use url::Url;
 
+/// Identity probes a candidate source runs at once, for tests outside the broker.
+pub(crate) const MAX_IDENTITY_PROBES: usize = super::identity::MAX_IDENTITY_PROBES;
+
 pub(crate) fn data_result(bytes: Bytes) -> RpcResult {
     RpcResult::new(serde_json::to_value(bytes).expect("Bytes serialize"))
 }
@@ -183,7 +186,7 @@ pub(super) fn aggregate_response(request: &Value, results: Vec<(bool, Bytes)>) -
 
 pub(crate) type RpcResponder = Arc<dyn Fn(Value) -> Value + Send + Sync>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct RpcMockGate {
     pub(crate) request_started: Arc<tokio::sync::Notify>,
     pub(crate) release_response: Arc<tokio::sync::Notify>,
@@ -206,7 +209,7 @@ pub(crate) async fn spawn_gated_rpc_mock(
     spawn_rpc_mock_with_gate(responder, active, maximum, Some(gate)).await
 }
 
-pub(super) async fn spawn_rpc_mock_with_gate(
+pub(crate) async fn spawn_rpc_mock_with_gate(
     responder: RpcResponder,
     active: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
@@ -326,7 +329,9 @@ async fn handle_rpc_mock(
 }
 
 mod actor;
+mod candidates;
 mod methods;
 mod model;
 mod profile;
 mod progressive;
+mod warmup;

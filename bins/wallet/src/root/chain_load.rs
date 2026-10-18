@@ -1704,6 +1704,11 @@ impl WalletRoot {
         let waku_completion = self.stop_waku_for_root_replacement();
         let proposal_cleanup = self.proposals.take_cleanup();
         let cleanup = self.wallet_sync_lifecycle.invalidate();
+        // A retained Tor context must not keep warming the outgoing routes.
+        self.rpc_identity_warmup = None;
+        self.active_rpc_chains.clear();
+        self.public_broadcaster_anchor_refresh
+            .set_active_chains(&[]);
         let outgoing_http = self.http.clone();
         self.reset_wallet_scoped_state(cx);
         self.start_wallet_sync_cleanup(cleanup);
@@ -2878,6 +2883,54 @@ impl WalletRoot {
         .detach();
     }
 
+    pub(super) fn install_chain_background(&mut self) {
+        if self.wallet_sync_lifecycle_shutdown_started {
+            return;
+        }
+        self.rpc_identity_warmup = Some(wallet_ops::start_rpc_identity_warmup(
+            &self.http,
+            &self.effective_chain_configs,
+            self.selected_chain,
+        ));
+        let chains = self
+            .effective_chain_configs
+            .enabled_chains()
+            .filter(|chain| {
+                chain.require_railgun().is_ok()
+                    || chain.chain_id == self.selected_chain
+                    || self.active_rpc_chains.contains(&chain.chain_id)
+                    || self
+                        .public_transaction_tracker
+                        .has_pending_observation(chain.chain_id)
+            })
+            .map(|chain| chain.chain_id)
+            .collect::<Vec<_>>();
+        self.active_rpc_chains.clear();
+        self.activate_chains_background(chains);
+    }
+
+    pub(super) fn activate_chain_background(&mut self, chain_id: u64) {
+        self.activate_chains_background([chain_id]);
+    }
+
+    pub(super) fn activate_chains_background(&mut self, chains: impl IntoIterator<Item = u64>) {
+        if self.wallet_sync_lifecycle_shutdown_started {
+            return;
+        }
+        for chain_id in chains {
+            let Ok(chain) = self.effective_chain_configs.enabled(chain_id) else {
+                continue;
+            };
+            if self.active_rpc_chains.insert(chain_id)
+                && let Some(warmup) = &self.rpc_identity_warmup
+            {
+                warmup.activate_route(chain.rpc_route.clone());
+            }
+        }
+        self.public_broadcaster_anchor_refresh
+            .set_active_chains(&self.active_rpc_chains.iter().copied().collect::<Vec<_>>());
+    }
+
     pub(super) fn select_chain(
         &mut self,
         chain_id: u64,
@@ -2898,6 +2951,10 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
+        self.activate_chain_background(chain_id);
+        if let Some(warmup) = &self.rpc_identity_warmup {
+            warmup.prioritize_chain(chain_id);
+        }
         if !self.selected_chain_has_railgun() {
             self.active_wallet_tab = WalletTab::Public;
         }

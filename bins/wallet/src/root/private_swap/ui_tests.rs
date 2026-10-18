@@ -5983,6 +5983,10 @@ fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut T
             )
         };
         open_bridge_form(root, swaps, &stubs, runtime, cx);
+        assert!(
+            !root.read_with(cx, |root, _| root.active_rpc_chains.contains(&137)),
+            "browsing a destination does not activate its background RPC work"
+        );
         swaps.read_with(cx, |swaps, cx| {
             let form = swaps.form.as_ref().unwrap();
             let items = swaps
@@ -6022,6 +6026,10 @@ fn bridge_buy_token_picks_the_provider_and_explains_a_same_token_pair(cx: &mut T
             });
         });
         assert_eq!(shown(cx), (true, false));
+        assert!(
+            root.read_with(cx, |root, _| root.active_rpc_chains.contains(&137)),
+            "committing the destination starts its background RPC work"
+        );
 
         // Only NEAR Intents delivers POL: it switches and quotes again.
         cx.update(|window, cx| {

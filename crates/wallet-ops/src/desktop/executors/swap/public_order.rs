@@ -39,7 +39,7 @@ use super::bridge::{
     AcrossOrigin, BridgeLegPrice, SwapBridgeQuote, across_bridge_quote, across_quote_covers,
     quote_across_preview,
 };
-use super::gas::hook_data_cost_from_rpc_pool;
+use super::gas::hook_data_cost_from_candidates;
 use super::order::{
     SwapGasPricing, SwapOrderOutcome, SwapPrice, SwapQuoteAnchor, SwapQuoteDiagnostics,
     anchor_token, approval_cushion, order_limit_or_tight, placeholder_destination_shield_multicall,
@@ -59,7 +59,9 @@ use crate::cow::{
     quote_protocol_fee,
 };
 use crate::desktop::executor_observation::trace_step;
-use crate::desktop::{gas_price_from_rpc_pool_with_policy, query_rpc_pool_with_http_client};
+use crate::desktop::{
+    acquire_fee_candidates, gas_price_from_candidates_with_policy, query_rpc_pool_with_http_client,
+};
 use crate::public_wallet::{VaultedPublicSigner, query_erc20_balance, sign_public_swap_typed_data};
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PublicSwapProfile};
 use crate::vault::{
@@ -1078,10 +1080,18 @@ impl ExecutorOwner {
                         .await
                         .map_err(eyre::Report::from)
                 };
+                // The gas price and data cost reads share this quote's candidates.
+                let fee_candidates =
+                    acquire_fee_candidates(&self.http, &origin.rpc_route, None).await?;
                 let (quote, gas_price_wei, hook_data_cost_wei) = tokio::try_join!(
                     quote,
-                    gas_price_from_rpc_pool_with_policy(&pool, 1, 1),
-                    hook_data_cost_from_rpc_pool(&pool, origin.chain_id, app_data_len, &origin.gas),
+                    gas_price_from_candidates_with_policy(&fee_candidates, 1, 1),
+                    hook_data_cost_from_candidates(
+                        &fee_candidates,
+                        origin.chain_id,
+                        app_data_len,
+                        &origin.gas,
+                    ),
                 )?;
                 let anchor = anchor_cache.map_or(Ok(None), |cache| {
                     cache.cached_pair_rate(

@@ -137,7 +137,10 @@ pub(in crate::root) fn public_action_error_summary(
             }
         };
     }
-    if details.contains("estimate gas") {
+    if public_action_error_is_native_gas_balance(&details) {
+        return "Not enough native balance to cover the estimated network fees.".to_string();
+    }
+    if public_action_error_is_gas_estimate(&details) {
         return match step {
             PublicActionProgressStep::ShieldKey => {
                 "Could not prepare hardware shield key authorization.".to_string()
@@ -153,7 +156,7 @@ pub(in crate::root) fn public_action_error_summary(
                     .to_string()
             }
             PublicActionProgressStep::Shield => {
-                "Could not estimate gas for shielding. Try again or check the RPC/network."
+                "Could not estimate gas for shielding. Check the gas balance and transaction details."
                     .to_string()
             }
             PublicActionProgressStep::Sponsor => {
@@ -386,12 +389,21 @@ pub(in crate::root) fn public_action_error_retry_kind(
         .as_deref()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if message.contains("estimate gas")
-        || message.contains("insufficient native gas")
-        || message.contains("insufficient native balance")
+    if public_action_error_is_gas_estimate(&message)
+        || public_action_error_is_native_gas_balance(&message)
     {
         PublicActionGasRetryKind::RetryEstimate
     } else {
         PublicActionGasRetryKind::RetryStep
     }
+}
+
+fn public_action_error_is_gas_estimate(details: &str) -> bool {
+    details.contains("estimate gas")
+        || details.contains("estimate public action gas")
+        || details.contains("re-estimate authorized advanced public transaction gas")
+}
+
+fn public_action_error_is_native_gas_balance(details: &str) -> bool {
+    details.contains("insufficient native gas") || details.contains("insufficient native balance")
 }

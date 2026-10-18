@@ -413,6 +413,14 @@ pub struct TokenAnchorRefreshHandle {
 }
 
 impl TokenAnchorRefreshHandle {
+    /// Selects chains whose native USD sources refresh in the background.
+    pub fn set_active_chains(&self, chain_ids: &[u64]) {
+        if self.cache.set_active_native_chains(chain_ids) {
+            self.configuration_tx
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
     pub fn reconcile_native_sources(
         &self,
         chains: &EffectiveChainRegistry,

@@ -3297,6 +3297,14 @@ impl PrivateSwapsView {
     ) {
         ensure_gas_bar_bindings(cx);
         ensure_buy_picker_bindings(cx);
+        if let Some(root) = self.root.upgrade() {
+            root.update(cx, |root, _| {
+                root.activate_chain_background(self.origin_chain_id);
+                if let SwapDelivery::Bridge(delivery) = delivery {
+                    root.activate_chain_background(delivery.destination_chain);
+                }
+            });
+        }
         let terms = terms.unwrap_or_default();
         let (receive_to, receiver) = match delivery {
             // A private Bridge delivery's receiver is its destination stealth account.

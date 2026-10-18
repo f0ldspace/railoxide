@@ -1,5 +1,17 @@
 use super::*;
 
+#[cfg(debug_assertions)]
+fn public_shield_error_ui_fixture_mode() -> Option<bool> {
+    static FUNDING_ERROR: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *FUNDING_ERROR.get_or_init(
+        || match std::env::var("RAILOXIDE_UI_FIXTURE").ok()?.as_str() {
+            "shield:estimate-error" => Some(false),
+            "shield:funding-error" => Some(true),
+            _ => None,
+        },
+    )
+}
+
 impl WalletRoot {
     pub(in crate::root) fn open_public_action_dialog(
         &mut self,
@@ -17,6 +29,10 @@ impl WalletRoot {
         };
         self.reset_public_action_gas_fee_quotes();
         self.clear_public_action_dialog_inputs(window, cx);
+        #[cfg(debug_assertions)]
+        if self.open_public_shield_error_ui_fixture(asset, window, cx) {
+            return;
+        }
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
@@ -57,6 +73,81 @@ impl WalletRoot {
         cx.defer_in(window, |root, window, cx| {
             root.focus_public_action_dialog_input(window, cx);
         });
+    }
+
+    /// `shield:estimate-error` and `shield:funding-error` stage an inert progress dialog
+    /// when a Public asset dialog is opened on a scratch profile. No action is submitted.
+    #[cfg(debug_assertions)]
+    pub(in crate::root) fn open_public_shield_error_ui_fixture(
+        &mut self,
+        asset: PublicAssetId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(funding_error) = public_shield_error_ui_fixture_mode() else {
+            return false;
+        };
+        let asset = self
+            .effective_chain_configs
+            .get(self.selected_chain)
+            .and_then(|chain| chain.wrapped_native_token)
+            .map_or(asset, PublicAssetId::Erc20);
+        let message = if funding_error {
+            "insufficient native balance for public shield estimated network fees"
+        } else {
+            "all public action query RPC attempts failed: estimate public action gas: server returned an error response: error code 3: execution reverted, data: \"0x\""
+        };
+        let states = vec![
+            PublicActionStepState {
+                step: PublicActionProgressStep::Approve,
+                status: if funding_error {
+                    PublicActionStepStatus::Error
+                } else {
+                    PublicActionStepStatus::Done
+                },
+                tx_hash: None,
+                message: funding_error.then(|| Arc::from(message)),
+                interval: None,
+            },
+            PublicActionStepState {
+                step: PublicActionProgressStep::Shield,
+                status: if funding_error {
+                    PublicActionStepStatus::NotStarted
+                } else {
+                    PublicActionStepStatus::Error
+                },
+                tx_hash: None,
+                message: (!funding_error).then(|| Arc::from(message)),
+                interval: None,
+            },
+        ];
+        self.start_public_action_progress_with_states(
+            PublicActionMode::Shield,
+            states,
+            public_asset_label(
+                self.effective_chain_configs.get(self.selected_chain),
+                asset,
+                Some(&self.effective_token_registry),
+            ),
+            public_asset_icon_path(
+                self.selected_chain,
+                asset,
+                Some(&self.effective_token_registry),
+            ),
+            PublicAccountSource::Derived,
+            None,
+            None,
+            false,
+        );
+        self.public_form.action_stop_available = false;
+        self.show_public_action_progress_dialog(window, cx);
+        cx.notify();
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    pub(in crate::root) fn public_shield_error_ui_fixture_active() -> bool {
+        public_shield_error_ui_fixture_mode().is_some()
     }
 
     pub(in crate::root) fn focus_public_action_dialog_input(
@@ -877,6 +968,10 @@ impl WalletRoot {
         action_mode: PublicActionMode,
         cx: &mut Context<'_, Self>,
     ) {
+        #[cfg(debug_assertions)]
+        if public_shield_error_ui_fixture_mode().is_some() {
+            return;
+        }
         let submitting = self.public_form.sending || self.public_form.shielding;
         let gas_fee = match action_mode {
             PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,

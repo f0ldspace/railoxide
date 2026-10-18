@@ -782,10 +782,23 @@ fn route_selection_orders_ties_by_hook_after_health_and_count() {
             .map(|endpoint| endpoint.expose_url().clone())
             .collect::<Vec<_>>()
     };
+    // Direct callers' requests are not counted, so their candidates keep the hook order alone.
+    let external = |actor: &mut Actor| {
+        actor
+            .select_candidates(route.chain_route())
+            .expect("route has endpoints")
+            .iter()
+            .map(|endpoint| endpoint.expose_url().clone())
+            .collect::<Vec<_>>()
+    };
 
     assert_eq!(
         selected(&mut actor),
         vec![urls[1].clone(), urls[0].clone(), urls[2].clone()]
+    );
+    assert_eq!(
+        external(&mut actor),
+        vec![urls[2].clone(), urls[1].clone(), urls[0].clone()]
     );
 
     for profile in actor.profiles.values_mut() {
@@ -800,6 +813,21 @@ fn route_selection_orders_ties_by_hook_after_health_and_count() {
             urls[2].clone()
         ]
     );
+    assert_eq!(
+        external(&mut actor),
+        vec![
+            urls[3].clone(),
+            urls[2].clone(),
+            urls[1].clone(),
+            urls[0].clone()
+        ]
+    );
+    // Selection never changes the session counts.
+    let counts = urls
+        .iter()
+        .map(|url| actor.profiles[&(1, url.clone())].request_count)
+        .collect::<Vec<_>>();
+    assert_eq!(counts, vec![1, 1, 5, 0]);
 }
 
 #[test]

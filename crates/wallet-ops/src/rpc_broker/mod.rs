@@ -13,6 +13,7 @@
 mod actor;
 mod broker;
 mod cache;
+mod candidates;
 mod capacity;
 mod execution;
 mod identity;
@@ -23,7 +24,9 @@ mod resolution;
 mod scheduler;
 #[cfg(test)]
 pub(crate) mod tests;
+mod warmup;
 pub use broker::RpcBroker;
+pub(crate) use candidates::RpcCandidates;
 pub(crate) use model::RpcBrokerViewCalls;
 pub(crate) use model::{BalanceRead, TransactionHashRead, total_failure};
 pub use model::{
@@ -31,3 +34,4 @@ pub use model::{
     RpcRead, RpcReadValidationError, RpcRemoteError, RpcResult, RpcRevert, RpcRoute, RpcSubmission,
     WalletRpcOrigin,
 };
+pub use warmup::RpcIdentityWarmup;

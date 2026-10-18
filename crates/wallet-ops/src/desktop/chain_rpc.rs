@@ -1,9 +1,11 @@
 use super::*;
+use crate::rpc_broker::RpcCandidates;
 use eyre::eyre;
 
 #[derive(Clone)]
 pub(super) struct EffectiveDesktopChainConfig {
-    pub(super) rpc_urls: Vec<Url>,
+    /// The resolved route, whose clones share its endpoint identity checks.
+    pub(super) rpc_route: RpcChainRoute,
     pub(super) railgun_contract: Address,
     pub(super) relay_adapt_contract: Address,
     pub(super) wrapped_native_token: Option<Address>,
@@ -18,7 +20,7 @@ pub(super) fn effective_desktop_chain_config(
     let private = effective_chain.require_railgun()?;
     let rpc_route = settings::resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     Ok(EffectiveDesktopChainConfig {
-        rpc_urls: rpc_route.endpoint_urls(),
+        rpc_route,
         railgun_contract: private.deployment.contract,
         relay_adapt_contract: private.deployment.relay_adapt_contract,
         wrapped_native_token: effective_chain.wrapped_native_token,
@@ -38,26 +40,58 @@ pub(crate) fn query_rpc_pool_with_http_client(
     ))
 }
 
-pub(crate) async fn buffered_gas_price_from_rpc_pool(
-    query_rpc_pool: &QueryRpcPool,
+/// Starts identity warmup for enabled privacy chains and `selected_chain`, prioritizing it.
+/// Other routes can be activated later through the returned handle. The registry's route objects
+/// are passed, so successful checks reach the caches that later reads use. Dropping every
+/// returned handle stops the pass.
+#[must_use]
+pub fn start_rpc_identity_warmup(
+    http: &HttpContext,
+    chains: &settings::EffectiveChainRegistry,
+    selected_chain: u64,
+) -> crate::RpcIdentityWarmup {
+    http.rpc_broker().warm_identities(
+        chains
+            .enabled_chains()
+            .filter(|chain| chain.chain_id == selected_chain || chain.require_railgun().is_ok())
+            .map(|chain| chain.rpc_route.clone())
+            .collect(),
+        Some(selected_chain),
+    )
+}
+
+/// Captures `route`'s fee candidates for one operation, without an enclosing deadline unless
+/// `deadline` gives one. A failed lookup never falls back to the route's raw endpoints.
+pub(crate) async fn acquire_fee_candidates(
+    http: &HttpContext,
+    route: &RpcChainRoute,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<RpcCandidates> {
+    RpcCandidates::acquire(http, route, deadline)
+        .await
+        .wrap_err("select fee query RPC candidates")
+}
+
+pub(crate) async fn buffered_gas_price_from_candidates(
+    candidates: &RpcCandidates,
     gas: &settings::EffectiveChainGasSettings,
 ) -> Result<u128> {
-    gas_price_from_rpc_pool_with_policy(
-        query_rpc_pool,
+    gas_price_from_candidates_with_policy(
+        candidates,
         u128::from(gas.gas_price_buffer_numerator),
         u128::from(gas.gas_price_buffer_denominator),
     )
     .await
 }
 
-pub(crate) async fn gas_price_from_rpc_pool_with_policy(
-    query_rpc_pool: &QueryRpcPool,
+pub(crate) async fn gas_price_from_candidates_with_policy(
+    candidates: &RpcCandidates,
     numerator: u128,
     denominator: u128,
 ) -> Result<u128> {
     let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+    for _ in 0..candidates.len() {
+        let Some(provider_handle) = candidates.random_ready().await else {
             break;
         };
         match buffered_gas_price_with_policy(&provider_handle.provider, numerator, denominator)
@@ -67,7 +101,7 @@ pub(crate) async fn gas_price_from_rpc_pool_with_policy(
             Err(error) => {
                 let rpc = http::redact_url_for_display(&provider_handle.url);
                 tracing::warn!(%error, %rpc, "fetch gas price failed");
-                query_rpc_pool.mark_bad_provider(&provider_handle);
+                candidates.pool().mark_bad_provider(&provider_handle);
                 last_error = Some(error);
             }
         }

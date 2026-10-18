@@ -58,7 +58,7 @@ use super::bridge::{
     SwapBridgeRoute, across_deposit, bridge_route,
 };
 use super::continuing::{SwapContinuingApprovals, is_public_across};
-use super::gas::hook_data_cost_from_rpc_pool;
+use super::gas::hook_data_cost_from_candidates;
 use super::simulation::{PreHookSimulation, simulate_pre_hook};
 use super::{
     DelegatedSwapExecutor, SwapExecutor, SwapExecutorSetup, SwapSetupInclusion, SwapShieldNotes,
@@ -71,8 +71,8 @@ use crate::cow::{
     post_hook_gas, pre_hook_gas, price_order_limit, quote_gas_units, quote_protocol_fee,
 };
 use crate::desktop::{
-    artifact_source, effective_desktop_chain_config, gas_price_from_rpc_pool_with_policy,
-    query_rpc_pool_with_http_client,
+    acquire_fee_candidates, artifact_source, effective_desktop_chain_config,
+    gas_price_from_candidates_with_policy,
 };
 use crate::poi_contexts::{
     active_list_pre_transaction_pois, build_pending_mixed_output_poi_context_records,
@@ -1934,7 +1934,8 @@ impl ExecutorOwner {
         let shield_fee_bps = RAILGUN_PROTOCOL_FEE_BPS;
         let sell_amount = order_sell_amount(plan.amount(), unshield_fee_bps)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
-        let pool = query_rpc_pool_with_http_client(chain.rpc_urls, &self.http);
+        // The gas price and data cost reads share this quote's candidates.
+        let fee_candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
         // Before setup the quote names the reserved executor or, for a preview, a stand-in
         // with no code, just as a fresh executor has none.
         let quote = async {
@@ -1959,7 +1960,7 @@ impl ExecutorOwner {
         let gas_price = async {
             let started = Instant::now();
             tracing::debug!(target: "swap_quote", step = "gas_price", "started");
-            let gas_price = gas_price_from_rpc_pool_with_policy(&pool, 1, 1).await;
+            let gas_price = gas_price_from_candidates_with_policy(&fee_candidates, 1, 1).await;
             tracing::debug!(
                 target: "swap_quote",
                 step = "gas_price",
@@ -1972,8 +1973,8 @@ impl ExecutorOwner {
         let (quote, gas_price_wei, hook_data_cost_wei) = tokio::try_join!(
             quote,
             gas_price,
-            hook_data_cost_from_rpc_pool(
-                &pool,
+            hook_data_cost_from_candidates(
+                &fee_candidates,
                 self.chain.chain_id,
                 plan.app_data_len(),
                 &chain.gas,

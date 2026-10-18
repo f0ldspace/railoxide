@@ -1208,6 +1208,21 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
     ) -> impl IntoElement {
+        #[cfg(debug_assertions)]
+        if Self::public_shield_error_ui_fixture_active() {
+            let root = root.clone();
+            return app_button(
+                "wallet-public-preview-shield-error",
+                "Preview Shield failure…",
+            )
+            .small()
+            .on_click(move |_, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_public_shield_error_ui_fixture(PublicAssetId::Native, window, cx);
+                });
+            })
+            .into_any_element();
+        }
         let derive_root = root.clone();
         let import_root = root.clone();
         app_button("wallet-public-add-account-trigger", "Add account")
@@ -1247,6 +1262,7 @@ impl WalletRoot {
                         },
                     ))
             })
+            .into_any_element()
     }
 
     /// Runs the add or import form with the vault password from device authentication.

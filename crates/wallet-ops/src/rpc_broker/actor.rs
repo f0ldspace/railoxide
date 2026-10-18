@@ -3,11 +3,13 @@ use super::capacity::{CapacityLedger, JobControl, JobResources, JobSlots, SlotKi
 use super::identity::CandidateOrder;
 use super::model::RpcResult;
 use super::model::{
-    JsonRpcFailurePolicy, RpcBrokerError, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
+    JsonRpcFailurePolicy, RpcBrokerError, RpcChainRoute, RpcOrigin, RpcRead, RpcRoute,
+    RpcSubmission,
 };
 use super::profile::EndpointProfile;
 use super::resolution::{ActiveWork, ReadReply, WaiterPolicy, WaiterState, WorkItem, WorkKey};
 use super::scheduler::{Claim, ExecutionJob, ReadyScheduler, RouteLoad};
+use super::warmup::{self, WarmupPass, WarmupRequest};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -16,7 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::futures::Notified;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Instant};
 use url::Url;
 
@@ -128,6 +130,11 @@ pub(super) enum Command {
         replies: Vec<ReadReply>,
         deadline: Option<Instant>,
     },
+    /// Answered at once with the route's eligible endpoints, without admission, slots or HTTP.
+    Candidates {
+        route: RpcChainRoute,
+        reply: oneshot::Sender<Result<Vec<poi::SensitiveUrl>, RpcBrokerError>>,
+    },
 }
 
 /// How a claimed job starts.
@@ -161,7 +168,7 @@ pub(super) struct Actor {
     active: HashMap<WorkKey, ActiveWork>,
     next_work_nonce: u64,
     jobs: FuturesUnordered<BoxFuture<'static, JobOutput>>,
-    /// Bounds read-active jobs and, separately, jobs owning a probe runner.
+    /// Bounds read-active jobs. Probe runners use the independent verification limit.
     max_in_flight: usize,
     ledger: Arc<CapacityLedger>,
     slot_tx: mpsc::UnboundedSender<SlotRequest>,
@@ -173,6 +180,11 @@ pub(super) struct Actor {
     cache: ReadCache,
     next_flush_at: Option<Instant>,
     candidate_order: CandidateOrder,
+    /// Kept so the warmup channel never closes while the actor runs.
+    warmup_tx: mpsc::UnboundedSender<WarmupRequest>,
+    warmup_rx: mpsc::UnboundedReceiver<WarmupRequest>,
+    /// The current installation's warmup pass; a newer request replaces it.
+    warmup: Option<WarmupPass>,
 }
 
 impl Actor {
@@ -185,6 +197,7 @@ impl Actor {
         candidate_order: CandidateOrder,
     ) -> Self {
         let (slot_tx, slot_rx) = mpsc::unbounded_channel();
+        let (warmup_tx, warmup_rx) = mpsc::unbounded_channel();
         Self {
             rx,
             interval,
@@ -207,7 +220,14 @@ impl Actor {
             cache: ReadCache::default(),
             next_flush_at: None,
             candidate_order,
+            warmup_tx,
+            warmup_rx,
+            warmup: None,
         }
+    }
+    /// Sender for the broker handle's warmup requests.
+    pub(super) fn warmup_requests(&self) -> mpsc::UnboundedSender<WarmupRequest> {
+        self.warmup_tx.clone()
     }
     pub(super) async fn run(mut self, mut block_rx: mpsc::UnboundedReceiver<BlockEvent>) {
         let mut block_events_closed = false;
@@ -258,7 +278,12 @@ impl Actor {
                             self.flush();
                         }
                     }
+                    Some(Command::Candidates { route, reply }) => {
+                        let _ = reply.send(self.select_candidates(&route));
+                    }
                     None => {
+                        // Shutdown never waits for warmup probes.
+                        self.warmup = None;
                         self.fail_pending(&RpcBrokerError::Shutdown);
                         // Running jobs waiting for a slot settle their work as shut down.
                         self.slot_rx.close();
@@ -315,6 +340,18 @@ impl Actor {
                     self.pump_ready();
                 },
                 () = ledger.changed() => self.pump_ready(),
+                Some(request) = self.warmup_rx.recv() => {
+                    // Dropping the previous pass drops its probes and their permits.
+                    self.warmup = Some(warmup::pass(
+                        self.resources.clone(),
+                        request,
+                        self.candidate_order,
+                    ));
+                },
+                event = warmup::next_event(self.warmup.as_mut(), &self.profiles) => match event {
+                    Some(event) => self.apply_warmup_event(&event),
+                    None => self.warmup = None,
+                },
                 // Built inside the branch because `select_all` panics on an empty set.
                 () = async {
                     futures_util::future::select_all(checks.iter_mut()).await;
@@ -525,7 +562,7 @@ impl Actor {
                 None => break,
             }
         }
-        while self.ledger.held(SlotKind::Runner) < self.max_in_flight {
+        while self.ledger.held(SlotKind::Runner) < self.resources.probe_limit {
             if let Some(request) = self.runner_waiters.pop_front() {
                 request.grant();
             } else if let Some(job) = self.scheduler.next_verification(job_read_ready) {
@@ -623,7 +660,7 @@ impl Actor {
                 // Jobs already waiting for a runner keep their turn.
                 if needs_runner
                     && self.ledger.held(SlotKind::Runner) + self.runner_waiters.len()
-                        < self.max_in_flight
+                        < self.resources.probe_limit
                 {
                     slots.acquire(SlotKind::Runner);
                 }
@@ -647,6 +684,47 @@ impl Actor {
         &mut self,
         route: &RpcRoute,
     ) -> Result<Vec<poi::SensitiveUrl>, RpcBrokerError> {
+        let route = route.chain_route();
+        let (mut ordered, counts) = self.eligible_endpoints(route)?;
+        // The hook orders ties; the stable sort still puts lower session counts first.
+        ordered.sort_by_key(|&index| counts[index]);
+        let endpoints = ordered
+            .into_iter()
+            .map(|index| route.endpoints()[index].clone())
+            .collect::<Vec<_>>();
+        Ok(endpoints)
+    }
+    /// Eligible endpoints in hook order for a caller that sends its own requests. Session counts
+    /// exclude that traffic, so ranking by them would keep favoring the same endpoints.
+    pub(super) fn select_candidates(
+        &mut self,
+        route: &RpcChainRoute,
+    ) -> Result<Vec<poi::SensitiveUrl>, RpcBrokerError> {
+        let (ordered, _) = self.eligible_endpoints(route)?;
+        let endpoints = ordered
+            .into_iter()
+            .map(|index| &route.endpoints()[index])
+            .filter(|endpoint| {
+                !self
+                    .warmup
+                    .as_ref()
+                    .is_some_and(|pass| pass.excludes(route, endpoint))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if endpoints.is_empty() {
+            return Err(RpcBrokerError::NoEndpoint {
+                chain_id: route.chain_id(),
+            });
+        }
+        Ok(endpoints)
+    }
+    /// Indices of the endpoints not withdrawn, or of every endpoint when all are, in hook order,
+    /// with each configured endpoint's session request count.
+    fn eligible_endpoints(
+        &mut self,
+        route: &RpcChainRoute,
+    ) -> Result<(Vec<usize>, Vec<u64>), RpcBrokerError> {
         if route.endpoints().is_empty() {
             return Err(RpcBrokerError::NoEndpoint {
                 chain_id: route.chain_id(),
@@ -658,11 +736,15 @@ impl Actor {
         let mut counts = Vec::with_capacity(route.endpoints().len());
         for (index, endpoint) in route.endpoints().iter().enumerate() {
             let url = endpoint.expose_url().clone();
+            let recovering = self
+                .warmup
+                .as_ref()
+                .is_some_and(|pass| pass.excludes(route, endpoint));
             let profile = self
                 .profiles
                 .entry((route.chain_id(), url.clone()))
                 .or_default();
-            if profile.restore_if_ready(now) {
+            if !recovering && profile.restore_if_ready(now) {
                 tracing::debug!(
                     chain_id = route.chain_id(),
                     endpoint = %crate::http::redact_url_for_display(&url),
@@ -670,7 +752,7 @@ impl Actor {
                 );
             }
             counts.push(profile.request_count);
-            if profile.is_withdrawn(now) {
+            if recovering || profile.is_withdrawn(now) {
                 withdrawn.push(index);
             } else {
                 candidates.push(index);
@@ -684,14 +766,8 @@ impl Actor {
             );
         }
         let mut ordered = if all_withdrawn { withdrawn } else { candidates };
-        // The hook orders ties; the stable sort still puts lower session counts first.
         (self.candidate_order)(&mut ordered);
-        ordered.sort_by_key(|&index| counts[index]);
-        let endpoints = ordered
-            .into_iter()
-            .map(|index| route.endpoints()[index].clone())
-            .collect::<Vec<_>>();
-        Ok(endpoints)
+        Ok((ordered, counts))
     }
     pub(super) fn complete_job(&mut self, output: JobOutput) {
         self.apply_request_events(&output.requests);
@@ -746,26 +822,52 @@ impl Actor {
     pub(super) fn apply_request_events(&mut self, events: &[RequestEvent]) {
         let now = Instant::now();
         for event in events {
-            let receiving_endpoint = crate::http::redact_url_for_display(&event.endpoint);
-            let key = (event.chain_id, event.endpoint.clone());
-            let profile = self.profiles.entry(key).or_default();
-            profile.request_count = profile.request_count.saturating_add(1);
-            match event.health_outcome {
-                EndpointHealthOutcome::Strike => {
-                    if profile.record_failure(now) {
-                        tracing::debug!(
-                            chain_id = event.chain_id,
-                            endpoint = %receiving_endpoint,
-                            withdrawal_level = profile.withdrawal_level,
-                            cooldown_ms = profile
-                                .withdrawn_until
-                                .map_or(0, |until| until.saturating_duration_since(now).as_millis()),
-                            "RPC endpoint withdrawn"
-                        );
-                    }
-                }
-                EndpointHealthOutcome::Healthy | EndpointHealthOutcome::Neutral => {}
+            self.apply_request_event(event, now, false);
+        }
+    }
+    /// Warmup strikes withdraw immediately; a successful recovery clears its cooldown.
+    pub(super) fn apply_warmup_event(&mut self, event: &RequestEvent) {
+        if event.health_outcome == EndpointHealthOutcome::Healthy {
+            let profile = self
+                .profiles
+                .get_mut(&(event.chain_id, event.endpoint.clone()));
+            if let Some(profile) = profile {
+                profile.withdrawn_until = None;
+                tracing::debug!(
+                    chain_id = event.chain_id,
+                    endpoint = %crate::http::redact_url_for_display(&event.endpoint),
+                    "RPC endpoint recovered"
+                );
             }
+        } else {
+            self.apply_request_event(event, Instant::now(), true);
+        }
+    }
+    fn apply_request_event(&mut self, event: &RequestEvent, now: Instant, warmup: bool) {
+        let receiving_endpoint = crate::http::redact_url_for_display(&event.endpoint);
+        let key = (event.chain_id, event.endpoint.clone());
+        let profile = self.profiles.entry(key).or_default();
+        profile.request_count = profile.request_count.saturating_add(1);
+        match event.health_outcome {
+            EndpointHealthOutcome::Strike => {
+                let withdrawn = if warmup {
+                    profile.withdraw_after_warmup_strike(now)
+                } else {
+                    profile.record_failure(now)
+                };
+                if withdrawn {
+                    tracing::debug!(
+                        chain_id = event.chain_id,
+                        endpoint = %receiving_endpoint,
+                        withdrawal_level = profile.withdrawal_level,
+                        cooldown_ms = profile
+                            .withdrawn_until
+                            .map_or(0, |until| until.saturating_duration_since(now).as_millis()),
+                        "RPC endpoint withdrawn"
+                    );
+                }
+            }
+            EndpointHealthOutcome::Healthy | EndpointHealthOutcome::Neutral => {}
         }
     }
     pub(super) async fn drain_jobs(&mut self) {
@@ -792,9 +894,11 @@ impl Actor {
     }
     pub(super) fn fail_queued(&mut self, error: &RpcBrokerError) {
         while let Ok(command) = self.rx.try_recv() {
-            let Command::Submit { replies, .. } = command;
-            for reply in replies {
-                reply.send(Err(error.clone()));
+            // Dropping a candidate lookup's reply reports shutdown to its caller.
+            if let Command::Submit { replies, .. } = command {
+                for reply in replies {
+                    reply.send(Err(error.clone()));
+                }
             }
         }
     }

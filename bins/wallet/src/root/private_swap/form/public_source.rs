@@ -2884,6 +2884,9 @@ impl PrivateSwapsView {
             self.public_tracking.remove(&key);
             return;
         };
+        root.update(cx, |root, _| {
+            root.activate_chains_background([origin_chain, chain]);
+        });
         let runtime = self.runtime.clone();
         cx.spawn_in(window, async move |view, cx| {
             let task = runtime.spawn(async move {
@@ -3206,6 +3209,9 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         self.open_public_form(account, saved.approval().sell_token, window, cx);
+        if let Some(root) = self.root.upgrade() {
+            root.update(cx, |root, _| root.activate_chain_background(chain));
+        }
         let decimals = self
             .form
             .as_ref()

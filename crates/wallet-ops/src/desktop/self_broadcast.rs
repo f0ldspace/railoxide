@@ -4,6 +4,8 @@ use eyre::eyre;
 
 use crate::block_observer::BlockObserver;
 use crate::public_wallet::PublicTransactionObservationGuard;
+use crate::rpc_broker::{RpcBrokerError, RpcCandidates};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopSponsoredSelfBroadcastResult {
@@ -165,7 +167,7 @@ pub(super) async fn submit_self_broadcast_plan(
 ) -> Result<DesktopSelfBroadcastResult> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let signer =
         if let Some(authorization @ DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)) =
             spend_authorization.as_ref()
@@ -227,13 +229,14 @@ pub(super) async fn submit_self_broadcast_plan(
         );
         let preflight = match self_broadcast_preflight_from_rpc_pool(
             &query_rpc_pool,
+            http,
+            &chain.rpc_route,
             chain_id,
             gas_payer,
             transaction.clone(),
             next_gas_fee,
             &chain.gas,
             nonce,
-            http.network_mode(),
         )
         .await
         {
@@ -395,6 +398,8 @@ pub(super) async fn submit_self_broadcast_plan(
                         .map_or(0, |attempt| attempt.info.gas_limit);
                     let replacement = match self_broadcast_replacement_preflight_from_rpc_pool(
                         &query_rpc_pool,
+                        http,
+                        &chain.rpc_route,
                         chain_id,
                         gas_payer,
                         transaction.clone(),
@@ -613,8 +618,12 @@ pub(super) async fn submit_self_broadcast_attempt(
     Ok(())
 }
 
+/// Each attempt re-quotes fees on a candidate from `route` and reads the balance on a
+/// `query_rpc_pool` provider. The candidates belong to this replacement alone.
 pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
+    http: &HttpContext,
+    route: &RpcChainRoute,
     chain_id: u64,
     from: Address,
     transaction: TransactionRequest,
@@ -622,12 +631,17 @@ pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
     gas_limit: u64,
     nonce: u64,
 ) -> Result<SelfBroadcastPreflight> {
+    let fee_candidates = acquire_fee_candidates(http, route, None).await?;
     let mut last_error = None;
     for _ in 0..query_rpc_pool.len() {
         let Some(provider_handle) = query_rpc_pool.random_provider() else {
             break;
         };
+        let Some(fee_provider) = fee_candidates.random_ready().await else {
+            break;
+        };
         match self_broadcast_replacement_preflight(
+            &fee_provider.provider,
             provider_handle,
             chain_id,
             from,
@@ -656,6 +670,7 @@ pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
 }
 
 pub(super) async fn self_broadcast_replacement_preflight(
+    fee_provider: &impl Provider,
     provider_handle: ProviderHandle,
     chain_id: u64,
     from: Address,
@@ -665,7 +680,7 @@ pub(super) async fn self_broadcast_replacement_preflight(
     nonce: u64,
 ) -> Result<SelfBroadcastPreflight> {
     let provider = &provider_handle.provider;
-    let quote = self_broadcast_gas_fee_quote(provider)
+    let quote = self_broadcast_gas_fee_quote(fee_provider)
         .await
         .wrap_err("fetch self-broadcast gas price")?;
     let SelfBroadcastResolvedGasFee {
@@ -808,24 +823,124 @@ impl SelfBroadcastFeeSample {
     }
 }
 
+/// Samples every candidate that is ready or becomes ready before collection ends. Returns
+/// `None` when no candidate became ready.
 pub(super) async fn self_broadcast_parallel_fee_samples(
-    providers: Vec<ProviderHandle>,
+    candidates: &RpcCandidates,
+    started_at: tokio::time::Instant,
     policy: SelfBroadcastFeeQuoteTimeoutPolicy,
-) -> Vec<SelfBroadcastFeeSample> {
-    self_broadcast_parallel_fee_samples_with_reads(providers, policy, None)
+) -> Option<Vec<SelfBroadcastFeeSample>> {
+    self_broadcast_parallel_fee_samples_with_reads(candidates, started_at, policy, None)
         .await
         .expect("native fee sampling does not return broker errors")
 }
 
+type SelfBroadcastFeeSampleJobs = JoinSet<Result<SelfBroadcastFeeSample, RpcBrokerError>>;
+
+/// The hard cutoff counts from `started_at` and the grace period from the first usable tip;
+/// neither restarts when a candidate becomes ready.
 async fn self_broadcast_parallel_fee_samples_with_reads(
-    providers: Vec<ProviderHandle>,
+    candidates: &RpcCandidates,
+    started_at: tokio::time::Instant,
     policy: SelfBroadcastFeeQuoteTimeoutPolicy,
     rpc_reads: Option<(crate::DappRpcReadClient, u64)>,
-) -> Result<Vec<SelfBroadcastFeeSample>, crate::rpc_broker::RpcBrokerError> {
-    let started_at = Instant::now();
+) -> Result<Option<Vec<SelfBroadcastFeeSample>>, RpcBrokerError> {
+    // Subscribed before the first launch, so no admission between the two is missed.
+    let mut progress = candidates.subscribe();
+    let mut more_candidates = true;
+    let mut launched = HashSet::new();
     let mut join_set = JoinSet::new();
-    for provider_handle in providers {
-        let rpc_reads = rpc_reads.clone();
+    launch_ready_fee_samples(
+        candidates,
+        &mut launched,
+        &mut join_set,
+        policy,
+        rpc_reads.as_ref(),
+    );
+
+    let hard_deadline = started_at + policy.hard_deadline;
+    let mut last_error = None;
+    let mut samples = Vec::new();
+    let mut grace_deadline = None;
+    // Without running jobs, collection continues only while a candidate may still arrive.
+    while !join_set.is_empty() || more_candidates {
+        let deadline = grace_deadline.map_or(hard_deadline, |grace: tokio::time::Instant| {
+            grace.min(hard_deadline)
+        });
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            biased;
+            joined = join_set.join_next(), if !join_set.is_empty() => match joined {
+                Some(Ok(Ok(sample))) => {
+                    let usable_tip = sample.has_usable_tip();
+                    samples.push(sample);
+                    if usable_tip && grace_deadline.is_none() {
+                        grace_deadline =
+                            Some(tokio::time::Instant::now() + policy.grace_after_first_usable);
+                    }
+                    let non_zero_fee_history_sources = samples
+                        .iter()
+                        .filter(|sample| sample.has_non_zero_fee_history_tip())
+                        .count();
+                    if non_zero_fee_history_sources >= 2 {
+                        break;
+                    }
+                }
+                Some(Ok(Err(error))) => {
+                    if crate::public_wallet::stops_dapp_read_retries(&error) {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "self-broadcast gas fee quote task failed");
+                }
+                None => {}
+            },
+            changed = progress.changed(), if more_candidates => {
+                if changed.is_ok() {
+                    launch_ready_fee_samples(
+                        candidates,
+                        &mut launched,
+                        &mut join_set,
+                        policy,
+                        rpc_reads.as_ref(),
+                    );
+                } else {
+                    more_candidates = false;
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    // Stops the sample jobs only; discovery belongs to the candidates' owner.
+    join_set.abort_all();
+    if launched.is_empty() {
+        return Ok(None);
+    }
+    if samples.is_empty()
+        && let Some(error) = last_error
+    {
+        return Err(error);
+    }
+    Ok(Some(samples))
+}
+
+/// Starts one sample job for each ready candidate not yet in `launched`.
+fn launch_ready_fee_samples(
+    candidates: &RpcCandidates,
+    launched: &mut HashSet<usize>,
+    join_set: &mut SelfBroadcastFeeSampleJobs,
+    policy: SelfBroadcastFeeQuoteTimeoutPolicy,
+    rpc_reads: Option<&(crate::DappRpcReadClient, u64)>,
+) {
+    for provider_handle in candidates.pool().available_providers() {
+        if !launched.insert(provider_handle.index) {
+            continue;
+        }
+        let rpc_reads = rpc_reads.cloned();
         join_set.spawn(async move {
             match rpc_reads {
                 Some((reads, chain_id)) => {
@@ -839,58 +954,6 @@ async fn self_broadcast_parallel_fee_samples_with_reads(
             }
         });
     }
-
-    let mut last_error = None;
-    let mut samples = Vec::new();
-    let mut grace_deadline = None;
-    while !join_set.is_empty() {
-        let now = Instant::now();
-        let Some(hard_remaining) = policy
-            .hard_deadline
-            .checked_sub(now.saturating_duration_since(started_at))
-        else {
-            break;
-        };
-        let wait_for = grace_deadline.map_or(hard_remaining, |deadline: Instant| {
-            deadline.saturating_duration_since(now).min(hard_remaining)
-        });
-        if wait_for.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(wait_for, join_set.join_next()).await {
-            Ok(Some(Ok(Ok(sample)))) => {
-                let usable_tip = sample.has_usable_tip();
-                samples.push(sample);
-                if usable_tip && grace_deadline.is_none() {
-                    grace_deadline = Some(Instant::now() + policy.grace_after_first_usable);
-                }
-                let non_zero_fee_history_sources = samples
-                    .iter()
-                    .filter(|sample| sample.has_non_zero_fee_history_tip())
-                    .count();
-                if non_zero_fee_history_sources >= 2 {
-                    break;
-                }
-            }
-            Ok(Some(Ok(Err(error)))) => {
-                if crate::public_wallet::stops_dapp_read_retries(&error) {
-                    return Err(error);
-                }
-                last_error = Some(error);
-            }
-            Ok(Some(Err(error))) => {
-                tracing::warn!(%error, "self-broadcast gas fee quote task failed");
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    join_set.abort_all();
-    if samples.is_empty()
-        && let Some(error) = last_error
-    {
-        return Err(error);
-    }
-    Ok(samples)
 }
 
 async fn self_broadcast_admitted_fee_sample(
@@ -1084,53 +1147,51 @@ pub(super) fn upper_quartile(values: &mut [u128]) -> Option<u128> {
     values.get(index).copied()
 }
 
-pub(super) async fn self_broadcast_gas_fee_quote_from_rpc_pool(
-    query_rpc_pool: &QueryRpcPool,
-    network_mode: WalletNetworkMode,
+/// Quotes from a candidate source owned by this quote. The broker lookup and any cold identity
+/// checks count against the sampler's hard window, which starts here.
+pub(super) async fn self_broadcast_gas_fee_quote_from_route(
+    http: &HttpContext,
+    route: &RpcChainRoute,
 ) -> Result<SelfBroadcastGasFeeQuote> {
-    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback(
-        query_rpc_pool,
+    let network_mode = http.network_mode();
+    let started_at = tokio::time::Instant::now();
+    let policy = SelfBroadcastFeeQuoteTimeoutPolicy::for_network_mode(network_mode);
+    let candidates =
+        acquire_fee_candidates(http, route, Some(started_at + policy.hard_deadline)).await?;
+    self_broadcast_gas_fee_quote_from_candidates_with_reads(
+        &candidates,
+        started_at,
         network_mode,
         SelfBroadcastTipFallback::Minimum,
-    )
-    .await
-}
-
-pub(crate) async fn self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback(
-    query_rpc_pool: &QueryRpcPool,
-    network_mode: WalletNetworkMode,
-    tip_fallback: SelfBroadcastTipFallback,
-) -> Result<SelfBroadcastGasFeeQuote> {
-    self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
-        query_rpc_pool,
-        network_mode,
-        tip_fallback,
         None,
     )
     .await
 }
 
-pub(crate) async fn self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
-    query_rpc_pool: &QueryRpcPool,
+/// `started_at` begins the sampler's hard window: the source's acquisition when the quote owns
+/// it, or the sampler's entry when it follows other stages.
+pub(crate) async fn self_broadcast_gas_fee_quote_from_candidates_with_reads(
+    candidates: &RpcCandidates,
+    started_at: tokio::time::Instant,
     network_mode: WalletNetworkMode,
     tip_fallback: SelfBroadcastTipFallback,
     rpc_reads: Option<(&crate::DappRpcReadClient, u64)>,
 ) -> Result<SelfBroadcastGasFeeQuote> {
-    let providers = query_rpc_pool.available_providers();
-    if providers.is_empty() {
-        return Err(eyre!("no healthy query RPC available"));
-    }
     let policy = SelfBroadcastFeeQuoteTimeoutPolicy::for_network_mode(network_mode);
     let samples = match rpc_reads {
         Some((reads, chain_id)) => {
             self_broadcast_parallel_fee_samples_with_reads(
-                providers,
+                candidates,
+                started_at,
                 policy,
                 Some((reads.clone(), chain_id)),
             )
             .await?
         }
-        None => self_broadcast_parallel_fee_samples(providers, policy).await,
+        None => self_broadcast_parallel_fee_samples(candidates, started_at, policy).await,
+    };
+    let Some(samples) = samples else {
+        return Err(eyre!("no healthy query RPC available"));
     };
     if let Some(quote) =
         self_broadcast_quote_from_fee_samples_with_tip_fallback(&samples, tip_fallback)
@@ -1202,17 +1263,20 @@ pub(crate) fn validate_self_broadcast_gas_fee(
     Ok(())
 }
 
+/// Quotes fees from `route`'s candidates, then reads the nonce, estimate and balance on one
+/// `query_rpc_pool` provider per attempt.
 pub(super) async fn self_broadcast_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
+    http: &HttpContext,
+    route: &RpcChainRoute,
     chain_id: u64,
     from: Address,
     transaction: TransactionRequest,
     gas_fee: SelfBroadcastGasFeeSelection,
     gas: &settings::EffectiveChainGasSettings,
     nonce: Option<u64>,
-    network_mode: WalletNetworkMode,
 ) -> Result<SelfBroadcastPreflight> {
-    let quote = self_broadcast_gas_fee_quote_from_rpc_pool(query_rpc_pool, network_mode)
+    let quote = self_broadcast_gas_fee_quote_from_route(http, route)
         .await
         .wrap_err("fetch self-broadcast gas price")?;
     let mut last_error = None;
@@ -1853,7 +1917,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         ));
     }
 
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
     let nonce = provider_handle
@@ -2483,6 +2547,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::rpc_broker::tests::{MAX_IDENTITY_PROBES, RpcMockGate, spawn_rpc_mock_with_gate};
     use serde_json::{Value, json};
 
     #[tokio::test(start_paused = true)]
@@ -2582,15 +2647,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn admitted_fee_sampling_reaches_healthy_fifth_provider_before_quote_deadline() {
         let http = HttpContext::direct_for_tests();
-        let urls = (0..5)
+        let urls: Vec<Url> = (0..5)
             .map(|index| {
                 Url::parse(&format!("http://127.0.0.1:1/fee-provider-{index}"))
                     .expect("synthetic provider URL")
             })
             .collect();
-        let pool = query_rpc_pool_with_http_client(urls, &http);
-        let providers = pool.available_providers();
-        let stalled_endpoints: Vec<_> = providers
+        let started = tokio::time::Instant::now();
+        let candidates =
+            RpcCandidates::acquire_for_gateway(&http, &RpcChainRoute::new(42161, urls), None)
+                .await
+                .expect("gateway candidates");
+        let stalled_endpoints: Vec<_> = candidates
+            .pool()
+            .available_providers()
             .iter()
             .take(4)
             .map(|provider| provider.url.clone())
@@ -2609,17 +2679,178 @@ mod tests {
 
         let policy =
             SelfBroadcastFeeQuoteTimeoutPolicy::for_network_mode(WalletNetworkMode::Direct);
-        let started = tokio::time::Instant::now();
         let samples = self_broadcast_parallel_fee_samples_with_reads(
-            providers,
+            &candidates,
+            started,
             policy,
             Some((reads, 42161)),
         )
         .await
-        .expect("the healthy fifth provider supplies fees while earlier providers remain pending");
+        .expect("the healthy fifth provider supplies fees while earlier providers remain pending")
+        .expect("providers were sampled");
 
         assert!(self_broadcast_quote_from_fee_samples(&samples).is_some());
         assert!(started.elapsed() < policy.hard_deadline);
+    }
+
+    const FEE_CHAIN_ID: u64 = 999_999;
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// An endpoint reporting `chain_id` that logs each method it receives. It offers a nonzero
+    /// gas price without a usable tip, so its samples never start the grace period.
+    async fn fee_endpoint(
+        chain_id: u64,
+        gate: Option<RpcMockGate>,
+    ) -> (Url, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let logged = methods.clone();
+        let responder: crate::rpc_broker::tests::RpcResponder = Arc::new(move |request: Value| {
+            let method = request["method"].as_str().unwrap_or_default().to_owned();
+            logged.lock().expect("method log").push(method.clone());
+            let result = match method.as_str() {
+                "eth_chainId" => json!(alloy::primitives::U64::from(chain_id)),
+                "eth_gasPrice" => json!("0x64"),
+                "eth_maxPriorityFeePerGas" => json!("0x0"),
+                _ => {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": {"code": -32601, "message": "unsupported"},
+                    });
+                }
+            };
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        });
+        let (url, server) =
+            spawn_rpc_mock_with_gate(responder, Arc::default(), Arc::default(), gate).await;
+        (url, server, methods)
+    }
+
+    fn received(methods: &Mutex<Vec<String>>, method: &str) -> usize {
+        methods
+            .lock()
+            .expect("method log")
+            .iter()
+            .filter(|logged| *logged == method)
+            .count()
+    }
+
+    /// Wrong-chain endpoints whose identity probes fill every probe slot until released.
+    async fn stalled_probe_window(
+        count: usize,
+    ) -> (Vec<Url>, Vec<tokio::task::JoinHandle<()>>, Vec<RpcMockGate>) {
+        let (mut urls, mut servers, mut gates) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..count {
+            let gate = RpcMockGate::default();
+            let (url, server, _) = fee_endpoint(1, Some(gate.clone())).await;
+            urls.push(url);
+            servers.push(server);
+            gates.push(gate);
+        }
+        (urls, servers, gates)
+    }
+
+    #[tokio::test]
+    async fn cold_fee_sampling_collects_a_later_admitted_candidate_once() {
+        let policy = SelfBroadcastFeeQuoteTimeoutPolicy {
+            grace_after_first_usable: Duration::from_secs(1),
+            hard_deadline: Duration::from_secs(20),
+        };
+        // The healthy endpoint shares the first probe window with stalled ones. The later
+        // endpoint takes the slot the healthy probe frees, but its identity answer is held.
+        let (healthy, healthy_server, healthy_methods) = fee_endpoint(FEE_CHAIN_ID, None).await;
+        let (stalled, stalled_servers, gates) = stalled_probe_window(MAX_IDENTITY_PROBES - 1).await;
+        let later_gate = RpcMockGate::default();
+        let (later, later_server, later_methods) =
+            fee_endpoint(FEE_CHAIN_ID, Some(later_gate.clone())).await;
+        let mut endpoints = vec![healthy];
+        endpoints.extend(stalled);
+        endpoints.push(later);
+        let http = HttpContext::direct_for_tests_with_candidate_order(|_| {});
+        let route = RpcChainRoute::new(FEE_CHAIN_ID, endpoints).with_identity_verification();
+        let started_at = tokio::time::Instant::now();
+        let candidates =
+            RpcCandidates::acquire(&http, &route, Some(started_at + policy.hard_deadline))
+                .await
+                .expect("candidates");
+        let sampling = tokio::spawn({
+            let candidates = candidates.clone();
+            async move { self_broadcast_parallel_fee_samples(&candidates, started_at, policy).await }
+        });
+        for gate in &gates {
+            tokio::time::timeout(WAIT, gate.request_started.notified())
+                .await
+                .expect("stalled probes fill the window");
+        }
+        tokio::time::timeout(WAIT, async {
+            while received(&healthy_methods, "eth_gasPrice") == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the healthy endpoint is sampled");
+        tokio::time::timeout(WAIT, later_gate.request_started.notified())
+            .await
+            .expect("the later endpoint's identity probe is held");
+        // Let that sample settle so no sample job is running when the later endpoint arrives.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(received(&later_methods, "eth_gasPrice"), 0);
+        assert!(!sampling.is_finished());
+
+        // The later endpoint passes its check and answers every later request; the stalled
+        // endpoints fail theirs, which ends discovery.
+        let release_later = tokio::spawn(async move {
+            loop {
+                later_gate.release_response.notify_one();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        for gate in &gates {
+            gate.release_response.notify_one();
+        }
+        let samples = tokio::time::timeout(WAIT, sampling)
+            .await
+            .expect("sampling ends once discovery and its jobs finish")
+            .expect("sampling task")
+            .expect("candidates were sampled");
+        assert!(started_at.elapsed() < policy.hard_deadline / 2);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(received(&healthy_methods, "eth_gasPrice"), 1);
+        assert_eq!(received(&later_methods, "eth_gasPrice"), 1);
+        release_later.abort();
+        healthy_server.abort();
+        later_server.abort();
+        for server in stalled_servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_cold_probes_leave_fee_sampling_unavailable_at_its_cutoff() {
+        let policy = SelfBroadcastFeeQuoteTimeoutPolicy {
+            grace_after_first_usable: Duration::from_millis(100),
+            hard_deadline: Duration::from_millis(400),
+        };
+        let (mut endpoints, stalled_servers, _gates) =
+            stalled_probe_window(MAX_IDENTITY_PROBES).await;
+        let (queued, queued_server, _) = fee_endpoint(FEE_CHAIN_ID, None).await;
+        endpoints.push(queued);
+        let http = HttpContext::direct_for_tests_with_candidate_order(|_| {});
+        let route = RpcChainRoute::new(FEE_CHAIN_ID, endpoints).with_identity_verification();
+        let started_at = tokio::time::Instant::now();
+        let candidates =
+            RpcCandidates::acquire(&http, &route, Some(started_at + policy.hard_deadline))
+                .await
+                .expect("candidates");
+
+        let samples = self_broadcast_parallel_fee_samples(&candidates, started_at, policy).await;
+        assert!(samples.is_none());
+        assert!(started_at.elapsed() >= policy.hard_deadline);
+        assert!(started_at.elapsed() < policy.hard_deadline * 5);
+        queued_server.abort();
+        for server in stalled_servers {
+            server.abort();
+        }
     }
 
     #[test]

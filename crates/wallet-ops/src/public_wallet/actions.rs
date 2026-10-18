@@ -9,8 +9,9 @@ use super::gas::public_advanced_transaction_payload_fingerprint;
 use super::runtime::{public_shield_token, verified_public_chain_runtime_config};
 use super::signer::admitted_public_signer_authorized;
 use super::submission::{
-    PublicActionStepEnd, emit_public_action_event, emit_refreshed_public_action_hardware_session,
-    public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
+    PublicActionStepEnd, PublicShieldFundingBudget, emit_public_action_event,
+    emit_refreshed_public_action_hardware_session, public_action_progress_update,
+    recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
     PublicActionCommandReceiver, PublicActionGasFeeMode, PublicActionGasFeeSelection,
@@ -116,12 +117,14 @@ pub(crate) async fn submit_public_action_step_with_signer(
         signer,
         operation_label,
         query_rpc_pool,
+        &chain.rpc_route,
         chain.finality_depth,
         http,
         transaction_tracking,
         chain_id,
         from_address,
         &chain.gas,
+        None,
         authorized_gas_limit,
         None,
         gas_fee,
@@ -368,6 +371,29 @@ pub async fn submit_public_shield_with_progress(
                 }
             };
 
+            let (approval_gas_units, shield_gas_units) =
+                super::gas::public_shield_estimated_gas_units(
+                    railgun_wallet::tx::RailgunGasModel::for_chain(request.chain_id),
+                    request.asset,
+                    request.profile,
+                    chain.gas.gas_limit_buffer,
+                );
+            let remaining_max_fee_per_gas = if approval_required
+                && request.profile == PublicShieldTransactionProfile::Railway
+                && request.gas_fee_mode == PublicActionGasFeeMode::Auto
+            {
+                Some(
+                    super::gas::resolve_public_action_gas_fee(
+                        request.chain_id,
+                        request.profile,
+                        request.authorized_fee_ceiling,
+                        None,
+                    )?
+                    .max_fee_per_gas,
+                )
+            } else {
+                None
+            };
             let approve_receipt = if request.asset == PublicAssetId::Native {
                 None
             } else if !approval_required {
@@ -399,12 +425,18 @@ pub async fn submit_public_shield_with_progress(
                     &signer,
                     "public-shield-approve",
                     query_rpc_pool.clone(),
+                    &chain.rpc_route,
                     chain.finality_depth,
                     http,
                     request.transaction_tracking.as_ref(),
                     request.chain_id,
                     from_address,
                     &chain.gas,
+                    Some(PublicShieldFundingBudget {
+                        gas_units: approval_gas_units,
+                        remaining_shield_gas_units: shield_gas_units,
+                        remaining_max_fee_per_gas,
+                    }),
                     None,
                     nonce,
                     gas_fee,
@@ -462,12 +494,18 @@ pub async fn submit_public_shield_with_progress(
                 &signer,
                 "public-shield",
                 query_rpc_pool,
+                &chain.rpc_route,
                 chain.finality_depth,
                 http,
                 request.transaction_tracking.as_ref(),
                 request.chain_id,
                 from_address,
                 &chain.gas,
+                Some(PublicShieldFundingBudget {
+                    gas_units: shield_gas_units,
+                    remaining_shield_gas_units: 0,
+                    remaining_max_fee_per_gas: None,
+                }),
                 None,
                 nonce,
                 gas_fee,

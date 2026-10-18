@@ -7,6 +7,12 @@
 //!
 //! The variable names one mode, read once:
 //!
+//! - `shield:estimate-error` and `shield:funding-error` replace a Public asset dialog with
+//!   its wrapped-native-token Shield progress dialog: an estimate failure after approval, or
+//!   insufficient native balance before approval. These fixtures live in
+//!   `public_action/root.rs`, submit no action, and have no retry session. Details and Close
+//!   work normally. Public's Add account button becomes Preview Shield failure… so an
+//!   unfunded scratch wallet can open them without an account or asset balance.
 //! - `route-error` opens the Public form with a failed Across route lookup and its Retry.
 //! - `form` lets the Buy picker pick a network without private funds there, and gives a new
 //!   destination account a stand-in setup fee in place of an estimate, so a live quote can

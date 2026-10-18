@@ -1794,9 +1794,10 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     let recognized_request = TransactionRequest::default()
         .with_to(to)
         .with_value(U256::from(1_u64));
-    super::submission::public_action_preflight_from_rpc_pool_with_mode(
+    super::submission::public_action_preflight_from_rpc_pool(
         &pool,
-        WalletNetworkMode::Direct,
+        &http,
+        &chain.rpc_route,
         1,
         from,
         recognized_request,
@@ -1807,9 +1808,9 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         None,
         None,
         Some(65_000 + chain.gas.gas_limit_buffer),
-        super::submission::PublicActionPreflightMode::Managed,
         None,
         false,
+        None,
     )
     .await
     .expect("recognized operation preflight");
@@ -1820,9 +1821,10 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         .with_value(U256::from(1_u64))
         .with_input(Bytes::from_static(&[0x12, 0x34, 0x56, 0x78]));
     let before_submission_estimate = rpc_calls_for(&server.calls(), "eth_estimateGas").len();
-    super::submission::public_action_preflight_from_rpc_pool_with_mode(
+    super::submission::public_action_preflight_from_rpc_pool(
         &pool,
-        WalletNetworkMode::Direct,
+        &http,
+        &chain.rpc_route,
         1,
         from,
         unknown_request,
@@ -1833,9 +1835,9 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         None,
         None,
         None,
-        super::submission::PublicActionPreflightMode::Managed,
         None,
         false,
+        None,
     )
     .await
     .expect("managed post-approval resolution");
@@ -1988,6 +1990,156 @@ async fn advanced_simulation_uses_each_provider_once_and_selects_revert_pluralit
         rpc_calls_for(&unavailable_server.calls(), "eth_estimateGas").len(),
         1
     );
+}
+
+/// A chain-1 fee endpoint that reports `chain_id` to identity checks, estimates `estimate` gas
+/// or fails the estimate, and logs each method it receives.
+async fn logged_fee_endpoint(
+    chain_id: u64,
+    gas_price: u128,
+    estimate: Option<u64>,
+    gate: Option<crate::rpc_broker::tests::RpcMockGate>,
+) -> (Url, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let logged = methods.clone();
+    let responder: crate::rpc_broker::tests::RpcResponder = Arc::new(move |request: Value| {
+        let method = request["method"].as_str().unwrap_or_default().to_owned();
+        logged.lock().unwrap().push(method.clone());
+        let result = match (method.as_str(), estimate) {
+            ("eth_chainId", _) => json!(alloy::primitives::U64::from(chain_id)),
+            ("eth_getBlockByNumber", _) => {
+                let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+                block.header.inner.base_fee_per_gas = Some(5);
+                serde_json::to_value(block).unwrap()
+            }
+            ("eth_gasPrice", _) => json!(format!("0x{gas_price:x}")),
+            ("eth_maxPriorityFeePerGas", _) => json!("0x2"),
+            ("eth_feeHistory", _) => json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": ["0x5", "0x5"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x1", "0x2", "0x3", "0x4"]]
+            }),
+            ("eth_estimateGas", Some(estimate)) => json!(format!("0x{estimate:x}")),
+            _ => {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32603, "message": "unavailable"},
+                });
+            }
+        };
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    });
+    let (url, server) = crate::rpc_broker::tests::spawn_rpc_mock_with_gate(
+        responder,
+        Arc::default(),
+        Arc::default(),
+        gate,
+    )
+    .await;
+    (url, server, methods)
+}
+
+/// Chain 1 on `endpoints`, each of which must pass an identity check before a fee read.
+fn identity_checked_chain(endpoints: Vec<Url>) -> EffectiveChainConfig {
+    let mut chain = effective_chain_for_rpc(endpoints[0].as_str(), 8_000);
+    chain.rpc_route = RpcChainRoute::new(1, endpoints)
+        .with_identity_verification()
+        .with_multicall(chain.rpc_route.multicall().expect("multicall"));
+    chain
+}
+
+fn raw_estimate_request(chain: EffectiveChainConfig) -> PublicAdvancedTransactionEstimateRequest {
+    PublicAdvancedTransactionEstimateRequest {
+        chain_id: 1,
+        effective_chain: chain,
+        from: Address::repeat_byte(1),
+        intent: PublicTransactionIntent::Raw {
+            to: Some(Address::repeat_byte(2)),
+            value: U256::from(7_u64),
+            data: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+        },
+        gas_fee: PublicActionGasFeeSelection::Auto,
+        access_list: None,
+    }
+}
+
+#[tokio::test]
+async fn gas_only_public_reads_never_reach_a_wrong_chain_endpoint() {
+    // Sampled, the wrong-chain endpoint would set the upper-quartile gas price.
+    let (wrong, wrong_server, wrong_methods) =
+        logged_fee_endpoint(5, 1_000, Some(99_000), None).await;
+    let (valid, valid_server, _) = logged_fee_endpoint(1, 100, Some(42_000), None).await;
+    let chain = identity_checked_chain(vec![wrong, valid]);
+    let http = HttpContext::direct_for_tests();
+
+    let quote = quote_public_action_gas_fee(1, &chain, &http)
+        .await
+        .expect("quote from the valid endpoint");
+    assert_eq!(quote.rpc_gas_price, 100);
+    assert_eq!(*wrong_methods.lock().unwrap(), ["eth_chainId"]);
+
+    // The estimate's quote and estimate stages share one source, so the endpoint is checked
+    // once more rather than once per stage.
+    let estimate = estimate_public_advanced_transaction(raw_estimate_request(chain), &http)
+        .await
+        .expect("estimate from the valid endpoint");
+    assert_eq!(estimate.raw_gas_limit, 42_000);
+    assert_eq!(
+        *wrong_methods.lock().unwrap(),
+        ["eth_chainId", "eth_chainId"]
+    );
+    wrong_server.abort();
+    valid_server.abort();
+}
+
+#[tokio::test]
+async fn advanced_estimate_uses_an_endpoint_admitted_after_its_quote() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    // The first endpoint quotes but cannot estimate; the second passes its identity check only
+    // once the quote has finished and the first estimate has failed.
+    let (quoting, quoting_server, quoting_methods) = logged_fee_endpoint(1, 100, None, None).await;
+    let gate = crate::rpc_broker::tests::RpcMockGate::default();
+    let (late, late_server, late_methods) =
+        logged_fee_endpoint(1, 100, Some(42_000), Some(gate.clone())).await;
+    let chain = identity_checked_chain(vec![quoting, late]);
+    let http = HttpContext::direct_for_tests();
+    let release_late_endpoint = async {
+        tokio::time::timeout(WAIT, gate.request_started.notified())
+            .await
+            .expect("the late endpoint's identity is checked");
+        while !quoting_methods
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "eth_estimateGas")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Releases the identity check, then the estimate that follows it.
+        gate.release_response.notify_one();
+        gate.request_started.notified().await;
+        gate.release_response.notify_one();
+    };
+    let (estimate, released) = tokio::join!(
+        tokio::time::timeout(
+            WAIT,
+            estimate_public_advanced_transaction(raw_estimate_request(chain), &http),
+        ),
+        tokio::time::timeout(WAIT, release_late_endpoint),
+    );
+    let estimate = estimate
+        .expect("the estimate finishes")
+        .expect("the late endpoint estimates");
+    released.expect("the quote finishes and the first estimate fails before the release");
+    assert_eq!(estimate.raw_gas_limit, 42_000);
+    assert_eq!(
+        *late_methods.lock().unwrap(),
+        ["eth_chainId", "eth_estimateGas"]
+    );
+    quoting_server.abort();
+    late_server.abort();
 }
 
 #[test]
@@ -2727,6 +2879,342 @@ fn public_action_tip_fallback_uses_rpc_gas_price_only_for_bnb() {
     );
 }
 
+#[tokio::test]
+async fn shield_submission_checks_remaining_funding_before_estimation_and_signing() {
+    let (root_dir, db, store, view_session) = public_action_request_parts();
+    let account = store
+        .list_active_public_accounts_for_session(&view_session)
+        .unwrap()
+        .into_iter()
+        .find(|account| account.source == PublicAccountSource::Derived)
+        .unwrap();
+    let native_balance = 1_000_000_000_000_000_000_000_u128;
+    let token = PublicAssetId::Erc20(Address::repeat_byte(7));
+    for (case, asset, profile) in [
+        ("approval", token, PublicShieldTransactionProfile::Railoxide),
+        ("approval", token, PublicShieldTransactionProfile::Railway),
+        ("allowance", token, PublicShieldTransactionProfile::Railway),
+        (
+            "auto_ceiling",
+            token,
+            PublicShieldTransactionProfile::Railway,
+        ),
+        (
+            "native",
+            PublicAssetId::Native,
+            PublicShieldTransactionProfile::Railoxide,
+        ),
+        (
+            "native",
+            PublicAssetId::Native,
+            PublicShieldTransactionProfile::Railway,
+        ),
+        ("retry", token, PublicShieldTransactionProfile::Railoxide),
+        (
+            "estimate_reserve",
+            token,
+            PublicShieldTransactionProfile::Railoxide,
+        ),
+    ] {
+        let mut chain = default_effective_chain(42161);
+        let (approval_gas, shield_gas) = super::gas::public_shield_estimated_gas_units(
+            railgun_wallet::tx::RailgunGasModel::for_chain(42161),
+            asset,
+            profile,
+            chain.gas.gas_limit_buffer,
+        );
+        let estimate_gas = approval_gas.saturating_add(shield_gas.saturating_mul(2));
+        let estimate = if case == "estimate_reserve" {
+            MockRpcEstimateResult::Success(estimate_gas)
+        } else {
+            MockRpcEstimateResult::Error {
+                code: -32000,
+                message: "estimation reached".to_owned(),
+                data: None,
+            }
+        };
+        let server = MockRpcServer::spawn_with_estimate_result(false, estimate).await;
+        chain.rpc_route = RpcChainRoute::new(42161, vec![Url::parse(&server.url).unwrap()]);
+        let max_fee = match case {
+            "approval" => native_balance / u128::from(approval_gas),
+            "allowance" => native_balance / u128::from(shield_gas + approval_gas / 2),
+            "estimate_reserve" => {
+                native_balance
+                    / u128::from(estimate_gas + chain.gas.gas_limit_buffer + shield_gas / 2)
+            }
+            _ => 1,
+        };
+        let fee = |max_fee_per_gas| PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas: 1,
+        };
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        if case == "retry" {
+            command_tx
+                .send(PublicActionCommand {
+                    kind: PublicActionCommandKind::Retry,
+                    gas_fee: fee(native_balance / u128::from(approval_gas)),
+                })
+                .unwrap();
+        }
+        drop(command_tx);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let http = HttpContext::direct_for_tests();
+        let error = submit_public_shield(
+            PublicShieldRequest {
+                executor_owner: None,
+                transaction_tracking: None,
+                chain_id: 42161,
+                effective_chain: chain,
+                view_session: view_session.clone(),
+                vault_store: store.clone(),
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_owned()),
+                        None,
+                    ),
+                ),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                asset,
+                amount: match case {
+                    "native" => U256::from(native_balance),
+                    "allowance" => U256::from(1),
+                    _ => U256::from(5_000),
+                },
+                profile,
+                gas_fee: fee(max_fee),
+                gas_fee_mode: if case == "auto_ceiling" {
+                    PublicActionGasFeeMode::Auto
+                } else {
+                    PublicActionGasFeeMode::Custom
+                },
+                authorized_fee_ceiling: fee(if case == "auto_ceiling" {
+                    native_balance / u128::from(shield_gas) + 1
+                } else {
+                    max_fee
+                }),
+                command_rx: Some(command_rx),
+                event_tx: Some(event_tx),
+            },
+            &http,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        if case == "allowance" {
+            assert!(message.contains("estimation reached"), "{message}");
+            assert!(!message.contains("insufficient native balance"));
+        } else {
+            assert!(
+                message.contains("insufficient native balance"),
+                "{case}: {message}"
+            );
+            if case != "estimate_reserve" {
+                assert!(message.contains("estimated Shield fees"), "{message}");
+            }
+        }
+        let calls = server.calls();
+        assert_eq!(
+            rpc_calls_for(&calls, "eth_estimateGas").len(),
+            usize::from(matches!(case, "allowance" | "retry" | "estimate_reserve")),
+            "{case}",
+        );
+        assert_eq!(
+            rpc_calls_for(&calls, "eth_getBalance").len(),
+            if case == "retry" { 2 } else { 1 },
+            "{case}",
+        );
+        assert!(rpc_calls_for(&calls, "eth_sendRawTransaction").is_empty());
+        let expected_step = if asset == PublicAssetId::Native || case == "allowance" {
+            PublicActionProgressStep::Shield
+        } else {
+            PublicActionProgressStep::Approve
+        };
+        let mut failures = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                PublicActionSessionEvent::StepFailed { step, .. } => {
+                    assert_eq!(step, expected_step);
+                    failures += 1;
+                }
+                PublicActionSessionEvent::AttemptHandoff { .. }
+                | PublicActionSessionEvent::AttemptSubmitted { .. } => {
+                    panic!("{case}: an unaffordable Shield must not reach transaction signing");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(failures, if case == "retry" { 2 } else { 1 });
+    }
+    drop(view_session);
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).unwrap();
+}
+
+#[tokio::test]
+async fn shield_speedup_funding_uses_the_previously_signed_gas_limit() {
+    let server = MockRpcServer::spawn(false, 50_000).await;
+    let mut chain = default_effective_chain(42161);
+    chain.rpc_route = RpcChainRoute::new(42161, vec![Url::parse(&server.url).unwrap()]);
+    let (_, model_gas) = super::gas::public_shield_estimated_gas_units(
+        railgun_wallet::tx::RailgunGasModel::for_chain(42161),
+        PublicAssetId::Native,
+        PublicShieldTransactionProfile::Railoxide,
+        chain.gas.gas_limit_buffer,
+    );
+    let signed_gas_limit = model_gas / 2;
+    let native_balance = U256::from(1_000_000_000_000_000_000_000_u128);
+    let value = native_balance - U256::from(model_gas) * U256::from(100);
+    let http = HttpContext::direct_for_tests();
+    let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+    for (max_fee_per_gas, affordable) in [(125_u128, true), (300, false)] {
+        let actual_cost = value + U256::from(signed_gas_limit) * U256::from(max_fee_per_gas);
+        assert_eq!(actual_cost <= native_balance, affordable);
+        assert!(value + U256::from(model_gas) * U256::from(max_fee_per_gas) > native_balance);
+        let result = super::submission::public_action_preflight_from_rpc_pool(
+            &pool,
+            &http,
+            &chain.rpc_route,
+            42161,
+            Address::repeat_byte(1),
+            TransactionRequest::default()
+                .with_to(Address::repeat_byte(2))
+                .with_value(value),
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas: 1,
+            },
+            &chain.gas,
+            PublicShieldTransactionProfile::Railoxide,
+            super::types::PublicActionGasLimitStrategy::ChainBuffer,
+            None,
+            Some(7),
+            Some(signed_gas_limit),
+            None,
+            false,
+            Some(super::submission::PublicShieldFundingBudget {
+                gas_units: model_gas,
+                remaining_shield_gas_units: 0,
+                remaining_max_fee_per_gas: None,
+            }),
+        )
+        .await;
+        if affordable {
+            assert!(
+                result.is_ok(),
+                "affordable replacement failed: {:?}",
+                result.err()
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(super::submission::PublicActionPreflightError::InsufficientShieldFunding(_))
+            ));
+        }
+    }
+    let calls = server.calls();
+    assert!(rpc_calls_for(&calls, "eth_estimateGas").is_empty());
+    assert!(rpc_calls_for(&calls, "eth_getTransactionCount").is_empty());
+}
+
+#[tokio::test]
+async fn native_preflight_filters_broker_withdrawals_and_tries_each_candidate_once() {
+    let failing = MockRpcServer::spawn(true, 50_000).await;
+    let other = MockRpcServer::spawn_with_estimate_result(
+        false,
+        MockRpcEstimateResult::Error {
+            code: -32000,
+            message: "estimate unavailable".to_owned(),
+            data: None,
+        },
+    )
+    .await;
+    let route = RpcChainRoute::new(
+        1,
+        vec![
+            Url::parse(&failing.url).unwrap(),
+            Url::parse(&other.url).unwrap(),
+        ],
+    );
+    let http = HttpContext::direct_for_tests();
+    // The original transaction pool predates the broker's withdrawal and still contains both.
+    let pool = crate::query_rpc_pool_with_http_client(route.endpoint_urls(), &http);
+    let warmup = http.rpc_broker().warm_identities(vec![route.clone()], None);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if http
+                .rpc_broker()
+                .endpoint_candidates(&route, None)
+                .await
+                .unwrap()
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed startup responsiveness check withdraws one endpoint");
+    let failed_before = failing.calls().len();
+    for warmed in [true, false] {
+        let fresh_http = HttpContext::direct_for_tests();
+        let http = if warmed { &http } else { &fresh_http };
+        let before_other = other.calls();
+        let error = super::submission::public_action_preflight_from_rpc_pool(
+            &pool,
+            http,
+            &route,
+            1,
+            Address::repeat_byte(1),
+            TransactionRequest::default().with_to(Address::repeat_byte(2)),
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 2,
+            },
+            &default_effective_chain(1).gas,
+            PublicShieldTransactionProfile::Railway,
+            super::types::PublicActionGasLimitStrategy::ChainBuffer,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .err()
+        .expect("all eligible candidates fail");
+        assert!(matches!(
+            error,
+            super::submission::PublicActionPreflightError::Other(_)
+        ));
+        let after_other = other.calls();
+        assert_eq!(
+            rpc_calls_for(&after_other, "eth_estimateGas").len()
+                - rpc_calls_for(&before_other, "eth_estimateGas").len(),
+            1,
+        );
+        if warmed {
+            assert_eq!(
+                failing.calls().len(),
+                failed_before,
+                "withdrawn endpoint was bypassed"
+            );
+        } else {
+            assert_eq!(
+                rpc_calls_for(&failing.calls(), "eth_getTransactionCount").len(),
+                1
+            );
+        }
+    }
+    drop(warmup);
+}
+
 #[test]
 fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3393,9 +3881,10 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
     let before = server.calls().len();
     let before_callbacks = callback_calls.load(Ordering::SeqCst);
-    super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+    super::submission::public_action_preflight_from_rpc_pool_with_reads(
         &pool,
-        WalletNetworkMode::Direct,
+        &http,
+        &chain.rpc_route,
         1,
         from,
         TransactionRequest::default()
@@ -3408,10 +3897,10 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
         Some(admitted.gas_limit),
         None,
         None,
-        super::submission::PublicActionPreflightMode::Managed,
         None,
         false,
         Some(&reads),
+        None,
     )
     .await
     .expect("admitted post-approval preflight");
@@ -3454,9 +3943,10 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
         })
     });
     let before_balance = rpc_calls_for(&server.calls(), "eth_getBalance").len();
-    let error = super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+    let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
         &pool,
-        WalletNetworkMode::Direct,
+        &http,
+        &chain.rpc_route,
         1,
         from,
         TransactionRequest::default()
@@ -3469,10 +3959,10 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
         None,
         None,
         None,
-        super::submission::PublicActionPreflightMode::Managed,
         None,
         false,
         Some(&fail_balance),
+        None,
     )
     .await
     .err()
@@ -3494,13 +3984,16 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
     let server = MockRpcServer::spawn(false, 42_000).await;
     let other = MockRpcServer::spawn(false, 42_000).await;
     let mut chain = effective_chain_for_rpc(&server.url, 8_000);
+    // Gateway reads verify identities in their own admission; a native probe would reach a
+    // server.
     chain.rpc_route = RpcChainRoute::new(
         1,
         vec![
             Url::parse(&server.url).unwrap(),
             Url::parse(&other.url).unwrap(),
         ],
-    );
+    )
+    .with_identity_verification();
     let http = HttpContext::direct_for_tests();
     let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
     let from = Address::repeat_byte(1);
@@ -3567,9 +4060,10 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         count.store(0, Ordering::SeqCst);
-        let error = super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
+        let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
             &pool,
-            WalletNetworkMode::Direct,
+            &http,
+            &chain.rpc_route,
             1,
             from,
             TransactionRequest::default().with_to(to),
@@ -3580,10 +4074,10 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
             None,
             None,
             None,
-            super::submission::PublicActionPreflightMode::Managed,
             None,
             false,
             Some(&reads),
+            None,
         )
         .await
         .err()
@@ -3616,12 +4110,13 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
             let error = rejection.clone();
             Box::pin(async move { Err(error) })
         });
-        let error = super::submission::public_action_preflight_from_rpc_pool_with_mode_and_reads(
-            &pool, WalletNetworkMode::Direct, 1, from, TransactionRequest::default().with_to(to),
+        let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
+            &pool, &http, &chain.rpc_route, 1, from, TransactionRequest::default().with_to(to),
             gas_fee, &chain.gas, PublicShieldTransactionProfile::Railoxide,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
-            None, None, None, super::submission::PublicActionPreflightMode::Managed,
+            None, None, None,
             None, false, Some(&reads),
+            None,
         ).await.err().expect("remote nonce failure");
         assert!(matches!(error, super::submission::PublicActionPreflightError::Other(error)
             if error.downcast_ref::<RpcBrokerError>() == Some(&expected)));
@@ -3829,6 +4324,155 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
     drop(store);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[tokio::test]
+async fn native_preflight_logs_failure_stage_without_sensitive_payloads() {
+    use std::io::Write;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let from = Address::repeat_byte(0xab);
+    let to = Address::repeat_byte(0xcd);
+    let data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe]);
+    let value = U256::from(12_345_678_901_234_567_890_123_u128);
+    let remote_message = "private-remote-error-message";
+    let remote_data = "private-remote-error-data";
+    for remote_failure in [true, false] {
+        let estimate = if remote_failure {
+            MockRpcEstimateResult::Error {
+                code: -32000,
+                message: remote_message.to_owned(),
+                data: Some(remote_data.to_owned()),
+            }
+        } else {
+            MockRpcEstimateResult::Success(50_000)
+        };
+        let server = MockRpcServer::spawn_with_estimate_result(false, estimate).await;
+        let mut endpoint = Url::parse(&server.url).unwrap();
+        endpoint.set_username("private-rpc-user").unwrap();
+        endpoint.set_password(Some("private-rpc-password")).unwrap();
+        endpoint.set_path("/private-rpc-path");
+        endpoint.set_query(Some("key=private-rpc-key"));
+        let mut chain = default_effective_chain(42161);
+        let mut second_endpoint = endpoint.clone();
+        second_endpoint.set_path("/private-rpc-path/second");
+        chain.rpc_route = RpcChainRoute::new(42161, vec![endpoint, second_endpoint]);
+        let http = HttpContext::direct_for_tests_with_candidate_order(<[usize]>::reverse);
+        let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = super::submission::public_action_preflight_from_rpc_pool(
+            &pool,
+            &http,
+            &chain.rpc_route,
+            42161,
+            from,
+            TransactionRequest::default()
+                .with_to(to)
+                .with_value(value)
+                .with_input(data.clone()),
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 2,
+            },
+            &chain.gas,
+            PublicShieldTransactionProfile::Railway,
+            super::types::PublicActionGasLimitStrategy::ChainBuffer,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await
+        .err()
+        .expect("preflight fails");
+        let super::submission::PublicActionPreflightError::Other(error) = error else {
+            panic!("failure must retain the original error");
+        };
+        if remote_failure {
+            let error = error
+                .downcast_ref::<alloy::transports::TransportError>()
+                .expect("original transport error remains available");
+            let payload = error.as_error_resp().expect("original RPC error");
+            assert_eq!(payload.code, -32000);
+            assert_eq!(payload.message, remote_message);
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("all public action query RPC attempts failed")
+            );
+            assert!(format!("{error:#}").contains("insufficient native balance"));
+        }
+        let calls = server.calls();
+        assert_eq!(rpc_calls_for(&calls, "eth_getTransactionCount").len(), 2);
+        assert_eq!(rpc_calls_for(&calls, "eth_estimateGas").len(), 2);
+        assert_eq!(
+            rpc_calls_for(&calls, "eth_getBalance").len(),
+            2 * usize::from(!remote_failure)
+        );
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let failures = logs
+            .lines()
+            .filter(|line| line.contains("public action preflight failed"))
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("rpc_index=1"));
+        assert!(failures[1].contains("rpc_index=0"));
+        assert!(failures.iter().all(|line| line.contains(&format!(
+            "endpoint={}",
+            crate::http::redact_url_for_display(&Url::parse(&server.url).unwrap())
+        ))));
+        for field in ["chain_id=42161", "attempt=1", "attempts=2", "elapsed_ms="] {
+            assert!(logs.contains(field), "missing diagnostic field {field}");
+        }
+        if remote_failure {
+            assert!(logs.contains("stage=\"estimate\""));
+            assert!(logs.contains("failure=\"rpc_error\""));
+            assert!(logs.contains("rpc_code=-32000"));
+        } else {
+            assert!(logs.contains("stage=\"native_balance_validation\""));
+            assert!(logs.contains("failure=\"validation\""));
+        }
+        for secret in [
+            remote_message.to_owned(),
+            remote_data.to_owned(),
+            "private-rpc-user".to_owned(),
+            "private-rpc-password".to_owned(),
+            "private-rpc-path".to_owned(),
+            "private-rpc-key".to_owned(),
+            alloy::hex::encode_prefixed(from),
+            alloy::hex::encode_prefixed(to),
+            alloy::hex::encode_prefixed(&data),
+            value.to_string(),
+            "1000000000000000000000".to_owned(),
+        ] {
+            assert!(
+                !logs.contains(&secret),
+                "sensitive data appeared in diagnostics"
+            );
+        }
+    }
 }
 
 #[tokio::test]

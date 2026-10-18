@@ -853,6 +853,9 @@ impl WalletRoot {
             self.discard_walletconnect_fee_state(window, cx);
             return;
         };
+        if let Ok(chain_id) = parse_chain_id(&request.item.chain_id) {
+            self.activate_chain_background(chain_id);
+        }
         if self
             .walletconnect
             .walletconnect_fee_state

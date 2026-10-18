@@ -2,21 +2,26 @@ use super::actor::{Actor, BlockEvent, Command, JobExecutor};
 use super::execution::run_job;
 use super::identity::{CandidateOrder, random_candidate_order};
 use super::model::{
-    DEFAULT_INTERVAL, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError, RpcBrokerSpawnError, RpcOrigin,
-    RpcRead, RpcResult, RpcRoute, RpcSubmission,
+    DEFAULT_INTERVAL, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute,
+    RpcOrigin, RpcRead, RpcResult, RpcRoute, RpcSubmission,
 };
+use super::warmup::{InstalledWarmup, RpcIdentityWarmup, WarmupRequest, same_installation};
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes};
 use alloy::sol_types::SolCall;
+use poi::SensitiveUrl;
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::time::{self, Instant};
 
 const SUBMISSION_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(256).expect("submission capacity must be positive");
+/// Bounds a candidate lookup's local communication with the actor, independent of HTTP and
+/// identity probe timing.
+const METADATA_LOOKUP_LIMIT: Duration = Duration::from_secs(10);
 
 /// Handle for the shared Ethereum read broker.
 #[derive(Clone)]
@@ -24,6 +29,8 @@ pub struct RpcBroker {
     tx: mpsc::Sender<Command>,
     block_tx: mpsc::UnboundedSender<BlockEvent>,
     admission: Arc<Semaphore>,
+    warmups: mpsc::UnboundedSender<WarmupRequest>,
+    warmup: Arc<Mutex<InstalledWarmup>>,
 }
 
 impl fmt::Debug for RpcBroker {
@@ -78,22 +85,22 @@ impl RpcBroker {
         }
         let (tx, rx) = mpsc::channel(submission_capacity.get());
         let (block_tx, block_rx) = mpsc::unbounded_channel();
+        let actor = Actor::new(
+            client,
+            rx,
+            interval,
+            max_in_flight.max(1),
+            executor,
+            candidate_order,
+        );
         let broker = Arc::new(Self {
             tx,
             block_tx,
             admission: Arc::new(Semaphore::new(submission_capacity.get())),
+            warmups: actor.warmup_requests(),
+            warmup: Arc::default(),
         });
-        let actor = handle.spawn(
-            Actor::new(
-                client,
-                rx,
-                interval,
-                max_in_flight.max(1),
-                executor,
-                candidate_order,
-            )
-            .run(block_rx),
-        );
+        let actor = handle.spawn(actor.run(block_rx));
         if actor.is_finished() {
             return Err(RpcBrokerSpawnError::ActorStartup);
         }
@@ -265,6 +272,32 @@ impl RpcBroker {
         }
         Ok(results)
     }
+    /// Returns `route`'s health-eligible endpoints in randomized order for a caller that sends its
+    /// own requests; identity admission remains the caller's. The lookup takes no submission
+    /// credit, so held submissions and running reads do not delay it. Enqueueing and the reply
+    /// share one deadline: `deadline` or the metadata lookup limit, whichever is earlier.
+    pub(crate) async fn endpoint_candidates(
+        &self,
+        route: &RpcChainRoute,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<SensitiveUrl>, RpcBrokerError> {
+        let limit = Instant::now() + METADATA_LOOKUP_LIMIT;
+        let deadline = deadline.map_or(limit, |deadline| deadline.min(limit));
+        let (reply, receiver) = oneshot::channel();
+        let lookup = async {
+            self.tx
+                .send(Command::Candidates {
+                    route: route.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| RpcBrokerError::Shutdown)?;
+            receiver.await.map_err(|_| RpcBrokerError::Shutdown)?
+        };
+        time::timeout_at(deadline, lookup)
+            .await
+            .map_err(|_| RpcBrokerError::Timeout)?
+    }
     /// Advises the broker of a head; newer heads advance state, equal heads refresh freshness,
     /// and stale heads are ignored.
     pub fn notify_block(&self, chain_id: u64, block_number: u64) {
@@ -276,6 +309,43 @@ impl RpcBroker {
     /// Disables latest-head usability and clears latest cache entries until a new head arrives.
     pub fn invalidate_block(&self, chain_id: u64) {
         let _ = self.block_tx.send(BlockEvent::Invalidate { chain_id });
+    }
+    /// Starts background identity warmup for an installation's routes and returns its owner.
+    ///
+    /// Pass clones of the installed route objects: checks land in their shared caches and are
+    /// usable at once, while rebuilt routes have caches of their own. Initially each endpoint
+    /// that needs verification is checked, and each endpoint of a trusted route gets an
+    /// `eth_chainId` responsiveness probe that leaves it trusted. Failed endpoints stay out of
+    /// candidate snapshots and are retried after the broker's usual cooldown until recovery.
+    /// The pass uses at most four permits from the broker's independent verification budget.
+    /// The broker runs one pass: a new installation replaces the previous pass, and registering the same
+    /// initial route objects while their pass is owned joins it, including after more routes
+    /// are activated. The owner can activate additional routes without restarting the pass.
+    /// Dropping every handle cancels the pass. Pending checks for `preferred_chain` run first,
+    /// including when joining a pass. Its end does not imply that every endpoint verified.
+    #[must_use]
+    pub fn warm_identities(
+        &self,
+        routes: Vec<RpcChainRoute>,
+        preferred_chain: Option<u64>,
+    ) -> RpcIdentityWarmup {
+        let mut installed = self.warmup.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((current, owner)) = &*installed
+            && same_installation(current, &routes)
+            && let Some(owner) = owner.upgrade()
+        {
+            let warmup = RpcIdentityWarmup(owner);
+            if let Some(chain_id) = preferred_chain {
+                warmup.prioritize_chain(chain_id);
+            }
+            return warmup;
+        }
+        let (warmup, request) = RpcIdentityWarmup::start(routes.clone(), preferred_chain);
+        *installed = Some((routes, Arc::downgrade(&warmup.0)));
+        // Sent under the lock so the actor sees installations in registration order. Without an
+        // actor the handle is inert.
+        let _ = self.warmups.send(request);
+        warmup
     }
 }
 

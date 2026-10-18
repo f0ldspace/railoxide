@@ -1,15 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{B256, U256, keccak256};
 use alloy::providers::Provider;
 use alloy::rpc::types::BlockNumberOrTag;
 use alloy::sol_types::{Panic, Revert, SolError, decode_revert_reason};
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 
 use super::actions::{public_send_transaction_request, validate_public_transaction_intent};
-use super::runtime::{public_chain_runtime_config, verified_public_chain_runtime_config};
+use super::runtime::public_chain_runtime_config;
 use super::types::{
     PublicActionFeeProjection, PublicActionFeeSource, PublicActionGasFeeQuote,
     PublicActionGasFeeQuoteBundle, PublicActionGasFeeSelection, PublicActionKind,
@@ -17,13 +16,14 @@ use super::types::{
     PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
     PublicAssetId, PublicShieldTransactionProfile, PublicTransactionIntent,
 };
+use crate::rpc_broker::RpcCandidates;
 use crate::settings::EffectiveChainConfig;
 use crate::walletconnect::WalletConnectDecodedCallKind;
 use crate::{
     Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
-    SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback,
-    TRANSACTION_INTRINSIC_GAS, expected_eip1559_fee_per_gas, query_rpc_pool_with_http_client,
-    railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
+    RpcChainRoute, SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback,
+    TRANSACTION_INTRINSIC_GAS, expected_eip1559_fee_per_gas, railgun_protocol_fee_amount,
+    resolve_self_broadcast_gas_fee,
 };
 use railgun_ui::native_usd_micro_value;
 
@@ -373,28 +373,45 @@ fn public_action_estimated_gas_units_with_buffer(
             };
             gas_units.saturating_add(gas_limit_buffer)
         }
-        PublicActionKind::Shield => match asset {
-            PublicAssetId::Native => match profile {
+        PublicActionKind::Shield => {
+            let (approve, shield) =
+                public_shield_estimated_gas_units(model, asset, profile, gas_limit_buffer);
+            approve.saturating_add(shield)
+        }
+    }
+}
+
+/// The approval and Shield portions of the same model used for the displayed fee budget.
+pub(super) fn public_shield_estimated_gas_units(
+    model: &RailgunGasModel,
+    asset: PublicAssetId,
+    profile: PublicShieldTransactionProfile,
+    gas_limit_buffer: u64,
+) -> (u64, u64) {
+    match asset {
+        PublicAssetId::Native => (
+            0,
+            match profile {
                 PublicShieldTransactionProfile::Railway => PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS,
                 PublicShieldTransactionProfile::Railoxide => {
                     public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
                         .saturating_add(gas_limit_buffer)
                 }
             },
-            PublicAssetId::Erc20(_) => match profile {
-                PublicShieldTransactionProfile::Railway => railway_gas_limit(
-                    PUBLIC_NATIVE_APPROVE_GAS_UNITS,
-                )
-                .saturating_add(railway_gas_limit(public_shield_gas_units(
-                    model,
-                    GasEstimateMode::UpperBound,
-                ))),
-                PublicShieldTransactionProfile::Railoxide => PUBLIC_NATIVE_APPROVE_GAS_UNITS
-                    .saturating_add(gas_limit_buffer)
-                    .saturating_add(public_shield_gas_units(model, GasEstimateMode::UpperBound))
-                    .saturating_add(gas_limit_buffer),
-            },
-        },
+        ),
+        PublicAssetId::Erc20(_) => {
+            let shield = public_shield_gas_units(model, GasEstimateMode::UpperBound);
+            match profile {
+                PublicShieldTransactionProfile::Railway => (
+                    railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS),
+                    railway_gas_limit(shield),
+                ),
+                PublicShieldTransactionProfile::Railoxide => (
+                    PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
+                    shield.saturating_add(gas_limit_buffer),
+                ),
+            }
+        }
     }
 }
 
@@ -497,11 +514,10 @@ pub async fn quote_public_action_gas_fee_with_reads(
     http: &HttpContext,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> Result<PublicActionGasFeeQuote> {
-    let chain =
-        verified_public_chain_runtime_config(chain_id, effective_chain, http, rpc_reads).await?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
-    public_action_gas_fee_quote_from_rpc_pool_with_reads(
-        &query_rpc_pool,
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let candidates = public_fee_candidates(http, &chain.rpc_route, rpc_reads).await?;
+    public_action_gas_fee_quote_from_candidates_with_reads(
+        &candidates,
         http.network_mode(),
         chain_id,
         rpc_reads,
@@ -528,10 +544,10 @@ pub async fn quote_public_action_gas_fee_bundle_with_profile(
     profile: PublicShieldTransactionProfile,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
-    let chain = verified_public_chain_runtime_config(chain_id, effective_chain, http, None).await?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
-    public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
-        &query_rpc_pool,
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    public_action_gas_fee_quote_bundle_from_candidates_with_profile(
+        &candidates,
         http.network_mode(),
         chain_id,
         profile,
@@ -549,16 +565,11 @@ pub async fn estimate_public_advanced_transaction(
             "advanced gas estimation requires a raw transaction intent"
         ));
     }
-    let chain = verified_public_chain_runtime_config(
-        request.chain_id,
-        &request.effective_chain,
-        http,
-        None,
-    )
-    .await?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
-    let quote = public_action_gas_fee_quote_from_rpc_pool(
-        &query_rpc_pool,
+    let chain = public_chain_runtime_config(request.chain_id, &request.effective_chain)?;
+    // The quote and the estimate share one source, so neither stage probes an endpoint again.
+    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    let quote = public_action_gas_fee_quote_from_candidates(
+        &candidates,
         http.network_mode(),
         request.chain_id,
     )
@@ -570,7 +581,16 @@ pub async fn estimate_public_advanced_transaction(
         request.gas_fee,
         Some(quote),
     )?;
-    estimate_public_advanced_transaction_with_fee(request, quote, resolved, http).await
+    advanced_estimate_report(
+        estimate_public_advanced_transaction_with_fee_core(
+            &candidates,
+            request,
+            quote,
+            resolved,
+            None,
+        )
+        .await,
+    )
 }
 
 pub async fn estimate_public_advanced_transaction_with_fee(
@@ -580,8 +600,21 @@ pub async fn estimate_public_advanced_transaction_with_fee(
     http: &HttpContext,
 ) -> Result<PublicAdvancedTransactionEstimate> {
     validate_advanced_transaction_estimate_request(&request)?;
-    estimate_public_advanced_transaction_with_fee_core(request, quote, resolved, http, None)
-        .await
+    advanced_estimate_report(
+        estimate_public_advanced_transaction_with_own_candidates(
+            request, quote, resolved, http, None,
+        )
+        .await,
+    )
+}
+
+fn advanced_estimate_report(
+    result: std::result::Result<
+        PublicAdvancedTransactionEstimate,
+        PublicAdvancedTransactionSimulationError,
+    >,
+) -> Result<PublicAdvancedTransactionEstimate> {
+    result
         .map_err(|error| eyre!(simulation_error_reason(&error).to_owned()))
         .wrap_err("all advanced public transaction query RPC attempts failed")
 }
@@ -608,8 +641,10 @@ pub async fn simulate_public_advanced_transaction_with_fee_and_reads(
     validate_advanced_transaction_estimate_request(&request).map_err(|error| {
         PublicAdvancedTransactionSimulationError::Unavailable(error.to_string())
     })?;
-    estimate_public_advanced_transaction_with_fee_core(request, quote, resolved, http, rpc_reads)
-        .await
+    estimate_public_advanced_transaction_with_own_candidates(
+        request, quote, resolved, http, rpc_reads,
+    )
+    .await
 }
 
 fn validate_advanced_transaction_estimate_request(
@@ -624,7 +659,8 @@ fn validate_advanced_transaction_estimate_request(
     Ok(())
 }
 
-async fn estimate_public_advanced_transaction_with_fee_core(
+/// A standalone estimate owns its candidate source.
+async fn estimate_public_advanced_transaction_with_own_candidates(
     request: PublicAdvancedTransactionEstimateRequest,
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
@@ -632,15 +668,33 @@ async fn estimate_public_advanced_transaction_with_fee_core(
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
-    let chain = verified_public_chain_runtime_config(
-        request.chain_id,
-        &request.effective_chain,
-        http,
+    let unavailable =
+        |_: eyre::Report| unavailable_simulation_error("RPC providers are unavailable.");
+    let chain = public_chain_runtime_config(request.chain_id, &request.effective_chain)
+        .map_err(unavailable)?;
+    let candidates = public_fee_candidates(http, &chain.rpc_route, rpc_reads)
+        .await
+        .map_err(unavailable)?;
+    estimate_public_advanced_transaction_with_fee_core(
+        &candidates,
+        request,
+        quote,
+        resolved,
         rpc_reads,
     )
     .await
-    .map_err(|_| unavailable_simulation_error("RPC providers are unavailable."))?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+}
+
+/// Tries ready candidates once each, including endpoints admitted while earlier ones fail,
+/// until one estimates or discovery has ended.
+async fn estimate_public_advanced_transaction_with_fee_core(
+    candidates: &RpcCandidates,
+    request: PublicAdvancedTransactionEstimateRequest,
+    quote: PublicActionGasFeeQuote,
+    resolved: PublicActionResolvedGasFee,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
+{
     let mut tx_req =
         public_send_transaction_request(request.chain_id, request.from, &request.intent)
             .map_err(|error| unavailable_simulation_error(&error.to_string()))?;
@@ -660,15 +714,10 @@ async fn estimate_public_advanced_transaction_with_fee_core(
     }
     tx_req.access_list = request.access_list;
 
-    let providers = query_rpc_pool.available_providers();
-    if providers.is_empty() {
-        return Err(unavailable_simulation_error(
-            "RPC providers are unavailable.",
-        ));
-    }
-
-    let mut failures = Vec::with_capacity(providers.len());
-    for provider_handle in providers {
+    // Without any candidate there are no failures, which reports the providers as unavailable.
+    let mut tried = HashSet::new();
+    let mut failures = Vec::new();
+    while let Some(provider_handle) = candidates.next_untried(&mut tried).await {
         let estimate = match rpc_reads {
             Some(reads) => match reads
                 .estimate_gas(
@@ -697,8 +746,10 @@ async fn estimate_public_advanced_transaction_with_fee_core(
         };
         match estimate {
             Ok(estimated_gas) => {
-                let gas_limit =
-                    buffered_advanced_gas_limit(estimated_gas, chain.gas.gas_limit_buffer);
+                let gas_limit = buffered_advanced_gas_limit(
+                    estimated_gas,
+                    request.effective_chain.gas.gas_limit_buffer,
+                );
                 let projection = project_public_action_fee(
                     estimated_gas,
                     gas_limit,
@@ -1006,10 +1057,10 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
     http: &HttpContext,
     authorization_ceiling: Option<PublicActionGasFeeSelection>,
 ) -> Result<U256> {
-    let chain = verified_public_chain_runtime_config(chain_id, effective_chain, http, None).await?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
-    let quote_bundle = public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
-        &query_rpc_pool,
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    let quote_bundle = public_action_gas_fee_quote_bundle_from_candidates_with_profile(
+        &candidates,
         http.network_mode(),
         chain_id,
         profile,
@@ -1050,18 +1101,29 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile(
     .await
 }
 
-pub(super) async fn public_action_gas_fee_quote_from_rpc_pool(
-    query_rpc_pool: &QueryRpcPool,
+/// Captures `route`'s fee candidates for one quote, estimate or preflight. Gateway reads
+/// verify each endpoint's identity in their own admission, so their source probes none. A
+/// failed lookup never falls back to the route's raw endpoints.
+pub(super) async fn public_fee_candidates(
+    http: &HttpContext,
+    route: &RpcChainRoute,
+    rpc_reads: Option<&super::DappRpcReadClient>,
+) -> Result<RpcCandidates> {
+    match rpc_reads {
+        Some(_) => RpcCandidates::acquire_for_gateway(http, route, None)
+            .await
+            .wrap_err("select fee query RPC candidates"),
+        None => crate::acquire_fee_candidates(http, route, None).await,
+    }
+}
+
+pub(super) async fn public_action_gas_fee_quote_from_candidates(
+    candidates: &RpcCandidates,
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
 ) -> Result<PublicActionGasFeeQuote> {
-    public_action_gas_fee_quote_from_rpc_pool_with_reads(
-        query_rpc_pool,
-        network_mode,
-        chain_id,
-        None,
-    )
-    .await
+    public_action_gas_fee_quote_from_candidates_with_reads(candidates, network_mode, chain_id, None)
+        .await
 }
 
 pub(super) fn public_action_uses_legacy_envelope(
@@ -1075,15 +1137,18 @@ pub(super) fn public_action_uses_legacy_envelope(
                 .is_some_and(|quote| quote.observed_fee_model == Some(crate::EvmFeeModel::Legacy)))
 }
 
-pub(super) async fn public_action_gas_fee_quote_from_rpc_pool_with_reads(
-    query_rpc_pool: &QueryRpcPool,
+/// Observes a header, then samples fees. Both stages draw from `candidates`, and sampling's
+/// collection window starts once the header is observed.
+pub(super) async fn public_action_gas_fee_quote_from_candidates_with_reads(
+    candidates: &RpcCandidates,
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> Result<PublicActionGasFeeQuote> {
-    let base_fee = observed_public_base_fee(query_rpc_pool, chain_id, rpc_reads).await?;
-    let mut quote = crate::self_broadcast_gas_fee_quote_from_rpc_pool_with_reads(
-        query_rpc_pool,
+    let base_fee = observed_public_base_fee(candidates, chain_id, rpc_reads).await?;
+    let mut quote = crate::self_broadcast_gas_fee_quote_from_candidates_with_reads(
+        candidates,
+        tokio::time::Instant::now(),
         network_mode,
         public_action_tip_fallback(chain_id),
         rpc_reads.map(|reads| (reads, chain_id)),
@@ -1102,12 +1167,15 @@ pub(super) async fn public_action_gas_fee_quote_from_rpc_pool_with_reads(
     Ok(quote)
 }
 
+/// Tries ready candidates once each, including endpoints admitted while earlier ones fail,
+/// until one returns a header or discovery has ended.
 async fn observed_public_base_fee(
-    query_rpc_pool: &QueryRpcPool,
+    candidates: &RpcCandidates,
     chain_id: u64,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> Result<Option<u128>> {
-    for provider in query_rpc_pool.available_providers() {
+    let mut tried = HashSet::new();
+    while let Some(provider) = candidates.next_untried(&mut tried).await {
         let observation = async {
             match rpc_reads {
                 Some(reads) => reads
@@ -1138,15 +1206,15 @@ async fn observed_public_base_fee(
     ))
 }
 
-pub(super) async fn public_action_gas_fee_quote_from_rpc_pool_with_profile(
-    query_rpc_pool: &QueryRpcPool,
+pub(super) async fn public_action_gas_fee_quote_from_candidates_with_profile(
+    candidates: &RpcCandidates,
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
     profile: PublicShieldTransactionProfile,
 ) -> Result<PublicActionGasFeeQuote> {
     Ok(
-        public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
-            query_rpc_pool,
+        public_action_gas_fee_quote_bundle_from_candidates_with_profile(
+            candidates,
             network_mode,
             chain_id,
             profile,
@@ -1156,29 +1224,29 @@ pub(super) async fn public_action_gas_fee_quote_from_rpc_pool_with_profile(
     )
 }
 
-pub(super) async fn public_action_gas_fee_quote_bundle_from_rpc_pool_with_profile(
-    query_rpc_pool: &QueryRpcPool,
+pub(super) async fn public_action_gas_fee_quote_bundle_from_candidates_with_profile(
+    candidates: &RpcCandidates,
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
     profile: PublicShieldTransactionProfile,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
     if profile == PublicShieldTransactionProfile::Railoxide {
         let standard =
-            public_action_gas_fee_quote_from_rpc_pool(query_rpc_pool, network_mode, chain_id)
-                .await?;
+            public_action_gas_fee_quote_from_candidates(candidates, network_mode, chain_id).await?;
         return Ok(public_action_gas_fee_quote_bundle_from_standard(standard));
     }
-    let providers = query_rpc_pool.available_providers();
-    if providers.is_empty() {
-        return Err(eyre!("no healthy query RPC available"));
-    }
-    for provider_handle in providers {
+    // Ready candidates are tried once each, including endpoints admitted while earlier ones fail.
+    let mut tried = HashSet::new();
+    while let Some(provider_handle) = candidates.next_untried(&mut tried).await {
         match railway_gas_fee_quote_from_provider(&provider_handle.provider, chain_id).await {
             Ok(quote) => return Ok(quote),
             Err(_) => {
                 tracing::debug!("Railway gas fee quote provider attempt failed");
             }
         }
+    }
+    if tried.is_empty() {
+        return Err(eyre!("no healthy query RPC available"));
     }
     Err(eyre!("all Railway gas quote RPC attempts failed"))
 }

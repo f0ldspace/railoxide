@@ -1694,7 +1694,7 @@ async fn prepare_desktop_sponsored_calldata(
         .coinbase_payer
         .ok_or(SponsorshipError::MissingCoinbasePayer)?;
     let signer_address = self_broadcast_gas_payer(vault_store, view_session, public_account_uuid)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
 
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
@@ -1743,7 +1743,7 @@ async fn prepare_desktop_sponsored_calldata(
         required_wrapped_native: authorization_limit.max_total_wrapped_native_spend,
     })?;
 
-    let quote = self_broadcast_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode())
+    let quote = self_broadcast_gas_fee_quote_from_route(http, &chain.rpc_route)
         .await
         .wrap_err("fetch sponsored self-broadcast gas price")?;
     let resolved_fee = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
@@ -2278,8 +2278,8 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     if let Some(executor) = &request.executor {
         executor.require_broadcaster(&broadcaster)?;
     }
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
-    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
+    let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
+    let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let utxos = if let Some(prepared) = request.executor.as_deref() {
         request.session.unspent_utxos_for_executor(prepared)?
     } else {
@@ -2587,8 +2587,8 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         policy,
         &request.trust_filter,
     )?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
-    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
+    let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
+    let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;
     let initial_fee_amount = initial_public_broadcaster_fee_amount(
@@ -3618,7 +3618,7 @@ mod tests {
 
     fn test_chain_config(wrapped_native: Address) -> EffectiveDesktopChainConfig {
         EffectiveDesktopChainConfig {
-            rpc_urls: Vec::new(),
+            rpc_route: RpcChainRoute::new(1, Vec::<Url>::new()),
             railgun_contract: Address::ZERO,
             relay_adapt_contract: Address::ZERO,
             wrapped_native_token: Some(wrapped_native),

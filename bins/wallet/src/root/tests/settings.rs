@@ -1647,3 +1647,71 @@ fn settings_fields_commit_first_edit_after_sync_and_number_steps(cx: &mut gpui::
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[gpui::test]
+fn chain_background_activation_is_demand_based_sticky_and_stops_on_retirement(
+    cx: &mut gpui::TestAppContext,
+) {
+    let path = temp_wallet_db_root("retired-root-warmup");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = super::public_accounts::fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        gpui_component::Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let private = root.effective_chain_configs.get(1).unwrap().clone();
+            let public = |chain_id, enabled| {
+                let mut chain = private.clone();
+                chain.chain_id = chain_id;
+                chain.enabled = enabled;
+                chain.railgun = None;
+                chain.rpc_route =
+                    wallet_ops::RpcChainRoute::new(chain_id, Vec::<reqwest::Url>::new());
+                chain
+            };
+            root.effective_chain_configs = [
+                private.clone(),
+                public(10, true),
+                public(20, true),
+                public(30, false),
+            ]
+            .into_iter()
+            .collect();
+            root.selected_chain = 10;
+            root.view_session = None;
+            root.install_chain_background();
+            assert_eq!(root.active_rpc_chains, [1, 10].into_iter().collect());
+            root.select_chain(20, window, cx);
+            root.select_chain(10, window, cx);
+            assert_eq!(root.active_rpc_chains, [1, 10, 20].into_iter().collect());
+            root.install_chain_background();
+            root.activate_chain_background(30);
+            assert_eq!(root.active_rpc_chains, [1, 10, 20].into_iter().collect());
+            assert!(root.rpc_identity_warmup.is_some());
+            drop(root.begin_root_replacement_shutdown(cx));
+            assert!(root.rpc_identity_warmup.is_none());
+            assert!(root.active_rpc_chains.is_empty());
+            // Settings Apply can defer work on the outgoing root, after retirement.
+            root.apply_saved_request_settings(&WalletSettings::default(), cx);
+            root.activate_chain_background(1);
+            assert!(root.rpc_identity_warmup.is_none());
+            assert!(root.active_rpc_chains.is_empty());
+        });
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    drop(entered);
+    drop(runtime);
+    std::fs::remove_dir_all(path).unwrap();
+}

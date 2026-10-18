@@ -14,8 +14,8 @@ use tokio::time::Instant;
 use super::{RpcBrokerError, RpcChainRoute};
 
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Upper bound on concurrent identity probes for one pool admission.
-const MAX_IDENTITY_PROBES: usize = 8;
+/// Upper bound on concurrent identity probes for one pool admission or candidate source.
+pub(super) const MAX_IDENTITY_PROBES: usize = 8;
 /// How often a background admission checks that its pool is still owned.
 const POOL_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const SYNC_ADMISSION_BACKOFF: AdmissionBackoff = AdmissionBackoff {
@@ -158,6 +158,11 @@ impl RpcChainRoute {
         !self.requires_identity_verification() || self.endpoint_verification(endpoint).initialized()
     }
 
+    /// Whether `other` shares this route's identity cache, as its clones do.
+    pub(super) fn shares_identity_cache(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.verified_identities, &other.verified_identities)
+    }
+
     /// Completes after a later successful identity check on this route or a clone. Create it
     /// before reading the cache so a check that finishes in between still wakes it.
     pub(super) fn identity_checked(&self) -> tokio::sync::futures::Notified<'_> {
@@ -178,18 +183,7 @@ impl RpcChainRoute {
         let result = tokio::time::timeout(
             timeout,
             self.endpoint_verification(endpoint)
-                .get_or_try_init(|| async {
-                    let provider = ProviderBuilder::new()
-                        .connect_reqwest(client.clone(), endpoint.expose_url().clone());
-                    let id = provider
-                        .get_chain_id()
-                        .await
-                        .map_err(|_| RpcBrokerError::Transport)?;
-                    if id != self.chain_id() {
-                        return Err(RpcBrokerError::InvalidResponse);
-                    }
-                    Ok(())
-                }),
+                .get_or_try_init(|| self.check_chain_id(client, endpoint)),
         )
         .await
         .map_err(|_| RpcBrokerError::Timeout)?
@@ -202,7 +196,7 @@ impl RpcChainRoute {
     }
 
     /// Logs the outcome under `label` (a configured index or `archive`), never the URL.
-    async fn verify_labeled_endpoint_identity(
+    pub(super) async fn verify_labeled_endpoint_identity(
         &self,
         client: &reqwest::Client,
         endpoint: &SensitiveUrl,
@@ -222,6 +216,47 @@ impl RpcChainRoute {
             );
         }
         result
+    }
+
+    /// One bounded `eth_chainId` request to an endpoint of a trusted route, for background
+    /// warmup. It neither reads nor fills the identity cache, so the route stays trusted for
+    /// admission. Logs the outcome under `label`, never the URL.
+    pub(super) async fn probe_labeled_endpoint_responsiveness(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &SensitiveUrl,
+        label: &(dyn Display + Sync),
+    ) -> Result<(), RpcBrokerError> {
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(IDENTITY_TIMEOUT, self.check_chain_id(client, endpoint))
+            .await
+            .unwrap_or(Err(RpcBrokerError::Timeout));
+        tracing::debug!(
+            chain_id = self.chain_id(),
+            endpoint = %label,
+            outcome = identity_outcome(&result),
+            elapsed_ms = started.elapsed().as_millis(),
+            "RPC endpoint responsiveness check finished"
+        );
+        result
+    }
+
+    /// Asks `endpoint` for its chain ID and compares it with this route's, without a timeout.
+    async fn check_chain_id(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &SensitiveUrl,
+    ) -> Result<(), RpcBrokerError> {
+        let provider =
+            ProviderBuilder::new().connect_reqwest(client.clone(), endpoint.expose_url().clone());
+        let id = provider
+            .get_chain_id()
+            .await
+            .map_err(|_| RpcBrokerError::Transport)?;
+        if id != self.chain_id() {
+            return Err(RpcBrokerError::InvalidResponse);
+        }
+        Ok(())
     }
 
     /// Checks all endpoints concurrently, so slow endpoints delay the caller by at most one

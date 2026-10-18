@@ -1060,6 +1060,19 @@ impl PrivateSwapsView {
                 let Some((runtime, owner, requests)) = hints else {
                     continue;
                 };
+                let _ = this.update_in(cx, |this, _, cx| {
+                    if let Some(root) = this.root.upgrade() {
+                        root.update(cx, |root, _| {
+                            root.activate_chains_background(requests.iter().flat_map(|request| {
+                                request
+                                    .bridges
+                                    .iter()
+                                    .map(|(_, chain)| chain.chain_id)
+                                    .chain(request.destination.iter().map(|chain| chain.chain_id))
+                            }));
+                        });
+                    }
+                });
                 let results = runtime.spawn(fetch_order_hints(owner, requests)).await;
                 if this
                     .update_in(cx, |this, _, cx| {

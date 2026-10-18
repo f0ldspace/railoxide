@@ -47,6 +47,7 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
 }
 
 pub use blocked_shield_rescue::*;
+pub use chain_rpc::start_rpc_identity_warmup;
 pub(crate) use chain_rpc::*;
 pub use executor_discovery::*;
 pub use executors::*;

@@ -9,33 +9,28 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
+pub(super) const DEFAULT_MAX_IDENTITY_PROBES: usize = 8;
+
 /// Broker-wide resources handed to every job.
 #[derive(Clone)]
 pub(super) struct JobResources {
     pub(super) client: reqwest::Client,
-    /// Bounds every physical HTTP request, including identity probes.
+    /// Bounds physical read requests independently of identity probes.
     pub(super) http: Arc<Semaphore>,
-    /// Bounds identity probes across all jobs. Probes acquire it before `http`, so a waiting
-    /// probe never queues ahead of reads for an HTTP permit.
+    /// Bounds identity probes across all jobs and background warmup.
     pub(super) probes: Arc<Semaphore>,
     /// Concurrent probes one job may drive.
     pub(super) probe_limit: usize,
-    /// Whether the probe budget leaves an HTTP permit for reads. Without that reserve a job runs
-    /// a ready read before starting further probes.
-    pub(super) reserve: bool,
 }
 
 impl JobResources {
     pub(super) fn new(client: reqwest::Client, max_in_flight: usize) -> Self {
         let max_in_flight = max_in_flight.max(1);
-        // One HTTP permit stays free of probes; a single-slot broker still needs a probe.
-        let probe_limit = max_in_flight.saturating_sub(1).max(1);
         Self {
             client,
             http: Arc::new(Semaphore::new(max_in_flight)),
-            probes: Arc::new(Semaphore::new(probe_limit)),
-            probe_limit,
-            reserve: max_in_flight > probe_limit,
+            probes: Arc::new(Semaphore::new(DEFAULT_MAX_IDENTITY_PROBES)),
+            probe_limit: DEFAULT_MAX_IDENTITY_PROBES,
         }
     }
 }

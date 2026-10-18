@@ -1216,6 +1216,11 @@ impl PrivateSwapsView {
             // An account chosen on the old network doesn't follow to the new one.
             form.clear_destination();
         }
+        if let Some(root) = self.root.upgrade() {
+            root.update(cx, |root, _| {
+                root.activate_chain_background(network.unwrap_or(own));
+            });
+        }
         self.load_bridge_routes(window, cx);
         self.bridge_choices_changed(window, cx);
     }

@@ -472,7 +472,7 @@ async fn drive_job<W: Failover>(
         let ready = candidates
             .iter()
             .position(|candidate| *candidate == Candidate::Ready);
-        if may_refill(resources, control, runner_grant.is_some(), &candidates) {
+        if may_refill(control, runner_grant.is_some()) {
             refill_probes(&probes, &mut candidates, &failover.waiters(), &start_probe);
         }
         if probes.is_empty() && !candidates.contains(&Candidate::Unprobed) {
@@ -513,7 +513,7 @@ async fn drive_job<W: Failover>(
                         outcome = &mut attempt => break outcome,
                         Some((probe, outcome)) = probes.next(), if !probes.is_empty() => {
                             target.apply(&mut candidates, &mut events, probe, outcome);
-                            if may_refill(resources, control, runner_grant.is_some(), &candidates) {
+                            if may_refill(control, runner_grant.is_some()) {
                                 let waiters = failover.waiters();
                                 refill_probes(&probes, &mut candidates, &waiters, &start_probe);
                             }
@@ -567,17 +567,9 @@ async fn drive_job<W: Failover>(
     events
 }
 
-/// Whether the job may start more probes: it holds its runner, and either the broker keeps an
-/// HTTP permit free of probes or no ready endpoint is waiting for a read.
-fn may_refill(
-    resources: &JobResources,
-    control: &JobControl,
-    awaiting_runner: bool,
-    candidates: &[Candidate],
-) -> bool {
-    !awaiting_runner
-        && control.holds(SlotKind::Runner)
-        && (resources.reserve || !candidates.contains(&Candidate::Ready))
+/// Whether the job holds its probe runner and has received its grant.
+fn may_refill(control: &JobControl, awaiting_runner: bool) -> bool {
+    !awaiting_runner && control.holds(SlotKind::Runner)
 }
 
 /// Starts probes for unprobed endpoints in selection order while the runner has room.
@@ -642,8 +634,8 @@ impl ProbeTarget<'_> {
     }
 }
 
-/// One identity check for a job. It waits for the broker-wide probe budget and then an HTTP
-/// permit, each bounded by live waiter deadlines, and is never retried. Only the captured
+/// One identity check for a job. It waits for the independent broker-wide probe budget,
+/// bounded by live waiter deadlines, and is never retried. Only the captured
 /// route's verification cache is consulted and updated.
 async fn probe_endpoint(
     resources: &JobResources,
@@ -656,10 +648,6 @@ async fn probe_endpoint(
         return ProbeOutcome::Verified;
     }
     let _budget = match acquire_live_permit(&resources.probes, &waiters).await {
-        Ok(permit) => permit,
-        Err(outcome) => return outcome,
-    };
-    let _permit = match acquire_live_permit(&resources.http, &waiters).await {
         Ok(permit) => permit,
         Err(outcome) => return outcome,
     };

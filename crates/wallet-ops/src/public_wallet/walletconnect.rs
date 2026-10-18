@@ -5,11 +5,9 @@ use super::signer::{
     VaultedPublicSigner, admitted_public_signer_authorized, vaulted_public_signer,
 };
 use super::submission::{
-    PublicActionPreflightMode, emit_public_action_event,
-    emit_refreshed_public_action_hardware_session,
-    public_action_preflight_from_rpc_pool_with_mode_and_reads,
-    sanitize_walletconnect_transaction_request, submit_public_action_attempt,
-    validate_walletconnect_reviewed_transaction,
+    emit_public_action_event, emit_refreshed_public_action_hardware_session,
+    public_action_preflight_from_rpc_pool_with_reads, sanitize_walletconnect_transaction_request,
+    submit_public_action_attempt, validate_walletconnect_reviewed_transaction,
 };
 use super::types::{
     PublicActionGasLimitStrategy, PublicActionProgressStep, PublicActionSessionEvent,
@@ -304,9 +302,10 @@ pub async fn submit_walletconnect_send_transaction(
             } else {
                 None
             };
-            let preflight = public_action_preflight_from_rpc_pool_with_mode_and_reads(
+            let preflight = public_action_preflight_from_rpc_pool_with_reads(
                 &query_rpc_pool,
-                http.network_mode(),
+                http,
+                &chain.rpc_route,
                 request.chain_id,
                 from_address,
                 tx_req,
@@ -317,10 +316,10 @@ pub async fn submit_walletconnect_send_transaction(
                 reviewed_gas_limit,
                 None,
                 operation_gas_limit,
-                PublicActionPreflightMode::Managed,
                 None,
                 false,
                 request.rpc_reads.as_ref(),
+                None,
             )
             .await
             .map_err(super::submission::PublicActionPreflightError::into_report)
