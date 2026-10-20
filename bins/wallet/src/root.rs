@@ -244,16 +244,16 @@ use public_action::{
     progress_footer_action, public_action_accepts_update, public_action_closed_active_step,
     public_action_error_copy_value, public_action_error_details, public_action_error_summary,
     public_action_max_amount_after_reserve, public_action_progress_footer_action,
-    public_action_progress_steps, public_action_step_color, public_action_step_detail,
-    public_action_step_is_final_handoff, public_action_step_is_final_handoff_for_steps,
-    public_action_step_uses_stop_marker, public_action_uses_railway_authorization_ceiling,
+    public_action_step_color, public_action_step_detail, public_action_step_is_final_handoff,
+    public_action_step_is_final_handoff_for_steps, public_action_step_uses_stop_marker,
+    public_action_uses_railway_authorization_ceiling,
 };
 #[cfg(test)]
 use public_balances::{public_asset_icon_path, public_balance_usd_label};
 #[cfg(test)]
 use public_broadcaster::{
     fee_token_option_has_eligible_broadcaster, highest_value_public_broadcaster_fee_token,
-    public_broadcaster_fee_token_options_from_snapshot, required_relay_adapt_for_unshield,
+    public_broadcaster_fee_token_options_from_snapshot,
     resolve_selected_public_broadcaster_fee_token,
 };
 #[cfg(test)]
@@ -1279,12 +1279,16 @@ impl WalletRoot {
             send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee_authorization_ceiling: None,
+            shield_gas_fee_route: None,
+            native_shield_preparation: public_action::NativeShieldPreparationState::default(),
+            native_shield_operation: None,
             import_global: false,
             selected_account_uuid: None,
             editing_account_uuid: None,
             search_query: Arc::from(""),
             selected_asset: None,
             mimic_railway_shield: mimic_railway_shields_by_default,
+            shield_approval_mode: wallet_ops::PublicShieldApprovalMode::Exact,
             action_mode: PublicActionMode::Shield,
             action_progress_mode: PublicActionMode::Shield,
             public_send_kind: PublicSendKind::Transfer,
@@ -1695,6 +1699,15 @@ impl WalletRoot {
             })
             .detach();
         }
+        cx.subscribe(
+            &root.public_form.shield_amount_input,
+            |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_native_shield_preparation(cx);
+                }
+            },
+        )
+        .detach();
         for input in [
             root.governance.reward_gas_fee.max_fee_input.clone(),
             root.governance

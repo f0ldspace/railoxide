@@ -119,11 +119,27 @@ pub enum PublicShieldTransactionProfile {
     Railway,
 }
 
+/// How a Public Shield approves its ERC-20, a fallback native shield's wrapped token
+/// included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicShieldApprovalMode {
+    /// Approves exactly the shield amount before every shield.
+    Exact,
+    /// Approves the maximum amount, only when the allowance is below the shield amount.
+    UnlimitedWhenShort,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublicActionGasLimitStrategy {
     ChainBuffer,
     RailwayEstimate120,
-    RailwayNativeFixed,
+    /// The profile's buffer over the final raw estimate of a prepared native shield, signed at
+    /// most at its reviewed limit and refused only when the raw estimate itself exceeds that
+    /// limit.
+    NativeShieldPrepared {
+        reviewed_gas_limit: u64,
+        profile: PublicShieldTransactionProfile,
+    },
 }
 
 impl PublicShieldTransactionProfile {
@@ -135,23 +151,27 @@ impl PublicShieldTransactionProfile {
         }
     }
 
+    /// Railway prices only BNB ERC-20 actions with a legacy envelope; its native shield is type 4.
     #[must_use]
-    pub const fn uses_legacy_envelope(self, chain_id: u64) -> bool {
-        matches!(self, Self::Railway) && chain_id == 56
+    pub const fn uses_legacy_envelope(self, chain_id: u64, asset: PublicAssetId) -> bool {
+        matches!(self, Self::Railway) && chain_id == 56 && matches!(asset, PublicAssetId::Erc20(_))
     }
 
-    pub(super) const fn gas_limit_strategy(
-        self,
-        asset: PublicAssetId,
-    ) -> PublicActionGasLimitStrategy {
-        match (self, asset) {
-            (Self::Railway, PublicAssetId::Native) => {
-                PublicActionGasLimitStrategy::RailwayNativeFixed
-            }
-            (Self::Railway, PublicAssetId::Erc20(_)) => {
-                PublicActionGasLimitStrategy::RailwayEstimate120
-            }
-            (Self::Railoxide, _) => PublicActionGasLimitStrategy::ChainBuffer,
+    /// A prepared native shield instead signs within its reviewed limit.
+    pub(super) const fn gas_limit_strategy(self) -> PublicActionGasLimitStrategy {
+        match self {
+            Self::Railway => PublicActionGasLimitStrategy::RailwayEstimate120,
+            Self::Railoxide => PublicActionGasLimitStrategy::ChainBuffer,
+        }
+    }
+
+    /// The approval mode a shield signs with: Mimic Railway locks Railway's unlimited approval,
+    /// Railoxide keeps the `chosen` one.
+    #[must_use]
+    pub const fn approval_mode(self, chosen: PublicShieldApprovalMode) -> PublicShieldApprovalMode {
+        match self {
+            Self::Railway => PublicShieldApprovalMode::UnlimitedWhenShort,
+            Self::Railoxide => chosen,
         }
     }
 }
@@ -346,6 +366,14 @@ pub struct PublicShieldRequest {
     pub asset: PublicAssetId,
     pub amount: U256,
     pub profile: PublicShieldTransactionProfile,
+    /// Chosen for Railoxide; Mimic Railway signs its own policy.
+    pub approval_mode: PublicShieldApprovalMode,
+    /// Required by, and only by, a stealth-account native shield. A native shield without one
+    /// takes the Railoxide wrap fallback.
+    pub native_preparation: Option<Arc<super::NativeShieldPreparation>>,
+    /// The stealth account operation a native shield is sent from. A retry of the same
+    /// shield passes the same one.
+    pub native_operation: Option<crate::vault::ExecutorOperationId>,
     pub gas_fee: PublicActionGasFeeSelection,
     pub gas_fee_mode: PublicActionGasFeeMode,
     pub authorized_fee_ceiling: PublicActionGasFeeSelection,

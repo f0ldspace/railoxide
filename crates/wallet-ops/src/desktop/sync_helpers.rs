@@ -1129,9 +1129,10 @@ mod tests {
                         deployment: broadcaster_core::deployment::RailgunDeployment {
                             chain_id: chain_key.chain_id,
                             contract: chain_key.contract,
-                            relay_adapt_contract: Address::ZERO,
+                            relay_adapt_contract: None,
                             relay_adapt_history: &[],
                             relay_adapt_7702_contract: Address::ZERO,
+                            relay_adapt_7702_delegates: &[],
                             deployment_block: 0,
                             v2_start_block: 0,
                             legacy_shield_block: 0,

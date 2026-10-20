@@ -26,6 +26,16 @@ pub enum GatewayDraftFee {
     },
 }
 
+/// The approval amount of a Railoxide shield that may sign an ERC-20 approval. Mimic Railway
+/// signs its own unlimited policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayDraftApproval {
+    #[default]
+    Exact,
+    Unlimited,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayDraftInput {
@@ -39,6 +49,8 @@ pub struct GatewayDraftInput {
     pub address_book_entry: Option<String>,
     pub fee: GatewayDraftFee,
     pub mimic_railway: bool,
+    #[serde(default)]
+    pub approval: GatewayDraftApproval,
     pub max: bool,
 }
 
@@ -419,15 +431,14 @@ impl GatewayDraftExecution {
         }
     }
 
-    /// A later hardware prompt may be cancelled after the initial review was approved.
+    /// A hardware prompt after an approved review, private or public, may be cancelled.
     /// The native dialog owner calls this only for an explicit dismissal, before generation.
-    pub fn cancel_private_authorization(&self) {
+    pub fn cancel_authorization(&self) {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.started
-            || state.private.is_none()
             || matches!(
                 state.status,
                 GatewayDraftStatus::Done | GatewayDraftStatus::Failed
@@ -685,7 +696,17 @@ mod tests {
             let mut wire = public.clone();
             wire["kind"] = kind.into();
             let parsed: GatewayDraftPayload = serde_json::from_value(wire.clone()).unwrap();
-            assert!(matches!(parsed, GatewayDraftPayload::Public(_)));
+            // An input without an approval choice approves the exact amount.
+            assert_eq!(
+                parsed.public().map(|input| input.approval),
+                Some(GatewayDraftApproval::Exact)
+            );
+            wire["approval"] = "unlimited".into();
+            let parsed: GatewayDraftPayload = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(
+                parsed.public().map(|input| input.approval),
+                Some(GatewayDraftApproval::Unlimited)
+            );
             assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
         }
         let mut private = serde_json::json!({
@@ -770,7 +791,7 @@ mod tests {
         let hardware = GatewayDraftExecution::private("hardware-password-approved".into());
         assert!(hardware.approve_review());
         hardware.cancel_review(); // The first password dialog closes to open device approval.
-        hardware.cancel_private_authorization();
+        hardware.cancel_authorization();
         assert!(!hardware.approve_review());
         assert!(!hardware.start());
         assert!(hardware.snapshot().can_retry);
@@ -778,11 +799,19 @@ mod tests {
             hardware.snapshot().private.unwrap().result,
             Some(super::super::GatewayPrivateDraftResult::Cancelled)
         );
+        let public = GatewayDraftExecution::default();
+        assert!(public.approve_review());
+        public.cancel_review();
+        public.cancel_authorization();
+        assert!(!public.approve_review());
+        assert!(!public.start());
+        assert!(public.snapshot().can_retry);
+        assert_eq!(public.snapshot().status, GatewayDraftStatus::Failed);
 
         let running = GatewayDraftExecution::private("hardware-complete".into());
         assert!(running.approve_review());
         assert!(running.start());
-        running.cancel_private_authorization();
+        running.cancel_authorization();
         assert_eq!(running.snapshot().status, GatewayDraftStatus::InProgress);
         duplicate.event(&PublicActionSessionEvent::AttemptHandoff {
             step: PublicActionProgressStep::Send,

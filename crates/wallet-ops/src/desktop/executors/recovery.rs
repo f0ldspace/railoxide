@@ -10,7 +10,7 @@ use broadcaster_core::contracts::railgun::{Call, ShieldRequest, TokenData, shiel
 use broadcaster_core::contracts::shield::build_shield_request;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
-use railgun_wallet::tx::RailgunGasModel;
+use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 use zeroize::Zeroizing;
 
 use super::{ExecutorDelivery, ExecutorOwner};
@@ -279,12 +279,13 @@ impl ExecutorOwner {
             .ok_or_else(|| eyre!("derive this historical account before recovery"))?;
         let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("this historical account has no supported recovery profile"))?;
+        let mut target = profile;
         if let ExecutorRecoveryFunding::PublicBroadcaster {
             candidate,
             maximum_private_fee,
         } = &funding
         {
-            ExecutorDelivery::PublicBroadcaster(candidate.clone()).admit(profile)?;
+            target = ExecutorDelivery::PublicBroadcaster(candidate.clone()).admit(profile)?;
             if maximum_private_fee.is_zero() {
                 return Err(eyre!("review a private fee limit for broadcaster recovery"));
             }
@@ -458,6 +459,10 @@ impl ExecutorOwner {
         } else {
             self.recovery_record(operation)?
         };
+        if target.delegate() != record.delegate() {
+            self.store.retarget_delegate(operation, target.delegate())?;
+            self.notify_change();
+        }
         let recovery = ExecutorOperationId::random()?;
         if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
             hardware.bind_recovery(recovery)?;
@@ -469,7 +474,7 @@ impl ExecutorOwner {
             generation: self.generation,
             owner: self.closed.clone(),
             source,
-            delegate: profile.delegate(),
+            delegate: target.delegate(),
             current_delegate,
             account_nonce,
             recipient,
@@ -651,12 +656,26 @@ pub(super) fn recovery_gas_limits(
     // Same execution overhead used by private executor quotes. Final RPC estimation must
     // fit this reviewed ceiling; dependent calls cannot be estimated alone.
     vec![steps.iter().fold(model.executor(), |sum, step| {
-        sum.saturating_add(public_native_action_gas_units_with_buffer(
-            model,
-            &[*step],
-            buffer,
-        ))
+        sum.saturating_add(match step {
+            PublicActionProgressStep::Shield => {
+                recovery_shield_gas_units(model).saturating_add(buffer)
+            }
+            _ => public_native_action_gas_units_with_buffer(model, &[*step], buffer),
+        })
     })]
+}
+
+/// Recovery's Shield ceiling, unchanged since public native shields dropped `RelayAdapt`:
+/// the relay actions of a wrap and a shield, the wrap, and the shield.
+fn recovery_shield_gas_units(model: &RailgunGasModel) -> u64 {
+    model
+        .relay(2)
+        .saturating_add(public_native_action_gas_units_with_buffer(
+            model,
+            &[PublicActionProgressStep::Wrap],
+            0,
+        ))
+        .saturating_add(model.shield(GasEstimateMode::UpperBound, 1))
 }
 
 /// `swap_calls` bounds the calls a swap executor's batch runs before its asset steps.

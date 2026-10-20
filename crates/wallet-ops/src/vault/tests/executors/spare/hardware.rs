@@ -600,6 +600,12 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         view.receive_address().unwrap().as_str(),
     ))
     .unwrap();
+    // A broadcaster advertising the other listed delegate moves the account to it.
+    let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_7702_delegates[0]
+        .address;
+    assert_ne!(earlier, record.delegate());
     let candidate = crate::PublicBroadcasterCandidate {
         chain_id: 1,
         railgun_address: view.receive_address().unwrap(),
@@ -612,7 +618,7 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         available_wallets: 1,
         version: "test".into(),
         relay_adapt: record.delegate(),
-        relay_adapt_7702: Some(record.delegate()),
+        relay_adapt_7702: Some(earlier),
         required_poi_list_keys: Vec::new(),
         viewing_public_key: address_data.viewing_public_key,
         address_data,
@@ -635,6 +641,11 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         paid.execution(),
         crate::ExecutorRecoveryExecution::PaidExecute { .. }
     ));
+    assert_eq!(
+        (paid.delegate(), owner.records().unwrap()[0].delegate()),
+        (earlier, earlier)
+    );
+    assert!(owner.validate_recovery(&paid).is_ok());
     assert!(fresh.signer(&vault, &view, "recovery private fee").is_ok());
     owner.shutdown().await;
     drop(owner);
@@ -1017,6 +1028,130 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
     origin.shutdown().await;
     destination.shutdown().await;
     drop((origin, destination));
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn hardware_native_shield_is_sent_by_the_payer_its_approval_admits() {
+    let descriptor = test_hardware_descriptor(1);
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let vault = Arc::new(vault);
+    let view = hardware_view(&vault, &descriptor);
+    let chain = chain(&rpc);
+    let owner = Arc::new(
+        ExecutorOwner::new(
+            0,
+            db.clone(),
+            view.clone(),
+            chain.clone(),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap(),
+    );
+    let (_tip, tip_rx) = watch::channel(WalletSyncTip {
+        head_block: Some(10),
+        ..Default::default()
+    });
+    owner.start_tip_observation(tip_rx);
+    let payer = vault
+        .import_public_account(TEST_PASSWORD, &view, IMPORT_PRIVATE_KEY_ONE, None, true)
+        .unwrap();
+    let other = vault
+        .import_public_account(TEST_PASSWORD, &view, IMPORT_PRIVATE_KEY_TWO, None, true)
+        .unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let authorization = DesktopPrivateSpendAuthorization::HardwareExecutor(Box::new(
+        owner
+            .hardware_authorization_request(
+                view.clone(),
+                HardwareExecutorAction::Execute(operation),
+            )
+            .unwrap()
+            .with_gas_payer(
+                payer.public_account_uuid.clone(),
+                Zeroizing::new(TEST_PASSWORD.into()),
+                None,
+            )
+            .unwrap()
+            .complete(&descriptor, &[42; 32])
+            .unwrap(),
+    ));
+    // The approval admits its reviewed payer only.
+    assert!(
+        crate::public_wallet::admitted_gas_payer_signer(
+            &vault,
+            &view,
+            &authorization,
+            &other.public_account_uuid,
+            Some(&owner),
+            chain.chain_id,
+        )
+        .await
+        .is_err()
+    );
+    let signer = crate::public_wallet::admitted_gas_payer_signer(
+        &vault,
+        &view,
+        &authorization,
+        &payer.public_account_uuid,
+        Some(&owner),
+        chain.chain_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(signer.address(), payer.address);
+
+    let wrapped_native = chain.wrapped_native_token.unwrap();
+    let recipient = crate::public_wallet::public_shield_recipient(&view).unwrap();
+    let request = broadcaster_core::contracts::shield::build_shield_request(
+        recipient.master_public_key,
+        &recipient.viewing_public_key,
+        broadcaster_core::contracts::railgun::TokenData::erc20(wrapped_native),
+        alloy::primitives::aliases::U120::from(5_000_u64),
+        &[3; 32],
+    )
+    .unwrap();
+    let issued = owner
+        .issue_native_shield(
+            operation,
+            &view,
+            signer.address(),
+            &authorization,
+            wrapped_native,
+            U256::from(5_000_u64),
+            request,
+            "Shield",
+        )
+        .await
+        .unwrap();
+    let account = owner
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.operation() == operation)
+        .and_then(|record| record.address())
+        .unwrap();
+    let transaction = issued.transaction();
+    assert_eq!(
+        (transaction.from, transaction.to),
+        (
+            Some(payer.address),
+            Some(alloy::primitives::TxKind::Call(account))
+        )
+    );
+    let [delegation] = transaction.authorization_list.as_deref().unwrap() else {
+        panic!("one delegation");
+    };
+    assert_eq!(delegation.recover_authority().unwrap(), account);
+
+    drop(signer);
+    drop(authorization);
+    owner.shutdown().await;
+    drop(owner);
     drop(view);
     drop(vault);
     drop(db);

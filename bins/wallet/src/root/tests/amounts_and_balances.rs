@@ -185,7 +185,6 @@ fn public_broadcaster_cost_display_uses_shared_amount_precision() {
         &[fee_row(1, dai, "formatted-amounts")],
         1,
         dai,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -211,7 +210,6 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
         &[fee_row(1, dai, "usd-values")],
         1,
         dai,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -294,7 +292,6 @@ fn public_broadcaster_cost_display_uses_effective_token_metadata() {
         &[fee_row(1, token, "custom-token-formatting")],
         1,
         token,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -317,7 +314,6 @@ fn native_top_up_plan_display_and_request_use_fixed_native_amount() {
         &[fee_row(1, token, "native-top-up")],
         1,
         token,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -1585,7 +1581,12 @@ fn public_action_max_label_notes_native_gas_estimate() {
 #[test]
 fn public_action_progress_steps_use_single_send_step() {
     assert_eq!(
-        public_action_progress_steps(PublicActionMode::Send, PublicAssetId::Native),
+        public_action_progress_steps_for_source(
+            PublicActionMode::Send,
+            PublicAssetId::Native,
+            wallet_ops::vault::PublicAccountSource::Derived,
+            false,
+        ),
         vec![PublicActionProgressStep::Send],
     );
 }
@@ -1680,7 +1681,12 @@ fn public_action_closed_active_step_ignores_inactive_steps() {
 #[test]
 fn public_action_progress_steps_use_single_transaction_for_native_shield() {
     assert_eq!(
-        public_action_progress_steps(PublicActionMode::Shield, PublicAssetId::Native),
+        public_action_progress_steps_for_source(
+            PublicActionMode::Shield,
+            PublicAssetId::Native,
+            wallet_ops::vault::PublicAccountSource::Derived,
+            false,
+        ),
         vec![PublicActionProgressStep::Shield],
     );
 }
@@ -1688,9 +1694,11 @@ fn public_action_progress_steps_use_single_transaction_for_native_shield() {
 #[test]
 fn public_action_progress_steps_skip_wrap_for_erc20_shield() {
     assert_eq!(
-        public_action_progress_steps(
+        public_action_progress_steps_for_source(
             PublicActionMode::Shield,
             PublicAssetId::Erc20(Address::from([0xef; 20])),
+            wallet_ops::vault::PublicAccountSource::Derived,
+            false,
         ),
         vec![
             PublicActionProgressStep::Approve,
@@ -1706,6 +1714,7 @@ fn hardware_public_shield_progress_steps_start_with_shield_key_authorization() {
             PublicActionMode::Shield,
             PublicAssetId::Erc20(Address::from([0xef; 20])),
             wallet_ops::vault::PublicAccountSource::HardwareDerived,
+            false,
         ),
         vec![
             PublicActionProgressStep::ShieldKey,
@@ -1718,9 +1727,25 @@ fn hardware_public_shield_progress_steps_start_with_shield_key_authorization() {
             PublicActionMode::Shield,
             PublicAssetId::Native,
             wallet_ops::vault::PublicAccountSource::HardwareDerived,
+            false,
         ),
         vec![
             PublicActionProgressStep::ShieldKey,
+            PublicActionProgressStep::Shield,
+        ],
+    );
+    // A hardware-native payer's native shield takes the wrap fallback.
+    assert_eq!(
+        public_action_progress_steps_for_source(
+            PublicActionMode::Shield,
+            PublicAssetId::Native,
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+            true,
+        ),
+        vec![
+            PublicActionProgressStep::ShieldKey,
+            PublicActionProgressStep::Wrap,
+            PublicActionProgressStep::Approve,
             PublicActionProgressStep::Shield,
         ],
     );

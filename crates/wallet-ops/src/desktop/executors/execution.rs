@@ -3,14 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::eips::eip7702::Authorization;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use eyre::{Result, eyre};
-use public_broadcaster_protocol::supports_nonce_bearing_executor;
 use railgun_wallet::tx::ExecutorContext;
 use railgun_wallet::{TransactionCall, Utxo};
 
@@ -18,7 +17,7 @@ use super::{
     ExecutorOwner, ExecutorRecoveryExecution, ExecutorRecoveryFunding, PreparedExecutorRecovery,
 };
 use crate::desktop::executor_discovery::{inspect_for_signing, matches_executor_delegation};
-use crate::settings::ExecutorProfile;
+use crate::settings::{EffectiveChainConfig, ExecutorProfile};
 use crate::vault::{
     ExecutorInputIdentity, ExecutorOperationId, ExecutorPayloadContext, ExecutorPayloadPurpose,
     IssuedExecutorPayload,
@@ -35,27 +34,28 @@ pub enum ExecutorDelivery {
 }
 
 impl ExecutorDelivery {
-    pub fn admit(&self, profile: ExecutorProfile) -> Result<()> {
+    /// Admit this delivery for an operation needing `profile`'s capability. Returns the
+    /// profile its delegation authorization targets: a broadcaster's advertised delegate.
+    pub fn admit(&self, profile: ExecutorProfile) -> Result<ExecutorProfile> {
         match self {
             Self::PublicBroadcaster(candidate) => {
-                if candidate.chain_id != profile.chain_id()
-                    || candidate.available_wallets == 0
-                    || candidate.fee_expiration <= std::time::SystemTime::now()
-                    || !supports_nonce_bearing_executor(
-                        candidate.relay_adapt_7702,
-                        profile.delegate(),
-                    )
-                {
-                    return Err(eyre!(
-                        "selected broadcaster does not support this executor operation"
-                    ));
-                }
+                let target = candidate
+                    .relay_adapt_7702
+                    .and_then(|advertised| profile.interchangeable(advertised))
+                    .filter(|_| {
+                        candidate.chain_id == profile.chain_id()
+                            && candidate.available_wallets != 0
+                            && candidate.fee_expiration > std::time::SystemTime::now()
+                    })
+                    .ok_or_else(|| {
+                        eyre!("selected broadcaster does not support this executor operation")
+                    })?;
                 candidate.parsed_required_poi_list_keys()?;
-                Ok(())
+                Ok(target)
             }
             Self::SelfBroadcast {
                 sponsored: false, ..
-            } => Ok(()),
+            } => Ok(profile),
             Self::SelfBroadcast {
                 sponsored: true, ..
             } => Err(eyre!(
@@ -73,6 +73,41 @@ impl ExecutorDelivery {
             Self::PublicBroadcaster(_) | Self::ManualExport => None,
         }
     }
+}
+
+/// Outside private sponsorship, unwrap-to-native and native top-up Unshields run only
+/// through the executor; there is no legacy `RelayAdapt` fallback.
+#[must_use]
+pub const fn unshield_requires_executor(
+    unwrap: bool,
+    native_top_up: bool,
+    sponsored: bool,
+) -> bool {
+    (unwrap || native_top_up) && !sponsored
+}
+
+/// Why an Unshield that requires the executor cannot use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ExecutorRouteUnavailable {
+    #[error(
+        "Unwrap and gas top-up need this wallet's stealth account, which this session doesn't have."
+    )]
+    NoExecutorOwner,
+    #[error("Unwrap and gas top-up need the accepted RelayAdapt7702 contract on this network.")]
+    NoAcceptedProfile,
+}
+
+/// The executor route for an Unshield that requires it.
+pub fn unshield_executor_route(
+    has_executor_owner: bool,
+    chain: &EffectiveChainConfig,
+) -> std::result::Result<ExecutorProfile, ExecutorRouteUnavailable> {
+    if !has_executor_owner {
+        return Err(ExecutorRouteUnavailable::NoExecutorOwner);
+    }
+    chain
+        .accepted_executor_profile()
+        .ok_or(ExecutorRouteUnavailable::NoAcceptedProfile)
 }
 
 /// A newly reserved account that was found used before it issued anything. It is retired.
@@ -163,6 +198,18 @@ pub struct IssuedExecutorTransaction {
     operation: ExecutorOperationId,
     payload_hash: B256,
     transaction: TransactionRequest,
+}
+
+/// The caller-specific part of one execute payload: the hash the executor signs,
+/// the transaction value, the private inputs it spends, and how the signature
+/// becomes the signed call.
+pub(super) struct PayloadToSign<'a> {
+    pub(super) hash: B256,
+    pub(super) value: U256,
+    pub(super) inputs: Vec<ExecutorInputIdentity>,
+    /// Sign an authorization even when this delegate is installed.
+    pub(super) authorize_delegation: bool,
+    pub(super) authorize: Box<dyn FnOnce(Signature) -> Result<TransactionCall> + Send + 'a>,
 }
 
 /// Chain evidence that one paid fee-convergence loop reuses to sign repriced
@@ -288,6 +335,7 @@ impl ExecutorOwner {
             .chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
+        let profile = prepared.delivery.admit(profile)?;
         if !self.closed.same_channel(&prepared.owner)
             || prepared.generation != self.generation
             || prepared.wallet_id != self.view.wallet_id()
@@ -298,7 +346,6 @@ impl ExecutorOwner {
                 "executor preparation belongs to a different wallet session"
             ));
         }
-        prepared.delivery.admit(profile)?;
         let record = self
             .store
             .records()?
@@ -428,7 +475,7 @@ impl ExecutorOwner {
             .chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
-        delivery.admit(profile)?;
+        let profile = delivery.admit(profile)?;
         if let ExecutorDelivery::SelfBroadcast { sender, .. } = &delivery
             && self
                 .vault
@@ -588,7 +635,85 @@ impl ExecutorOwner {
         call: &TransactionCall,
         inputs: &[Utxo],
         authorization: &crate::DesktopPrivateSpendAuthorization,
+        retry: Option<&mut IssueRetry>,
+    ) -> Result<IssuedExecutorTransaction> {
+        self.issue_payload(prepared, authorization, retry, |_| {
+            let hash = prepared.context.signing_hash(call)?;
+            // The durable reservation must cover precisely the private inputs whose
+            // nullifiers the signed execute can spend, including every inner transaction.
+            let decoded = RelayAdapt7702::executeCall::abi_decode(&call.data)?;
+            if let Some(recovery) = &prepared.recovery
+                && (decoded._actionData.minGasLimit != U256::ZERO
+                    || decoded._actionData.calls.len() != recovery.calls().len()
+                    || decoded._actionData.calls.iter().zip(recovery.calls()).any(
+                        |(actual, expected)| {
+                            actual.to != expected.to
+                                || actual.value != expected.value
+                                || actual.data != expected.data
+                        },
+                    ))
+            {
+                return Err(eyre!(
+                    "proved recovery calls differ from the reviewed actions"
+                ));
+            }
+            let mut expected = decoded
+                ._transactions
+                .iter()
+                .flat_map(|transaction| {
+                    transaction.nullifiers.iter().map(|nullifier| {
+                        (u32::from(transaction.boundParams.treeNumber), *nullifier)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let nullifying_key = self.view.scan_keys().nullifying_key;
+            let mut supplied = inputs
+                .iter()
+                .map(|input| (input.tree, B256::from(input.nullifier(nullifying_key))))
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            supplied.sort_unstable();
+            if expected != supplied || supplied.is_empty() {
+                return Err(eyre!(
+                    "executor input reservations do not match the proved transaction"
+                ));
+            }
+            if self.records()?.iter().any(|other| {
+                other.operation() != prepared.operation
+                    && other
+                        .reserved_inputs()
+                        .iter()
+                        .any(|reserved| inputs.iter().any(|input| reserved.matches(input)))
+            }) {
+                return Err(eyre!(
+                    "private inputs are reserved by another executor operation"
+                ));
+            }
+            Ok(PayloadToSign {
+                hash,
+                value: U256::ZERO,
+                inputs: inputs
+                    .iter()
+                    .map(ExecutorInputIdentity::from_utxo)
+                    .collect(),
+                authorize_delegation: false,
+                authorize: Box::new(move |signature| {
+                    Ok(prepared.context.authorize_call(call, signature)?)
+                }),
+            })
+        })
+        .await
+    }
+
+    /// Issue one execute payload under the shared executor admission, inspection,
+    /// signing and persistence rules. `payload` runs under the activity lock right
+    /// after the preparation is validated and before any chain read.
+    pub(super) async fn issue_payload<'a>(
+        &self,
+        prepared: &PreparedExecutorOperation,
+        authorization: &crate::DesktopPrivateSpendAuthorization,
         mut retry: Option<&mut IssueRetry>,
+        payload: impl FnOnce(&crate::vault::ExecutorRecord) -> Result<PayloadToSign<'a>>,
     ) -> Result<IssuedExecutorTransaction> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
@@ -604,61 +729,15 @@ impl ExecutorOwner {
             self.chain.clone()
         };
         let chain = Box::new(chain);
-        let profile = chain
-            .accepted_executor_profile()
+        let profile = ExecutorProfile::accepted(chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
-        let hash = prepared.context.signing_hash(call)?;
-        // The durable reservation must cover precisely the private inputs whose
-        // nullifiers the signed execute can spend, including every inner transaction.
-        let decoded = RelayAdapt7702::executeCall::abi_decode(&call.data)?;
-        if let Some(recovery) = &prepared.recovery
-            && (decoded._actionData.minGasLimit != U256::ZERO
-                || decoded._actionData.calls.len() != recovery.calls().len()
-                || decoded._actionData.calls.iter().zip(recovery.calls()).any(
-                    |(actual, expected)| {
-                        actual.to != expected.to
-                            || actual.value != expected.value
-                            || actual.data != expected.data
-                    },
-                ))
-        {
-            return Err(eyre!(
-                "proved recovery calls differ from the reviewed actions"
-            ));
-        }
-        let mut expected = decoded
-            ._transactions
-            .iter()
-            .flat_map(|transaction| {
-                transaction
-                    .nullifiers
-                    .iter()
-                    .map(|nullifier| (u32::from(transaction.boundParams.treeNumber), *nullifier))
-            })
-            .collect::<Vec<_>>();
-        let nullifying_key = self.view.scan_keys().nullifying_key;
-        let mut supplied = inputs
-            .iter()
-            .map(|input| (input.tree, B256::from(input.nullifier(nullifying_key))))
-            .collect::<Vec<_>>();
-        expected.sort_unstable();
-        supplied.sort_unstable();
-        if expected != supplied || supplied.is_empty() {
-            return Err(eyre!(
-                "executor input reservations do not match the proved transaction"
-            ));
-        }
-        if self.records()?.iter().any(|other| {
-            other.operation() != prepared.operation
-                && other
-                    .reserved_inputs()
-                    .iter()
-                    .any(|reserved| inputs.iter().any(|input| reserved.matches(input)))
-        }) {
-            return Err(eyre!(
-                "private inputs are reserved by another executor operation"
-            ));
-        }
+        let PayloadToSign {
+            hash,
+            value,
+            inputs,
+            authorize_delegation: require_authorization,
+            authorize,
+        } = payload(&record)?;
         let initially_unissued = prepared.recovery.is_none() && record.issued().is_empty();
         let reused = match retry.as_deref_mut() {
             Some(retry) if !initially_unissued => {
@@ -762,13 +841,11 @@ impl ExecutorOwner {
             ));
         }
         self.ensure_active()?;
-        let signed_call = prepared
-            .context
-            .authorize_call(call, signer.sign_hash_sync(&hash)?)?;
+        let signed_call = authorize(signer.sign_hash_sync(&hash)?)?;
         let mut transaction = TransactionRequest::default()
             .to(signed_call.to)
             .input(signed_call.data.clone().into())
-            .value(U256::ZERO);
+            .value(value);
         transaction.chain_id = Some(profile.chain_id());
         transaction.from = prepared.delivery.sender();
         authorize_delegation(
@@ -777,18 +854,12 @@ impl ExecutorOwner {
             inspection,
             &signer,
             prepared.recovery.is_some(),
-            matches!(prepared.delivery, ExecutorDelivery::PublicBroadcaster(_)),
+            matches!(prepared.delivery, ExecutorDelivery::PublicBroadcaster(_))
+                || require_authorization,
         )?;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let payload_context = ExecutorPayloadContext::new(
-            signed_call.data,
-            observed,
-            inputs
-                .iter()
-                .map(ExecutorInputIdentity::from_utxo)
-                .collect(),
-        );
+        let payload_context = ExecutorPayloadContext::new(signed_call.data, observed, inputs);
         let payload = IssuedExecutorPayload::new(
             observed.nonce(),
             profile.delegate(),
@@ -850,13 +921,15 @@ pub(super) fn authorize_delegation(
     let code = inspection
         .code()
         .ok_or_else(|| eyre!("executor delegation is unavailable"))?;
-    let delegated = matches_executor_delegation(code, profile);
+    let installed = crate::desktop::executor_discovery::executor_delegation(code);
+    let delegated = installed == Some(profile.delegate());
     // SDK broadcaster TX7702 requests require an authorization even when this
-    // delegate is already installed. Native delivery can reuse it without one.
+    // delegate is already installed. Self-broadcast execution reuses an installed
+    // delegate without one unless its payload requires it, as a native shield does.
+    // An account on another delegate of this capability moves to the delivery's delegate.
     if code.is_empty()
-        || recovery
-            && crate::desktop::executor_discovery::executor_delegation(code).is_some()
-            && !delegated
+        || !delegated
+            && (recovery && installed.is_some() || matches_executor_delegation(code, profile))
         || require_authorization && delegated
     {
         let account_nonce = inspection
@@ -884,4 +957,141 @@ pub(super) fn authorize_delegation(
         transaction.nonce = inspection.account_nonce();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{WalletSettings, build_effective_chain_configs};
+
+    #[test]
+    fn unwrap_and_top_up_route_through_the_executor_or_are_unavailable() {
+        let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let accepted = chains.get(1).unwrap().clone();
+        let profile = accepted.accepted_executor_profile().unwrap();
+        let mut unaccepted = accepted.clone();
+        unaccepted
+            .railgun
+            .as_mut()
+            .unwrap()
+            .deployment
+            .relay_adapt_7702_contract = Address::repeat_byte(7);
+        let mut disabled = accepted.clone();
+        disabled.enabled = false;
+        // (unwrap, top-up, sponsored, executor owner, chain, route when required)
+        let cases = [
+            (true, false, false, true, &accepted, Some(Ok(profile))),
+            (false, true, false, true, &accepted, Some(Ok(profile))),
+            (
+                true,
+                false,
+                false,
+                false,
+                &accepted,
+                Some(Err(ExecutorRouteUnavailable::NoExecutorOwner)),
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                &unaccepted,
+                Some(Err(ExecutorRouteUnavailable::NoAcceptedProfile)),
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                &disabled,
+                Some(Err(ExecutorRouteUnavailable::NoAcceptedProfile)),
+            ),
+            (true, true, true, false, &unaccepted, None),
+            (false, false, false, true, &accepted, None),
+        ];
+        for (unwrap, top_up, sponsored, owner, chain, expected) in cases {
+            let required = unshield_requires_executor(unwrap, top_up, sponsored);
+            assert_eq!(required, expected.is_some());
+            if let Some(route) = expected {
+                assert_eq!(unshield_executor_route(owner, chain), route);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_authorization_moves_an_account_to_the_delivery_delegate() {
+        use alloy::eips::BlockNumHash;
+        use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
+        use alloy::primitives::Bytes;
+        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::transports::mock::Asserter;
+
+        let chain = build_effective_chain_configs(&WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+        let primary = chain.accepted_executor_profile().unwrap();
+        let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+            .unwrap()
+            .relay_adapt_7702_delegates[0]
+            .address;
+        let earlier = ExecutorProfile::accepted(1, earlier).unwrap();
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(7)).unwrap();
+        let responses = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(responses.clone())
+            .erased();
+        // (installed delegate, delivery's target, broadcaster delivery, authorized delegate)
+        for (installed, target, broadcaster, authorized) in [
+            // Self-broadcast moves an account on the earlier delegate to the primary.
+            (earlier.delegate(), primary, false, Some(primary.delegate())),
+            (primary.delegate(), primary, false, None),
+            // A broadcaster advertising the earlier delegate moves the account to it.
+            (primary.delegate(), earlier, true, Some(earlier.delegate())),
+            (Address::repeat_byte(2), primary, false, None),
+        ] {
+            let listed = installed != Address::repeat_byte(2);
+            responses.push_success(&"0x2");
+            responses.push_success(&Bytes::from(
+                [
+                    EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+                    installed.as_slice(),
+                ]
+                .concat(),
+            ));
+            responses.push_success(&"0x0");
+            if listed {
+                responses.push_success(&Bytes::from(
+                    RelayAdapt7702::nonceCall::abi_encode_returns(&U256::ZERO),
+                ));
+            }
+            let inspection = crate::desktop::executor_discovery::inspect_at(
+                &provider,
+                &chain,
+                signer.address(),
+                &[],
+                BlockNumHash::new(10, B256::repeat_byte(10)),
+                false,
+            )
+            .await;
+            let mut transaction = TransactionRequest::default();
+            let result = authorize_delegation(
+                &mut transaction,
+                target,
+                &inspection,
+                &signer,
+                false,
+                broadcaster,
+            );
+            // An unlisted delegation is never authorized away outside recovery.
+            assert_eq!(result.is_ok(), listed);
+            assert_eq!(
+                transaction
+                    .authorization_list
+                    .map(|list| list[0].inner().address),
+                authorized
+            );
+        }
+    }
 }

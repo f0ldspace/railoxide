@@ -1,11 +1,18 @@
+use std::sync::Arc;
+
 use alloy::primitives::{Bytes, U256, address, keccak256};
 use wallet_ops::vault::PublicAccountSource;
 use wallet_ops::{
-    PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicAssetId,
-    PublicShieldTransactionProfile, PublicTransactionIntent,
+    NativeShieldPayer, PublicActionGasFeeMode, PublicActionGasFeeQuote,
+    PublicActionGasFeeSelection, PublicAssetId, PublicShieldTransactionProfile,
+    PublicTransactionIntent,
 };
 
 use super::*;
+use crate::root::public_action::{
+    NativeShieldKey, NativeShieldPreparationState, bind_native_shield_operation,
+    native_shield_payer,
+};
 
 #[test]
 fn advanced_public_send_parser_accepts_calls_creation_and_optional_prefix() {
@@ -125,6 +132,7 @@ fn railway_bnb_auto_authorization_binds_rpc_gas_price_as_legacy_fee() {
             PublicActionGasFeeSelection::Auto,
             Some(quote),
             PublicShieldTransactionProfile::Railway,
+            PublicAssetId::Erc20(address!("0x3333333333333333333333333333333333333333")),
             56,
         )
         .expect("Railway BNB authorization fee"),
@@ -141,6 +149,7 @@ fn railway_bnb_auto_authorization_binds_rpc_gas_price_as_legacy_fee() {
             },
             Some(quote),
             PublicShieldTransactionProfile::Railway,
+            PublicAssetId::Erc20(address!("0x3333333333333333333333333333333333333333")),
             56,
         )
         .expect("Railway BNB custom authorization fee"),
@@ -154,6 +163,7 @@ fn railway_bnb_auto_authorization_binds_rpc_gas_price_as_legacy_fee() {
             PublicActionGasFeeSelection::Auto,
             Some(quote),
             PublicShieldTransactionProfile::Railway,
+            PublicAssetId::Erc20(address!("0x3333333333333333333333333333333333333333")),
             1,
         )
         .expect("Railway type-2 authorization fee"),
@@ -206,4 +216,77 @@ fn explicit_review_summaries_cannot_use_cached_password() {
 
     let advanced = ordinary.requiring_explicit_review();
     assert!(!spend_authorization_can_use_cached_password(&advanced));
+}
+
+#[test]
+fn stale_native_shield_preparation_cannot_establish_readiness() {
+    let key_in = |profile, amount: u64| NativeShieldKey {
+        wallet_id: Some(Arc::from("wallet")),
+        chain_id: 56,
+        public_account_uuid: Arc::from("account"),
+        profile,
+        amount: U256::from(amount),
+    };
+    let key = |amount| key_in(PublicShieldTransactionProfile::Railoxide, amount);
+    let mut preparation = NativeShieldPreparationState::<u64>::default();
+    let earlier = preparation.begin();
+    let current = preparation.begin();
+    assert!(!preparation.complete(earlier, key(1), Some(&key(1)), Ok(1)));
+    assert!(preparation.prepared(Some(&key(1))).is_none());
+    // The latest request still cannot serve inputs edited after it started.
+    assert!(!preparation.complete(current, key(2), Some(&key(3)), Ok(2)));
+    assert!(preparation.complete(current, key(2), Some(&key(2)), Ok(2)));
+    assert_eq!(preparation.prepared(Some(&key(2))), Some(&2));
+    assert!(preparation.prepared(Some(&key(3))).is_none());
+    // Toggling Mimic Railway changes the gas buffer and fee bounds, so it prepares again.
+    let mimic = key_in(PublicShieldTransactionProfile::Railway, 2);
+    assert!(preparation.prepared(Some(&mimic)).is_none());
+    // Preparing again in the other profile is the same action, with the same stealth account.
+    let mut bound = None;
+    let operation = bind_native_shield_operation(&mut bound, key(2)).unwrap();
+    assert_eq!(
+        bind_native_shield_operation(&mut bound, mimic).unwrap(),
+        operation
+    );
+    assert_ne!(
+        bind_native_shield_operation(&mut bound, key(3)).unwrap(),
+        operation
+    );
+    preparation.invalidate();
+    assert!(preparation.prepared(Some(&key(2))).is_none());
+}
+
+#[test]
+fn native_shield_payer_follows_the_account_source() {
+    let executor = serde_json::from_value(serde_json::json!({
+        "chain_id": 1,
+        "index": 5,
+        "operation": wallet_ops::vault::ExecutorOperationId::random().unwrap(),
+    }))
+    .unwrap();
+    for (source, wallet_is_hardware, payer) in [
+        (
+            PublicAccountSource::HardwareDerived,
+            true,
+            NativeShieldPayer::Hardware,
+        ),
+        // A Ledger or Trezor wallet approves its stealth account with a software payer only.
+        (
+            PublicAccountSource::Imported,
+            true,
+            NativeShieldPayer::Software,
+        ),
+        (
+            PublicAccountSource::ExecutorDerived(executor),
+            true,
+            NativeShieldPayer::HardwareWallet,
+        ),
+        (
+            PublicAccountSource::ExecutorDerived(executor),
+            false,
+            NativeShieldPayer::Software,
+        ),
+    ] {
+        assert_eq!(native_shield_payer(source, wallet_is_hardware), payer);
+    }
 }

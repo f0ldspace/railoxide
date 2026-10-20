@@ -42,11 +42,11 @@ use broadcaster_core::contracts::shield::{build_shield_request, derive_shield_pr
 use eyre::{Result, eyre};
 use local_db::PendingOutputPoiContextRecord;
 use railgun_wallet::tx::{
-    BuildError, CompositeExecution, CompositeUnshieldLeg, CompositeUnshieldLegRole,
-    CompositeUnshieldRecipient, ExecutorContext, GasEstimateMode, MAX_BATCH_TRANSACTIONS,
-    MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest,
-    MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity, SwapAmountCheck,
-    SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
+    BuildError, CompositeAdapter, CompositeExecution, CompositeUnshieldLeg,
+    CompositeUnshieldLegRole, CompositeUnshieldRecipient, ExecutorContext, GasEstimateMode,
+    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint,
+    MixedPrivateActionRequest, MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity,
+    SwapAmountCheck, SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
 };
 use railgun_wallet::{ProverService, TransactionBuilder, TransactionCall, Utxo};
 use reqwest::Url;
@@ -764,7 +764,6 @@ impl SwapReview {
             chain_type: 0,
             chain_id: profile.chain_id(),
             railgun_contract: Address::repeat_byte(4),
-            relay_adapt_contract: Address::repeat_byte(5),
         };
         let note = Utxo::new(
             railgun_wallet::Note::new_change(U256::ONE, sell_token, amount, [0; 16]),
@@ -1765,7 +1764,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         let profile_budget = profile.app_data_byte_budget();
         let byte_budget = request
@@ -1855,7 +1853,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         plan_swap_speed_up_inputs(
             &builder,
@@ -2349,7 +2346,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         let mut request = plan.proof_request(&profile)?;
         request.verify_proof = verify_proof;
@@ -4038,8 +4034,8 @@ impl ExecutorOwner {
         Ok(executor)
     }
 
-    /// Set-up stealth accounts the swap form can offer to place another swap, hidden ones
-    /// included, whichever role they had before. This reads local records only: the shared
+    /// Set-up stealth accounts the swap form can offer to place another swap, except hidden
+    /// ones, whichever role they had before. This reads local records only: the shared
     /// admission rules judged from recorded outcomes, without a network request. Being listed
     /// authorizes nothing: execution preparation observes and checks the chosen account with
     /// [`Self::reuse_swap_account`].
@@ -4049,7 +4045,7 @@ impl ExecutorOwner {
     }
 
     /// Set-up stealth accounts on this chain the swap form can offer as the destination of a
-    /// private Bridge swap that delivers `token`, hidden ones included. Like
+    /// private Bridge swap that delivers `token`, except hidden ones. Like
     /// [`Self::swap_account_candidates`] this reads local records only. The account's balance
     /// of `token` and its earlier shields' POI verdicts are not judged here: preparation
     /// checks them, and can still refuse a listed account.
@@ -4089,14 +4085,14 @@ impl ExecutorOwner {
     }
 }
 
-/// A stealth account whose setup is done and that may take another swap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A visible stealth account whose setup is done and that may take another swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapAccountCandidate {
     operation: ExecutorOperationId,
     index: u32,
     address: Address,
-    hidden: bool,
     last_pair: Option<(Address, Address)>,
+    purpose: Option<String>,
 }
 
 impl SwapAccountCandidate {
@@ -4112,14 +4108,15 @@ impl SwapAccountCandidate {
     pub const fn address(&self) -> Address {
         self.address
     }
-    #[must_use]
-    pub const fn is_hidden(&self) -> bool {
-        self.hidden
-    }
     /// The sell and buy tokens of the account's last swap.
     #[must_use]
     pub const fn last_pair(&self) -> Option<(Address, Address)> {
         self.last_pair
+    }
+    /// What the account was set up for, as [`ExecutorRecord::purpose_intent`] gives it.
+    #[must_use]
+    pub fn purpose(&self) -> Option<&str> {
+        self.purpose.as_deref()
     }
 }
 
@@ -4129,14 +4126,16 @@ fn swap_account_candidate(
     role: SwapAccountRole,
 ) -> Option<SwapAccountCandidate> {
     let address = record.address()?;
-    if swap_account_refusal(
-        record,
-        chain_id,
-        role,
-        SwapAccountUse::New,
-        SwapAdmissionEvidence::Recorded,
-    )
-    .is_some()
+    // Hidden accounts are settled out of the way; admission still takes one a swap claims.
+    if record.is_hidden()
+        || swap_account_refusal(
+            record,
+            chain_id,
+            role,
+            SwapAccountUse::New,
+            SwapAdmissionEvidence::Recorded,
+        )
+        .is_some()
     {
         return None;
     }
@@ -4144,10 +4143,10 @@ fn swap_account_candidate(
         operation: record.operation(),
         index: record.index(),
         address,
-        hidden: record.is_hidden(),
         last_pair: record
             .swap()
             .map(|swap| (swap.terms().sell_token(), swap.terms().buy_token())),
+        purpose: record.purpose_intent().map(str::to_owned),
     })
 }
 
@@ -4631,7 +4630,7 @@ fn pre_hook_request(
     calls: Vec<Call>,
 ) -> MixedPrivateActionRequest {
     MixedPrivateActionRequest {
-        executor: Some(context),
+        adapter: Some(CompositeAdapter::Executor(context)),
         executor_calls: calls,
         private_sends: Vec::new(),
         public_unshields: vec![CompositeUnshieldLeg {

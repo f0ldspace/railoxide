@@ -692,3 +692,66 @@ fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut
     cx.run_until_parked();
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[gpui::test]
+fn native_shield_route_follows_the_payer_and_keeps_the_mimic_preference(cx: &mut TestAppContext) {
+    let path = temp_wallet_db_root("native-mimic-unavailable");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    root.update(cx, |root, _| {
+        root.public_accounts[0].source = PublicAccountSource::HardwareDerived;
+        root.public_form.selected_account_uuid = Some(Arc::from(
+            root.public_accounts[0].public_account_uuid.as_str(),
+        ));
+        root.public_form.mimic_railway_shield = true;
+        for (asset, mimic) in [
+            (PublicAssetId::Native, false),
+            (PublicAssetId::Erc20(Address::repeat_byte(42)), true),
+        ] {
+            root.public_form.selected_asset = Some(asset);
+            let profile = if mimic {
+                wallet_ops::PublicShieldTransactionProfile::Railway
+            } else {
+                wallet_ops::PublicShieldTransactionProfile::Railoxide
+            };
+            assert_eq!(root.mimic_railway_shield_effective(), mimic);
+            assert_eq!(
+                root.public_action_quote_route(PublicActionMode::Shield),
+                (asset, profile)
+            );
+            assert!(!root.native_shield_stealth_applies(PublicActionMode::Shield));
+        }
+        assert!(root.public_form.mimic_railway_shield);
+        // A hardware payer's native shield wraps, approves and shields in Railoxide.
+        root.public_form.selected_asset = Some(PublicAssetId::Native);
+        assert!(matches!(
+            root.native_shield_route(),
+            Some(Ok(wallet_ops::NativeShieldRoute::WrapFallback { .. }))
+        ));
+        assert!(root.public_shield_may_approve());
+        // A software payer takes the stealth route in either profile and signs no approval.
+        root.public_accounts[0].source = PublicAccountSource::Derived;
+        for mimic in [true, false] {
+            root.public_form.mimic_railway_shield = mimic;
+            assert_eq!(root.mimic_railway_shield_effective(), mimic);
+            assert!(root.native_shield_stealth_applies(PublicActionMode::Shield));
+            assert!(!root.public_shield_may_approve());
+        }
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}

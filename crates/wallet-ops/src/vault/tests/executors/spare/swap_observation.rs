@@ -1092,7 +1092,6 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: fixture.railgun,
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let amount = U256::from(1_000_000);
     let input = Utxo::new(
@@ -1196,7 +1195,11 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
         Err(railgun_wallet::tx::BuildError::PinnedInputUnavailable { .. })
     ));
     let mut changed_nonce = request;
-    changed_nonce.executor.as_mut().unwrap().execution_nonce += U256::ONE;
+    let Some(railgun_wallet::tx::CompositeAdapter::Executor(context)) = &mut changed_nonce.adapter
+    else {
+        panic!("the pre-hook request names its executor");
+    };
+    context.execution_nonce += U256::ONE;
     assert!(matches!(
         builder.preview_mixed_private_action_plan(&[input], &changed_nonce),
         Err(railgun_wallet::tx::BuildError::CompositePlanShapeChanged { .. })
@@ -1262,11 +1265,12 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
     }
     let expired = fixture.observe(31, 20).await;
     assert!(expired.swap().unwrap().admits_attempt());
+    let visible = listed(&fixture.owner, fixture.operation)
+        .expect("an account whose order ended is offered for another swap");
+    assert_eq!(visible.last_pair(), Some((SELL, BUY)));
+    // Hiding it keeps it out of the list; admission below still takes it.
     fixture.store.set_hidden(fixture.operation, true).unwrap();
-    let hidden = listed(&fixture.owner, fixture.operation)
-        .expect("a hidden account whose order ended is offered for another swap");
-    assert!(hidden.is_hidden());
-    assert_eq!(hidden.last_pair(), Some((SELL, BUY)));
+    assert!(listed(&fixture.owner, fixture.operation).is_none());
     fixture.chain.lock().unwrap().rpc_methods.clear();
     let preview = fixture
         .owner
@@ -3128,11 +3132,10 @@ async fn cancellation_fee_selection_excludes_the_swaps_reserved_notes() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: fixture.railgun,
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     // The broadcaster fee is paid in the swap's sell token.
     let fee = MixedPrivateActionRequest {
-        executor: None,
+        adapter: None,
         executor_calls: Vec::new(),
         private_sends: vec![MixedPrivateSend {
             token_address: SELL,
